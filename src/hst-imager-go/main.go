@@ -458,6 +458,9 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) > 0 {
 		path = args[0]
 	}
+	if basePath, table, ok := parsePartitionContainerPath(path); ok {
+		return handleFsDirPartitionContainer(basePath, table, stdout, opts)
+	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return err
@@ -479,6 +482,69 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	for _, i := range items {
 		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+	}
+	return nil
+}
+
+func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opts GlobalOptions) error {
+	type entry struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+		Size int64  `json:"size"`
+	}
+	items := make([]entry, 0)
+	switch table {
+	case "mbr":
+		parts, err := readMbrPartitions(basePath)
+		if err != nil {
+			return err
+		}
+		for _, p := range parts {
+			items = append(items, entry{
+				Name: strconv.Itoa(p.Index),
+				Type: "part",
+				Size: int64(p.SectorCount) * mbrSectorSize,
+			})
+		}
+	case "gpt":
+		_, parts, err := readGpt(basePath)
+		if err != nil {
+			return err
+		}
+		for _, p := range parts {
+			items = append(items, entry{
+				Name: strconv.Itoa(p.Index),
+				Type: "part",
+				Size: int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
+			})
+		}
+	case "rdb":
+		state, err := readRdbState(basePath)
+		if err != nil {
+			return err
+		}
+		for _, p := range state.Parts {
+			items = append(items, entry{
+				Name: strconv.Itoa(p.Index),
+				Type: "part",
+				Size: p.Size,
+			})
+		}
+	default:
+		return fmt.Errorf("unsupported partition table container: %s", table)
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{
+			"path":    basePath + `\` + table,
+			"entries": items,
+		})
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(stdout, "No partitions.")
+		return nil
+	}
+	for _, i := range items {
+		fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", i.Type, i.Name, i.Size)
 	}
 	return nil
 }
@@ -653,14 +719,26 @@ func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return errors.New("usage: info <path>")
 	}
 	path := args[0]
-	info, err := os.Stat(path)
+	region, isPartitionPath, err := resolvePartitionSelection(path)
+	if err != nil {
+		return err
+	}
+	statPath := path
+	if isPartitionPath {
+		statPath = region.BasePath
+	}
+	info, err := os.Stat(statPath)
 	if err != nil {
 		return err
 	}
 	fType := fileType(info)
-	mbrParts, hasMbr := tryReadMbr(path)
-	gptHeader, gptParts, hasGpt := tryReadGpt(path)
-	rdbStateValue, hasRdb := tryReadRdb(path)
+	reportSize := info.Size()
+	if isPartitionPath {
+		reportSize = region.Size
+	}
+	mbrParts, hasMbr := tryReadMbr(statPath)
+	gptHeader, gptParts, hasGpt := tryReadGpt(statPath)
+	rdbStateValue, hasRdb := tryReadRdb(statPath)
 
 	partitionTables := make([]string, 0)
 	if hasMbr {
@@ -677,8 +755,17 @@ func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 		out := map[string]any{
 			"path":            path,
 			"type":            fType,
-			"size":            info.Size(),
+			"size":            reportSize,
 			"partitionTables": partitionTables,
+		}
+		if isPartitionPath {
+			out["selection"] = map[string]any{
+				"basePath": statPath,
+				"table":    strings.ToUpper(region.Table),
+				"index":    region.Index,
+				"offset":   region.Offset,
+				"size":     region.Size,
+			}
 		}
 		if hasMbr {
 			parts := make([]Part, 0, len(mbrParts))
@@ -725,7 +812,10 @@ func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	fmt.Fprintf(stdout, "Path: %s\n", path)
 	fmt.Fprintf(stdout, "Type: %s\n", fType)
-	fmt.Fprintf(stdout, "Size: %d\n", info.Size())
+	fmt.Fprintf(stdout, "Size: %d\n", reportSize)
+	if isPartitionPath {
+		fmt.Fprintf(stdout, "Selection: %s partition %d (offset %d)\n", strings.ToUpper(region.Table), region.Index, region.Offset)
+	}
 	if len(partitionTables) == 0 {
 		fmt.Fprintln(stdout, "PartitionTables: none")
 		return nil
@@ -872,9 +962,17 @@ func copyFile(source, destination string, size int64) (int64, error) {
 	defer dst.Close()
 
 	if size > 0 {
-		return io.CopyN(dst, src, size)
+		written, err := io.CopyN(dst, src, size)
+		if errors.Is(err, io.ErrShortWrite) {
+			return written, errors.New("destination partition too small")
+		}
+		return written, err
 	}
-	return io.Copy(dst, src)
+	written, err := io.Copy(dst, src)
+	if errors.Is(err, io.ErrShortWrite) {
+		return written, errors.New("destination partition too small")
+	}
+	return written, err
 }
 
 func compareFiles(source, destination string, size int64) (bool, int64, error) {
@@ -3070,7 +3168,26 @@ type writeCloser struct {
 func (w *writeCloser) Write(p []byte) (int, error) { return w.writer.Write(p) }
 func (w *writeCloser) Close() error                { return w.close() }
 
+type partitionRegion struct {
+	BasePath string
+	Table    string
+	Index    int
+	Offset   int64
+	Size     int64
+}
+
 func openSourceReader(path string) (io.ReadCloser, error) {
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return nil, err
+	} else if ok {
+		f, err := os.Open(region.BasePath)
+		if err != nil {
+			return nil, err
+		}
+		section := io.NewSectionReader(f, region.Offset, region.Size)
+		return &readCloser{reader: section, closer: f}, nil
+	}
+
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".gz":
@@ -3136,6 +3253,20 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 }
 
 func openDestinationWriter(path string) (io.WriteCloser, error) {
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return nil, err
+	} else if ok {
+		f, err := os.OpenFile(region.BasePath, os.O_RDWR, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.Seek(region.Offset, io.SeekStart); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &partitionWriteCloser{f: f, remaining: region.Size}, nil
+	}
+
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".gz":
@@ -3190,3 +3321,127 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 type closerFunc func() error
 
 func (c closerFunc) Close() error { return c() }
+
+type partitionWriteCloser struct {
+	f         *os.File
+	remaining int64
+}
+
+func (w *partitionWriteCloser) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, io.ErrShortWrite
+	}
+	if int64(len(p)) > w.remaining {
+		p = p[:w.remaining]
+	}
+	n, err := w.f.Write(p)
+	w.remaining -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func (w *partitionWriteCloser) Close() error { return w.f.Close() }
+
+func resolvePartitionSelection(path string) (partitionRegion, bool, error) {
+	basePath, table, index, ok := parsePartitionPath(path)
+	if !ok {
+		return partitionRegion{}, false, nil
+	}
+	switch table {
+	case "mbr":
+		parts, err := readMbrPartitions(basePath)
+		if err != nil {
+			return partitionRegion{}, false, err
+		}
+		p, err := findMbrPart(parts, index)
+		if err != nil {
+			return partitionRegion{}, false, err
+		}
+		return partitionRegion{
+			BasePath: basePath,
+			Table:    table,
+			Index:    index,
+			Offset:   int64(p.StartLBA) * mbrSectorSize,
+			Size:     int64(p.SectorCount) * mbrSectorSize,
+		}, true, nil
+	case "gpt":
+		_, parts, err := readGpt(basePath)
+		if err != nil {
+			return partitionRegion{}, false, err
+		}
+		p, err := findGptPart(parts, index)
+		if err != nil {
+			return partitionRegion{}, false, err
+		}
+		return partitionRegion{
+			BasePath: basePath,
+			Table:    table,
+			Index:    index,
+			Offset:   int64(p.FirstLBA) * mbrSectorSize,
+			Size:     int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
+		}, true, nil
+	case "rdb":
+		state, err := readRdbState(basePath)
+		if err != nil {
+			return partitionRegion{}, false, err
+		}
+		p, err := findRdbPart(state.Parts, index)
+		if err != nil {
+			return partitionRegion{}, false, err
+		}
+		return partitionRegion{
+			BasePath: basePath,
+			Table:    table,
+			Index:    index,
+			Offset:   p.Start,
+			Size:     p.Size,
+		}, true, nil
+	default:
+		return partitionRegion{}, false, fmt.Errorf("unsupported partition table selector: %s", table)
+	}
+}
+
+func parsePartitionPath(path string) (basePath string, table string, index int, ok bool) {
+	lower := strings.ToLower(path)
+	for _, t := range []string{"mbr", "gpt", "rdb"} {
+		suffix := `\` + t + `\`
+		pos := strings.LastIndex(lower, suffix)
+		if pos <= 0 {
+			continue
+		}
+		idxStr := path[pos+len(suffix):]
+		n, err := strconv.Atoi(idxStr)
+		if err != nil || n < 1 {
+			continue
+		}
+		return path[:pos], t, n, true
+	}
+	return "", "", 0, false
+}
+
+func parsePartitionContainerPath(path string) (basePath string, table string, ok bool) {
+	lower := strings.ToLower(path)
+	for _, t := range []string{"mbr", "gpt", "rdb"} {
+		suffix := `\` + t
+		if !strings.HasSuffix(lower, suffix) {
+			continue
+		}
+		base := path[:len(path)-len(suffix)]
+		if base == "" {
+			continue
+		}
+		return base, t, true
+	}
+	return "", "", false
+}
+
+func findGptPart(parts []gptPartitionEntry, index int) (gptPartitionEntry, error) {
+	for _, p := range parts {
+		if p.Index == index {
+			return p, nil
+		}
+	}
+	return gptPartitionEntry{}, fmt.Errorf("partition %d not found", index)
+}

@@ -20,6 +20,11 @@ Initial bootstrap for porting Hst Imager Console to Go.
   - `del` -> `delete`
   - `rdb fs ...` -> `rdb filesystem ...`
 - automated tests for command tree, global option parsing, file flow, and expanded advanced command families
+- transfer/read/write/compare support compressed image flows:
+  - read from `.gz` and `.zip`
+  - write to `.gz` and `.zip`
+- partition path support in I/O commands using `\mbr\N`, `\gpt\N`, `\rdb\N` suffixes
+- `fs dir <media>\mbr|gpt|rdb` lists partition containers
 
 ## Build
 ```bash

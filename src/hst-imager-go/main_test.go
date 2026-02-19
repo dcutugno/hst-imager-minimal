@@ -711,3 +711,91 @@ func TestCompressedTransferAndCompare(t *testing.T) {
 		t.Fatalf("compare src/zip failed: %v", err)
 	}
 }
+
+func TestPartitionPathTransferAndWrite(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "disk.img")
+	outFile := filepath.Join(tmp, "part-out.bin")
+	inFile := filepath.Join(tmp, "part-in.bin")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "64KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	regionPath := media + `\mbr\1`
+	sourcePayload := bytes.Repeat([]byte{0x5a}, 64*1024)
+	if err := os.WriteFile(inFile, sourcePayload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"write", inFile, regionPath}, &out); err != nil {
+		t.Fatalf("write to partition path failed: %v", err)
+	}
+	if err := run([]string{"read", regionPath, outFile}, &out); err != nil {
+		t.Fatalf("read from partition path failed: %v", err)
+	}
+	got, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, sourcePayload) {
+		t.Fatal("partition-path read/write payload mismatch")
+	}
+}
+
+func TestFsDirPartitionContainers(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "disk.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "dir", media + `\mbr`}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "1") {
+		t.Fatalf("expected mbr partition listing, got: %q", out.String())
+	}
+
+	if err := run([]string{"gpt", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "part", "add", media, "linux", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "dir", media + `\gpt`}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "1") {
+		t.Fatalf("expected gpt partition listing, got: %q", out.String())
+	}
+
+	if err := run([]string{"rdb", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "dir", media + `\rdb`}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "1") {
+		t.Fatalf("expected rdb partition listing, got: %q", out.String())
+	}
+}
