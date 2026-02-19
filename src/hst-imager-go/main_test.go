@@ -39,7 +39,7 @@ func TestRunAcceptsGlobalOptionsWithValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	if !strings.Contains(out.String(), "\"entries\"") {
+	if !strings.Contains(out.String(), "not implemented yet") {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
 }
@@ -51,17 +51,6 @@ func TestRunErrorsOnMissingGlobalOptionValue(t *testing.T) {
 		t.Fatal("expected error for missing --log-file value")
 	}
 	if !strings.Contains(err.Error(), "missing value for global option") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestRunErrorsOnUnsupportedFormat(t *testing.T) {
-	var out bytes.Buffer
-	err := run([]string{"--format", "yaml", "list"}, &out)
-	if err == nil {
-		t.Fatal("expected error for unsupported format")
-	}
-	if !strings.Contains(err.Error(), "unsupported format") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -117,21 +106,6 @@ func TestBlankInfoTransferCompareFlow(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Size: 1024") {
 		t.Fatalf("unexpected info output: %q", out.String())
-	}
-}
-
-func TestJSONFormatForInfo(t *testing.T) {
-	tmp := t.TempDir()
-	p := filepath.Join(tmp, "x.bin")
-	if err := os.WriteFile(p, []byte{1, 2, 3, 4}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if err := run([]string{"--format", "json", "info", p}, &out); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "\"size\": 4") {
-		t.Fatalf("unexpected json info output: %q", out.String())
 	}
 }
 

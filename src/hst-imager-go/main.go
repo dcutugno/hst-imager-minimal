@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,10 +9,6 @@ import (
 	"strconv"
 	"strings"
 )
-
-type GlobalOptions struct {
-	Format string
-}
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
@@ -25,7 +20,7 @@ func main() {
 func run(args []string, stdout io.Writer) error {
 	root := BuildRootCommand()
 
-	opts, commandArgs, err := parseGlobalArgs(args, stdout, root)
+	commandArgs, err := parseGlobalArgs(args, stdout, root)
 	if err != nil {
 		return err
 	}
@@ -50,16 +45,14 @@ func run(args []string, stdout io.Writer) error {
 	}
 
 	switch consumedPath {
-	case "list":
-		return handleList(remaining, stdout, opts)
 	case "blank":
-		return handleBlank(remaining, stdout, opts)
+		return handleBlank(remaining, stdout)
 	case "info":
-		return handleInfo(remaining, stdout, opts)
+		return handleInfo(remaining, stdout)
 	case "transfer", "read", "write":
-		return handleTransfer(remaining, stdout, consumedPath, opts)
+		return handleTransfer(remaining, stdout, consumedPath)
 	case "compare":
-		return handleCompare(remaining, stdout, opts)
+		return handleCompare(remaining, stdout)
 	default:
 		if len(remaining) > 0 {
 			return fmt.Errorf("unknown command path: %s", strings.Join(commandArgs, " "))
@@ -69,8 +62,7 @@ func run(args []string, stdout io.Writer) error {
 	}
 }
 
-func parseGlobalArgs(args []string, stdout io.Writer, root *Command) (GlobalOptions, []string, error) {
-	opts := GlobalOptions{Format: "table"}
+func parseGlobalArgs(args []string, stdout io.Writer, root *Command) ([]string, error) {
 	commandArgs := make([]string, 0)
 
 	for i := 0; i < len(args); i++ {
@@ -83,34 +75,24 @@ func parseGlobalArgs(args []string, stdout io.Writer, root *Command) (GlobalOpti
 		switch arg {
 		case "--help", "-h":
 			printGlobalHelp(stdout, root)
-			return opts, nil, nil
+			return nil, nil
 		case "--version":
 			fmt.Fprintln(stdout, "hst-imager-go (prototype)")
-			return opts, nil, nil
+			return nil, nil
 		case "--verbose":
 			continue
-		case "--log-file":
+		case "--log-file", "--format":
 			if i+1 >= len(args) {
-				return opts, nil, fmt.Errorf("missing value for global option: %s", arg)
-			}
-			i++
-			continue
-		case "--format":
-			if i+1 >= len(args) {
-				return opts, nil, fmt.Errorf("missing value for global option: %s", arg)
-			}
-			opts.Format = strings.ToLower(strings.TrimSpace(args[i+1]))
-			if opts.Format != "table" && opts.Format != "json" {
-				return opts, nil, fmt.Errorf("unsupported format '%s' (supported: table, json)", args[i+1])
+				return nil, fmt.Errorf("missing value for global option: %s", arg)
 			}
 			i++
 			continue
 		default:
-			return opts, nil, fmt.Errorf("unknown global option: %s", arg)
+			return nil, fmt.Errorf("unknown global option: %s", arg)
 		}
 	}
 
-	return opts, commandArgs, nil
+	return commandArgs, nil
 }
 
 func printGlobalHelp(stdout io.Writer, root *Command) {
@@ -119,47 +101,13 @@ func printGlobalHelp(stdout io.Writer, root *Command) {
 	fmt.Fprintln(stdout, "Global options:")
 	fmt.Fprintln(stdout, "  --verbose          Verbose output")
 	fmt.Fprintln(stdout, "  --log-file <path>  Write log file")
-	fmt.Fprintln(stdout, "  --format <type>    Output format (table|json)")
+	fmt.Fprintln(stdout, "  --format <type>    Output format")
 	fmt.Fprintln(stdout, "  --version          Show version")
 	fmt.Fprintln(stdout)
 	PrintHelp(stdout, root, "")
 }
 
-func handleList(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) != 0 {
-		return errors.New("usage: list")
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(cwd)
-	if err != nil {
-		return err
-	}
-	type item struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-	}
-	items := make([]item, 0, len(entries))
-	for _, e := range entries {
-		t := "file"
-		if e.IsDir() {
-			t = "dir"
-		}
-		items = append(items, item{Name: e.Name(), Type: t})
-	}
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"cwd": cwd, "entries": items})
-	}
-	fmt.Fprintf(stdout, "Working directory: %s\n", cwd)
-	for _, i := range items {
-		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
-	}
-	return nil
-}
-
-func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {
+func handleBlank(args []string, stdout io.Writer) error {
 	if len(args) < 2 {
 		return errors.New("usage: blank <path> <size>")
 	}
@@ -176,14 +124,11 @@ func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if err := file.Truncate(size); err != nil {
 		return err
 	}
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": path, "size": size, "status": "created"})
-	}
 	fmt.Fprintf(stdout, "Created blank image '%s' (%d bytes).\n", path, size)
 	return nil
 }
 
-func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
+func handleInfo(args []string, stdout io.Writer) error {
 	if len(args) < 1 {
 		return errors.New("usage: info <path>")
 	}
@@ -191,17 +136,13 @@ func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if err != nil {
 		return err
 	}
-	fType := fileType(info)
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": args[0], "type": fType, "size": info.Size()})
-	}
 	fmt.Fprintf(stdout, "Path: %s\n", args[0])
-	fmt.Fprintf(stdout, "Type: %s\n", fType)
+	fmt.Fprintf(stdout, "Type: %s\n", fileType(info))
 	fmt.Fprintf(stdout, "Size: %d\n", info.Size())
 	return nil
 }
 
-func handleTransfer(args []string, stdout io.Writer, command string, opts GlobalOptions) error {
+func handleTransfer(args []string, stdout io.Writer, command string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>]", command)
 	}
@@ -215,14 +156,11 @@ func handleTransfer(args []string, stdout io.Writer, command string, opts Global
 	if err != nil {
 		return err
 	}
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"source": source, "destination": destination, "bytes": written})
-	}
 	fmt.Fprintf(stdout, "Transferred %d bytes from '%s' to '%s'.\n", written, source, destination)
 	return nil
 }
 
-func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
+func handleCompare(args []string, stdout io.Writer) error {
 	if len(args) < 2 {
 		return errors.New("usage: compare <source> <destination> [--size <bytes>]")
 	}
@@ -239,20 +177,8 @@ func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if !ok {
 		return fmt.Errorf("compare failed: files differ within first %d bytes", checked)
 	}
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"equal": true, "bytesChecked": checked})
-	}
 	fmt.Fprintf(stdout, "Compare successful: %d bytes are identical.\n", checked)
 	return nil
-}
-
-func writeJSON(stdout io.Writer, value any) error {
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintln(stdout, string(b))
-	return err
 }
 
 func parseOptionalSize(args []string) (int64, error) {
