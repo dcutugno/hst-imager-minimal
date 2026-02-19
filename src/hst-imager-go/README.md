@@ -33,8 +33,10 @@ go test ./...
 
 ## Status
 This Go prototype now has functional coverage for all commands currently exposed in `command_tree.go`.
-Low-level parity work is in progress: MBR operations (`info`, `initialize`, `part add/delete/export/import/clone`) now read/write real on-disk MBR sector structures.
-Some advanced areas are still intentionally lightweight (notably GPT/RDB internals and parts of filesystem/media-format behavior) and do not yet reproduce full binary-level parity with the original .NET core.
+Low-level parity work is in progress:
+- MBR operations (`info`, `initialize`, `part add/delete/export/import/clone`) read/write real on-disk MBR sector structures.
+- GPT operations (`info`, `initialize`, `part add/delete/format`) read/write real on-disk GPT headers and partition entries (including CRC updates and protective MBR).
+Some advanced areas are still intentionally lightweight (notably RDB internals and parts of filesystem/media-format behavior) and do not yet reproduce full binary-level parity with the original .NET core.
 
 
 ## Verify local vs remote sync

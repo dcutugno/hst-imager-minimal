@@ -391,3 +391,79 @@ func TestMbrLowLevelBinaryParity(t *testing.T) {
 		t.Fatal("cloned bytes do not match source partition bytes")
 	}
 }
+
+func TestGptLowLevelBinaryParity(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "gpt.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data[512:520]) != "EFI PART" {
+		t.Fatalf("missing gpt header signature: %q", string(data[512:520]))
+	}
+	// Protective MBR partition type
+	if data[446+4] != 0xee {
+		t.Fatalf("missing protective mbr type: %x", data[446+4])
+	}
+
+	if err := run([]string{"gpt", "part", "add", media, "linux", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Parts []Part `json:"parts"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Parts) != 1 {
+		t.Fatalf("expected 1 gpt partition, got %d", len(payload.Parts))
+	}
+	if payload.Parts[0].Size != 32*1024 {
+		t.Fatalf("unexpected gpt partition size: %d", payload.Parts[0].Size)
+	}
+	if payload.Parts[0].Start < 34*512 {
+		t.Fatalf("unexpected gpt partition start: %d", payload.Parts[0].Start)
+	}
+
+	if err := run([]string{"gpt", "part", "format", media, "1", "ROOTFS"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Parts[0].Name != "ROOTFS" {
+		t.Fatalf("unexpected gpt partition label: %q", payload.Parts[0].Name)
+	}
+
+	if err := run([]string{"gpt", "part", "del", media, "1"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Parts) != 0 {
+		t.Fatalf("expected 0 gpt partitions after delete, got %d", len(payload.Parts))
+	}
+}

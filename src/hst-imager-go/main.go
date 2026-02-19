@@ -3,11 +3,13 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"os/exec"
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 )
 
 type GlobalOptions struct {
@@ -65,6 +68,27 @@ type mbrPartition struct {
 	TypeCode    byte
 	StartLBA    uint32
 	SectorCount uint32
+}
+
+type gptHeader struct {
+	CurrentLBA     uint64
+	BackupLBA      uint64
+	FirstUsable    uint64
+	LastUsable     uint64
+	DiskGUID       [16]byte
+	PartEntriesLBA uint64
+	NumEntries     uint32
+	EntrySize      uint32
+}
+
+type gptPartitionEntry struct {
+	Index      int
+	TypeGUID   [16]byte
+	UniqueGUID [16]byte
+	FirstLBA   uint64
+	LastLBA    uint64
+	Attrs      uint64
+	Name       string
 }
 
 func main() {
@@ -891,9 +915,13 @@ func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	switch formatType {
 	case "mbr":
-		meta.MbrParts = nil
+		if err := initializeMbr(path); err != nil {
+			return err
+		}
 	case "gpt":
-		meta.GptParts = nil
+		if err := initializeGpt(path); err != nil {
+			return err
+		}
 	case "rdb":
 		meta.RdbParts = nil
 		meta.RdbFs = nil
@@ -912,7 +940,7 @@ func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 	default:
 		return fmt.Errorf("unsupported format type: %s", formatType)
 	}
-	if formatType != "adf" {
+	if formatType == "rdb" {
 		if err := saveMetadata(path, meta); err != nil {
 			return err
 		}
@@ -1490,18 +1518,33 @@ func handleGptInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
 		return errors.New("usage: gpt info <media>")
 	}
-	meta, err := loadMetadata(args[0])
+	header, parts, err := readGpt(args[0])
 	if err != nil {
 		return err
 	}
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"media": args[0], "parts": meta.GptParts})
+	outParts := make([]Part, 0, len(parts))
+	for _, p := range parts {
+		outParts = append(outParts, Part{
+			Index: p.Index,
+			Type:  gptGUIDToString(p.TypeGUID),
+			Name:  p.Name,
+			Start: int64(p.FirstLBA) * mbrSectorSize,
+			Size:  int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
+		})
 	}
-	if len(meta.GptParts) == 0 {
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{
+			"media":          args[0],
+			"parts":          outParts,
+			"firstUsableLBA": header.FirstUsable,
+			"lastUsableLBA":  header.LastUsable,
+		})
+	}
+	if len(outParts) == 0 {
 		fmt.Fprintln(stdout, "No GPT partitions.")
 		return nil
 	}
-	for _, p := range meta.GptParts {
+	for _, p := range outParts {
 		fmt.Fprintf(stdout, "#%d type=%s start=%d size=%d name=%s\n", p.Index, p.Type, p.Start, p.Size, p.Name)
 	}
 	return nil
@@ -1511,12 +1554,7 @@ func handleGptInitialize(args []string, stdout io.Writer, opts GlobalOptions) er
 	if len(args) < 1 {
 		return errors.New("usage: gpt initialize <media>")
 	}
-	meta, err := loadMetadata(args[0])
-	if err != nil {
-		return err
-	}
-	meta.GptParts = nil
-	if err := saveMetadata(args[0], meta); err != nil {
+	if err := initializeGpt(args[0]); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "gpt initialized", args[0])
@@ -1526,20 +1564,59 @@ func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	if len(args) < 3 {
 		return errors.New("usage: gpt part add <media> <type> <size|*>")
 	}
-	meta, err := loadMetadata(args[0])
+	header, parts, err := readGpt(args[0])
 	if err != nil {
 		return err
 	}
-	size, err := resolvePartSize(args[0], args[2], meta.GptParts)
+	partType, err := parseGptTypeGUID(args[1])
 	if err != nil {
 		return err
 	}
-	part := Part{Index: nextPartIndex(meta.GptParts), Type: args[1], Start: usedBytes(meta.GptParts), Size: size}
-	meta.GptParts = append(meta.GptParts, part)
-	if err := saveMetadata(args[0], meta); err != nil {
+	sizeBytes, err := resolveGptPartSize(args[0], args[2], header, parts)
+	if err != nil {
 		return err
 	}
-	return printSimpleStatus(stdout, opts, "gpt partition added", part)
+	sizeSectors := uint64(sizeBytes / mbrSectorSize)
+	if sizeSectors == 0 {
+		return errors.New("partition size must be at least 512 bytes")
+	}
+	startLBA := header.FirstUsable
+	for _, p := range parts {
+		if p.LastLBA+1 > startLBA {
+			startLBA = p.LastLBA + 1
+		}
+	}
+	endLBA := startLBA + sizeSectors - 1
+	if endLBA > header.LastUsable {
+		return errors.New("partition does not fit in GPT usable space")
+	}
+	index := nextGptPartitionIndex(header.NumEntries, parts)
+	if index == 0 {
+		return errors.New("no available GPT partition entries")
+	}
+	unique, err := newGUID()
+	if err != nil {
+		return err
+	}
+	entry := gptPartitionEntry{
+		Index:      index,
+		TypeGUID:   partType,
+		UniqueGUID: unique,
+		FirstLBA:   startLBA,
+		LastLBA:    endLBA,
+		Name:       args[1],
+	}
+	parts = append(parts, entry)
+	if err := writeGpt(args[0], header, parts); err != nil {
+		return err
+	}
+	return printSimpleStatus(stdout, opts, "gpt partition added", Part{
+		Index: entry.Index,
+		Type:  gptGUIDToString(entry.TypeGUID),
+		Name:  entry.Name,
+		Start: int64(entry.FirstLBA) * mbrSectorSize,
+		Size:  int64(entry.LastLBA-entry.FirstLBA+1) * mbrSectorSize,
+	})
 }
 
 func handleGptPartDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -1550,24 +1627,23 @@ func handleGptPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	header, parts, err := readGpt(args[0])
 	if err != nil {
 		return err
 	}
-	parts := make([]Part, 0, len(meta.GptParts))
+	newParts := make([]gptPartitionEntry, 0, len(parts))
 	found := false
-	for _, p := range meta.GptParts {
+	for _, p := range parts {
 		if p.Index == idx {
 			found = true
 			continue
 		}
-		parts = append(parts, p)
+		newParts = append(newParts, p)
 	}
 	if !found {
 		return fmt.Errorf("partition %d not found", idx)
 	}
-	meta.GptParts = parts
-	if err := saveMetadata(args[0], meta); err != nil {
+	if err := writeGpt(args[0], header, newParts); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "gpt partition deleted", idx)
@@ -1581,19 +1657,348 @@ func handleGptPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	header, parts, err := readGpt(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.GptParts, idx)
+	found := false
+	for i := range parts {
+		if parts[i].Index == idx {
+			parts[i].Name = args[2]
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("partition %d not found", idx)
+	}
+	if err := writeGpt(args[0], header, parts); err != nil {
+		return err
+	}
+	return printSimpleStatus(stdout, opts, "gpt partition formatted", idx)
+}
+
+func initializeGpt(path string) error {
+	sectors, err := mediaCapacitySectors(path)
 	if err != nil {
 		return err
 	}
-	p.Name = args[2]
-	if err := saveMetadata(args[0], meta); err != nil {
+	const entriesCount = 128
+	const entrySize = 128
+	entriesBytes := entriesCount * entrySize
+	entriesSectors := uint32((entriesBytes + mbrSectorSize - 1) / mbrSectorSize)
+	if sectors <= 2+entriesSectors+entriesSectors+1 {
+		return errors.New("media too small for GPT")
+	}
+	backupHeaderLBA := uint64(sectors - 1)
+	backupEntriesLBA := uint64(sectors - 1 - entriesSectors)
+	firstUsable := uint64(2 + entriesSectors)
+	lastUsable := backupEntriesLBA - 1
+	diskGUID, err := newGUID()
+	if err != nil {
 		return err
 	}
-	return printSimpleStatus(stdout, opts, "gpt partition formatted", p)
+	header := gptHeader{
+		CurrentLBA:     1,
+		BackupLBA:      backupHeaderLBA,
+		FirstUsable:    firstUsable,
+		LastUsable:     lastUsable,
+		DiskGUID:       diskGUID,
+		PartEntriesLBA: 2,
+		NumEntries:     entriesCount,
+		EntrySize:      entrySize,
+	}
+	if err := initializeProtectiveMbr(path, sectors); err != nil {
+		return err
+	}
+	return writeGpt(path, header, nil)
+}
+
+func initializeProtectiveMbr(path string, sectors uint32) error {
+	sector := make([]byte, mbrSectorSize)
+	sector[446+4] = 0xee
+	binary.LittleEndian.PutUint32(sector[446+8:446+12], 1)
+	binary.LittleEndian.PutUint32(sector[446+12:446+16], sectors-1)
+	sector[510] = 0x55
+	sector[511] = 0xaa
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteAt(sector, 0)
+	return err
+}
+
+func readGpt(path string) (gptHeader, []gptPartitionEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return gptHeader{}, nil, err
+	}
+	defer f.Close()
+	headerSector := make([]byte, mbrSectorSize)
+	if _, err := f.ReadAt(headerSector, mbrSectorSize); err != nil {
+		return gptHeader{}, nil, err
+	}
+	if string(headerSector[:8]) != "EFI PART" {
+		return gptHeader{}, nil, errors.New("guid partition table not found")
+	}
+	headerSize := binary.LittleEndian.Uint32(headerSector[12:16])
+	if headerSize < 92 || headerSize > mbrSectorSize {
+		return gptHeader{}, nil, errors.New("invalid gpt header size")
+	}
+	h := gptHeader{
+		CurrentLBA:     binary.LittleEndian.Uint64(headerSector[24:32]),
+		BackupLBA:      binary.LittleEndian.Uint64(headerSector[32:40]),
+		FirstUsable:    binary.LittleEndian.Uint64(headerSector[40:48]),
+		LastUsable:     binary.LittleEndian.Uint64(headerSector[48:56]),
+		PartEntriesLBA: binary.LittleEndian.Uint64(headerSector[72:80]),
+		NumEntries:     binary.LittleEndian.Uint32(headerSector[80:84]),
+		EntrySize:      binary.LittleEndian.Uint32(headerSector[84:88]),
+	}
+	copy(h.DiskGUID[:], headerSector[56:72])
+	if h.EntrySize < 128 {
+		return gptHeader{}, nil, errors.New("unsupported gpt entry size")
+	}
+	entriesBytes := int(h.NumEntries * h.EntrySize)
+	entryBuf := make([]byte, entriesBytes)
+	if _, err := f.ReadAt(entryBuf, int64(h.PartEntriesLBA)*mbrSectorSize); err != nil {
+		return gptHeader{}, nil, err
+	}
+	parts := make([]gptPartitionEntry, 0)
+	for i := 0; i < int(h.NumEntries); i++ {
+		offset := i * int(h.EntrySize)
+		chunk := entryBuf[offset : offset+int(h.EntrySize)]
+		var typeGUID [16]byte
+		copy(typeGUID[:], chunk[:16])
+		if isZeroGUID(typeGUID) {
+			continue
+		}
+		var unique [16]byte
+		copy(unique[:], chunk[16:32])
+		first := binary.LittleEndian.Uint64(chunk[32:40])
+		last := binary.LittleEndian.Uint64(chunk[40:48])
+		attrs := binary.LittleEndian.Uint64(chunk[48:56])
+		name := decodeUTF16Name(chunk[56 : 56+72])
+		parts = append(parts, gptPartitionEntry{
+			Index:      i + 1,
+			TypeGUID:   typeGUID,
+			UniqueGUID: unique,
+			FirstLBA:   first,
+			LastLBA:    last,
+			Attrs:      attrs,
+			Name:       name,
+		})
+	}
+	return h, parts, nil
+}
+
+func writeGpt(path string, header gptHeader, entries []gptPartitionEntry) error {
+	entryBytes := int(header.NumEntries * header.EntrySize)
+	entryBuf := make([]byte, entryBytes)
+	for _, e := range entries {
+		if e.Index < 1 || e.Index > int(header.NumEntries) {
+			return fmt.Errorf("invalid gpt partition index: %d", e.Index)
+		}
+		offset := (e.Index - 1) * int(header.EntrySize)
+		chunk := entryBuf[offset : offset+int(header.EntrySize)]
+		copy(chunk[:16], e.TypeGUID[:])
+		copy(chunk[16:32], e.UniqueGUID[:])
+		binary.LittleEndian.PutUint64(chunk[32:40], e.FirstLBA)
+		binary.LittleEndian.PutUint64(chunk[40:48], e.LastLBA)
+		binary.LittleEndian.PutUint64(chunk[48:56], e.Attrs)
+		copy(chunk[56:56+72], encodeUTF16Name(e.Name, 72))
+	}
+	partArrayCRC := crc32.ChecksumIEEE(entryBuf)
+	entriesSectors := uint64((len(entryBuf) + mbrSectorSize - 1) / mbrSectorSize)
+	backupEntriesLBA := header.BackupLBA - entriesSectors
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := writeBlocksAtLBA(f, header.PartEntriesLBA, entryBuf); err != nil {
+		return err
+	}
+	if err := writeBlocksAtLBA(f, backupEntriesLBA, entryBuf); err != nil {
+		return err
+	}
+	primary := buildGptHeaderSector(header, partArrayCRC)
+	if _, err := f.WriteAt(primary, int64(header.CurrentLBA)*mbrSectorSize); err != nil {
+		return err
+	}
+	backup := header
+	backup.CurrentLBA = header.BackupLBA
+	backup.BackupLBA = header.CurrentLBA
+	backup.PartEntriesLBA = backupEntriesLBA
+	backupSector := buildGptHeaderSector(backup, partArrayCRC)
+	if _, err := f.WriteAt(backupSector, int64(header.BackupLBA)*mbrSectorSize); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func writeBlocksAtLBA(f *os.File, lba uint64, data []byte) error {
+	paddedLen := ((len(data) + mbrSectorSize - 1) / mbrSectorSize) * mbrSectorSize
+	buf := make([]byte, paddedLen)
+	copy(buf, data)
+	_, err := f.WriteAt(buf, int64(lba)*mbrSectorSize)
+	return err
+}
+
+func buildGptHeaderSector(h gptHeader, partArrayCRC uint32) []byte {
+	sector := make([]byte, mbrSectorSize)
+	copy(sector[:8], []byte("EFI PART"))
+	binary.LittleEndian.PutUint32(sector[8:12], 0x00010000)
+	binary.LittleEndian.PutUint32(sector[12:16], 92)
+	binary.LittleEndian.PutUint64(sector[24:32], h.CurrentLBA)
+	binary.LittleEndian.PutUint64(sector[32:40], h.BackupLBA)
+	binary.LittleEndian.PutUint64(sector[40:48], h.FirstUsable)
+	binary.LittleEndian.PutUint64(sector[48:56], h.LastUsable)
+	copy(sector[56:72], h.DiskGUID[:])
+	binary.LittleEndian.PutUint64(sector[72:80], h.PartEntriesLBA)
+	binary.LittleEndian.PutUint32(sector[80:84], h.NumEntries)
+	binary.LittleEndian.PutUint32(sector[84:88], h.EntrySize)
+	binary.LittleEndian.PutUint32(sector[88:92], partArrayCRC)
+	// Header CRC is computed with its CRC field cleared.
+	binary.LittleEndian.PutUint32(sector[16:20], 0)
+	headerCRC := crc32.ChecksumIEEE(sector[:92])
+	binary.LittleEndian.PutUint32(sector[16:20], headerCRC)
+	return sector
+}
+
+func parseGptTypeGUID(value string) ([16]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "linux", "linuxdata":
+		return parseGUIDString("0fc63daf-8483-4772-8e79-3d69d8477de4")
+	case "efi", "esp", "efisystem":
+		return parseGUIDString("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+	case "microsoft", "basicdata", "ntfs", "fat32":
+		return parseGUIDString("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7")
+	default:
+		return parseGUIDString(value)
+	}
+}
+
+func resolveGptPartSize(mediaPath, value string, header gptHeader, parts []gptPartitionEntry) (int64, error) {
+	if value != "*" {
+		size, err := parseSize(value)
+		if err != nil {
+			return 0, err
+		}
+		return (size / mbrSectorSize) * mbrSectorSize, nil
+	}
+	var usedEnd uint64 = header.FirstUsable
+	for _, p := range parts {
+		if p.LastLBA+1 > usedEnd {
+			usedEnd = p.LastLBA + 1
+		}
+	}
+	if usedEnd > header.LastUsable {
+		return 0, errors.New("no free sectors available")
+	}
+	return int64(header.LastUsable-usedEnd+1) * mbrSectorSize, nil
+}
+
+func nextGptPartitionIndex(numEntries uint32, parts []gptPartitionEntry) int {
+	used := map[int]bool{}
+	for _, p := range parts {
+		used[p.Index] = true
+	}
+	for i := 1; i <= int(numEntries); i++ {
+		if !used[i] {
+			return i
+		}
+	}
+	return 0
+}
+
+func newGUID() ([16]byte, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return b, err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return b, nil
+}
+
+func parseGUIDString(value string) ([16]byte, error) {
+	var out [16]byte
+	s := strings.ToLower(strings.TrimSpace(value))
+	parts := strings.Split(s, "-")
+	if len(parts) != 5 {
+		return out, fmt.Errorf("invalid guid: %s", value)
+	}
+	if len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 || len(parts[3]) != 4 || len(parts[4]) != 12 {
+		return out, fmt.Errorf("invalid guid: %s", value)
+	}
+	p0, err := strconv.ParseUint(parts[0], 16, 32)
+	if err != nil {
+		return out, err
+	}
+	p1, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil {
+		return out, err
+	}
+	p2, err := strconv.ParseUint(parts[2], 16, 16)
+	if err != nil {
+		return out, err
+	}
+	binary.LittleEndian.PutUint32(out[0:4], uint32(p0))
+	binary.LittleEndian.PutUint16(out[4:6], uint16(p1))
+	binary.LittleEndian.PutUint16(out[6:8], uint16(p2))
+	tail := parts[3] + parts[4]
+	for i := 0; i < 8; i++ {
+		n, err := strconv.ParseUint(tail[i*2:i*2+2], 16, 8)
+		if err != nil {
+			return out, err
+		}
+		out[8+i] = byte(n)
+	}
+	return out, nil
+}
+
+func gptGUIDToString(b [16]byte) string {
+	a := binary.LittleEndian.Uint32(b[0:4])
+	c := binary.LittleEndian.Uint16(b[4:6])
+	d := binary.LittleEndian.Uint16(b[6:8])
+	return fmt.Sprintf("%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		a, c, d, b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15])
+}
+
+func isZeroGUID(g [16]byte) bool {
+	for _, b := range g {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeUTF16Name(data []byte) string {
+	u16 := make([]uint16, 0, len(data)/2)
+	for i := 0; i+1 < len(data); i += 2 {
+		v := binary.LittleEndian.Uint16(data[i : i+2])
+		if v == 0 {
+			break
+		}
+		u16 = append(u16, v)
+	}
+	return string(utf16.Decode(u16))
+}
+
+func encodeUTF16Name(value string, maxBytes int) []byte {
+	encoded := utf16.Encode([]rune(value))
+	maxUnits := maxBytes / 2
+	if len(encoded) > maxUnits {
+		encoded = encoded[:maxUnits]
+	}
+	out := make([]byte, maxBytes)
+	for i, v := range encoded {
+		binary.LittleEndian.PutUint16(out[i*2:i*2+2], v)
+	}
+	return out
 }
 
 func handleRdbInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
