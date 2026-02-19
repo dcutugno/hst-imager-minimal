@@ -61,6 +61,9 @@ type MediaMetadata struct {
 }
 
 const mbrSectorSize = 512
+const rdbSignature = "RDBGO100"
+const rdbHeaderSize = 16
+const rdbMetaStart = int64(64 * 1024)
 
 type mbrPartition struct {
 	Index       int
@@ -89,6 +92,31 @@ type gptPartitionEntry struct {
 	LastLBA    uint64
 	Attrs      uint64
 	Name       string
+}
+
+type rdbState struct {
+	RdbSize   int64           `json:"rdbSize"`
+	FsDataEnd int64           `json:"fsDataEnd"`
+	Fs        []rdbFileSystem `json:"filesystems"`
+	Parts     []rdbPart       `json:"partitions"`
+}
+
+type rdbFileSystem struct {
+	Index      int    `json:"index"`
+	Name       string `json:"name"`
+	DosType    string `json:"dosType,omitempty"`
+	Version    string `json:"version,omitempty"`
+	DataOffset int64  `json:"dataOffset"`
+	DataSize   int64  `json:"dataSize"`
+}
+
+type rdbPart struct {
+	Index  int    `json:"index"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Start  int64  `json:"start"`
+	Size   int64  `json:"size"`
+	Status string `json:"status"`
 }
 
 func main() {
@@ -836,14 +864,14 @@ func handleOptimize(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	target := explicitSize
 	if useRdb {
-		meta, err := loadMetadata(path)
+		state, err := readRdbState(path)
 		if err != nil {
 			return err
 		}
-		if meta.RdbSize <= 0 {
+		if state.RdbSize <= 0 {
 			return errors.New("no RDB size present for media")
 		}
-		target = meta.RdbSize
+		target = state.RdbSize
 	}
 	if target < 0 {
 		size, err := trimTrailingZeros(path)
@@ -909,10 +937,7 @@ func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	path := args[0]
 	formatType := strings.ToLower(args[1])
-	meta, err := loadMetadata(path)
-	if err != nil {
-		return err
-	}
+	var err error
 	switch formatType {
 	case "mbr":
 		if err := initializeMbr(path); err != nil {
@@ -923,9 +948,9 @@ func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 			return err
 		}
 	case "rdb":
-		meta.RdbParts = nil
-		meta.RdbFs = nil
-		meta.RdbSize = 0
+		if err := initializeRdb(args[0]); err != nil {
+			return err
+		}
 	case "adf":
 		size := int64(901120)
 		if len(args) > 2 {
@@ -939,11 +964,6 @@ func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 		}
 	default:
 		return fmt.Errorf("unsupported format type: %s", formatType)
-	}
-	if formatType == "rdb" {
-		if err := saveMetadata(path, meta); err != nil {
-			return err
-		}
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{"path": path, "type": formatType, "status": "formatted"})
@@ -2005,23 +2025,43 @@ func handleRdbInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
 		return errors.New("usage: rdb info <media>")
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
+	}
+	filesystems := make([]RdbFileSystem, 0, len(state.Fs))
+	for _, fs := range state.Fs {
+		filesystems = append(filesystems, RdbFileSystem{
+			Index:   fs.Index,
+			Path:    fs.Name,
+			DosType: fs.DosType,
+			Version: fs.Version,
+		})
+	}
+	partitions := make([]Part, 0, len(state.Parts))
+	for _, p := range state.Parts {
+		partitions = append(partitions, Part{
+			Index:  p.Index,
+			Name:   p.Name,
+			Type:   p.Type,
+			Start:  p.Start,
+			Size:   p.Size,
+			Status: p.Status,
+		})
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{
 			"media":       args[0],
-			"rdbSize":     meta.RdbSize,
-			"partitions":  meta.RdbParts,
-			"filesystems": meta.RdbFs,
+			"rdbSize":     state.RdbSize,
+			"partitions":  partitions,
+			"filesystems": filesystems,
 		})
 	}
-	fmt.Fprintf(stdout, "RDB size: %d\n", meta.RdbSize)
-	for _, fs := range meta.RdbFs {
-		fmt.Fprintf(stdout, "FS #%d path=%s dosType=%s version=%s\n", fs.Index, fs.Path, fs.DosType, fs.Version)
+	fmt.Fprintf(stdout, "RDB size: %d\n", state.RdbSize)
+	for _, fs := range filesystems {
+		fmt.Fprintf(stdout, "FS #%d name=%s dosType=%s version=%s\n", fs.Index, fs.Path, fs.DosType, fs.Version)
 	}
-	for _, p := range meta.RdbParts {
+	for _, p := range partitions {
 		fmt.Fprintf(stdout, "Part #%d name=%s type=%s start=%d size=%d status=%s\n", p.Index, p.Name, p.Type, p.Start, p.Size, p.Status)
 	}
 	return nil
@@ -2031,14 +2071,7 @@ func handleRdbInitialize(args []string, stdout io.Writer, opts GlobalOptions) er
 	if len(args) < 1 {
 		return errors.New("usage: rdb initialize <media>")
 	}
-	meta, err := loadMetadata(args[0])
-	if err != nil {
-		return err
-	}
-	meta.RdbParts = nil
-	meta.RdbFs = nil
-	meta.RdbSize = mediaSize(args[0])
-	if err := saveMetadata(args[0], meta); err != nil {
+	if err := initializeRdb(args[0]); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb initialized", args[0])
@@ -2052,12 +2085,25 @@ func handleRdbResize(args []string, stdout io.Writer, opts GlobalOptions) error 
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	meta.RdbSize = size
-	if err := saveMetadata(args[0], meta); err != nil {
+	if size < rdbMetaStart {
+		return fmt.Errorf("rdb size must be >= %d", rdbMetaStart)
+	}
+	for _, fs := range state.Fs {
+		if fs.DataOffset+fs.DataSize > size {
+			return errors.New("cannot shrink rdb below embedded filesystem data")
+		}
+	}
+	for _, p := range state.Parts {
+		if p.Start < size {
+			return errors.New("cannot shrink rdb below partition start offset")
+		}
+	}
+	state.RdbSize = size
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb resized", size)
@@ -2067,19 +2113,36 @@ func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
 		return errors.New("usage: rdb filesystem add <media> <path> [dostype]")
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	fs := RdbFileSystem{Index: nextFsIndex(meta.RdbFs), Path: args[1]}
+	b, err := os.ReadFile(args[1])
+	if err != nil {
+		return err
+	}
+	offset := alignUp(state.FsDataEnd, mbrSectorSize)
+	if offset+int64(len(b)) > state.RdbSize {
+		return errors.New("rdb has insufficient space for filesystem binary, resize rdb first")
+	}
+	if err := writeBytesAt(args[0], offset, b); err != nil {
+		return err
+	}
+	fs := rdbFileSystem{
+		Index:      nextRdbFsIndex(state.Fs),
+		Name:       filepath.Base(args[1]),
+		DataOffset: offset,
+		DataSize:   int64(len(b)),
+	}
 	if len(args) > 2 {
 		fs.DosType = args[2]
 	}
-	meta.RdbFs = append(meta.RdbFs, fs)
-	if err := saveMetadata(args[0], meta); err != nil {
+	state.Fs = append(state.Fs, fs)
+	state.FsDataEnd = offset + int64(len(b))
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
-	return printSimpleStatus(stdout, opts, "rdb filesystem added", fs)
+	return printSimpleStatus(stdout, opts, "rdb filesystem added", map[string]any{"index": fs.Index, "name": fs.Name, "size": fs.DataSize})
 }
 
 func handleRdbFsDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -2090,13 +2153,13 @@ func handleRdbFsDelete(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	out := make([]RdbFileSystem, 0, len(meta.RdbFs))
+	out := make([]rdbFileSystem, 0, len(state.Fs))
 	found := false
-	for _, fs := range meta.RdbFs {
+	for _, fs := range state.Fs {
 		if fs.Index == idx {
 			found = true
 			continue
@@ -2106,8 +2169,8 @@ func handleRdbFsDelete(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if !found {
 		return fmt.Errorf("filesystem %d not found", idx)
 	}
-	meta.RdbFs = out
-	if err := saveMetadata(args[0], meta); err != nil {
+	state.Fs = out
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb filesystem deleted", idx)
@@ -2125,21 +2188,28 @@ func handleRdbFsExport(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	var target *RdbFileSystem
-	for i := range meta.RdbFs {
-		if meta.RdbFs[i].Index == idx {
-			target = &meta.RdbFs[i]
+	var target *rdbFileSystem
+	for i := range state.Fs {
+		if state.Fs[i].Index == idx {
+			target = &state.Fs[i]
 			break
 		}
 	}
 	if target == nil {
 		return fmt.Errorf("filesystem %d not found", idx)
 	}
-	written, err := copyFile(target.Path, args[2], 0)
+	b, err := readBytesAt(args[0], target.DataOffset, target.DataSize)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(args[2], b, 0o644); err != nil {
+		return err
+	}
+	written := int64(len(b))
 	if err != nil {
 		return err
 	}
@@ -2154,16 +2224,16 @@ func handleRdbFsUpdate(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
 	found := false
-	for i := range meta.RdbFs {
-		if meta.RdbFs[i].Index == idx {
-			meta.RdbFs[i].DosType = args[2]
+	for i := range state.Fs {
+		if state.Fs[i].Index == idx {
+			state.Fs[i].DosType = args[2]
 			if len(args) > 3 {
-				meta.RdbFs[i].Version = args[3]
+				state.Fs[i].Version = args[3]
 			}
 			found = true
 			break
@@ -2172,7 +2242,7 @@ func handleRdbFsUpdate(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if !found {
 		return fmt.Errorf("filesystem %d not found", idx)
 	}
-	if err := saveMetadata(args[0], meta); err != nil {
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb filesystem updated", idx)
@@ -2182,24 +2252,28 @@ func handleRdbPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	if len(args) < 4 {
 		return errors.New("usage: rdb part add <media> <name> <type> <size|*>")
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	size, err := resolvePartSize(args[0], args[3], meta.RdbParts)
+	size, err := resolveRdbPartSize(args[0], args[3], state)
 	if err != nil {
 		return err
 	}
-	part := Part{
-		Index:  nextPartIndex(meta.RdbParts),
+	start := alignUp(maxInt64(state.RdbSize, rdbUsedEnd(state.Parts)), mbrSectorSize)
+	part := rdbPart{
+		Index:  nextRdbPartIndex(state.Parts),
 		Name:   args[1],
 		Type:   args[2],
-		Start:  usedBytes(meta.RdbParts),
+		Start:  start,
 		Size:   size,
 		Status: "active",
 	}
-	meta.RdbParts = append(meta.RdbParts, part)
-	if err := saveMetadata(args[0], meta); err != nil {
+	if part.Start+part.Size > mediaSize(args[0]) {
+		return errors.New("partition does not fit in media")
+	}
+	state.Parts = append(state.Parts, part)
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb partition added", part)
@@ -2213,19 +2287,25 @@ func handleRdbPartUpdate(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.RdbParts, idx)
-	if err != nil {
+	found := false
+	for i := range state.Parts {
+		if state.Parts[i].Index == idx {
+			state.Parts[i].Name = args[2]
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("partition %d not found", idx)
+	}
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
-	p.Name = args[2]
-	if err := saveMetadata(args[0], meta); err != nil {
-		return err
-	}
-	return printSimpleStatus(stdout, opts, "rdb partition updated", p)
+	return printSimpleStatus(stdout, opts, "rdb partition updated", idx)
 }
 
 func handleRdbPartDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -2236,13 +2316,13 @@ func handleRdbPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	out := make([]Part, 0, len(meta.RdbParts))
+	out := make([]rdbPart, 0, len(state.Parts))
 	found := false
-	for _, p := range meta.RdbParts {
+	for _, p := range state.Parts {
 		if p.Index == idx {
 			found = true
 			continue
@@ -2252,8 +2332,8 @@ func handleRdbPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 	if !found {
 		return fmt.Errorf("partition %d not found", idx)
 	}
-	meta.RdbParts = out
-	if err := saveMetadata(args[0], meta); err != nil {
+	state.Parts = out
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb partition deleted", idx)
@@ -2271,19 +2351,19 @@ func handleRdbPartCopy(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	srcMeta, err := loadMetadata(args[0])
+	srcState, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	dstMeta, err := loadMetadata(args[2])
+	dstState, err := readRdbState(args[2])
 	if err != nil {
 		return err
 	}
-	srcPart, err := findPart(srcMeta.RdbParts, srcIdx)
+	srcPart, err := findRdbPart(srcState.Parts, srcIdx)
 	if err != nil {
 		return err
 	}
-	dstPart, err := findPart(dstMeta.RdbParts, dstIdx)
+	dstPart, err := findRdbPart(dstState.Parts, dstIdx)
 	if err != nil {
 		return err
 	}
@@ -2306,11 +2386,11 @@ func handleRdbPartExport(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.RdbParts, idx)
+	p, err := findRdbPart(state.Parts, idx)
 	if err != nil {
 		return err
 	}
@@ -2329,11 +2409,11 @@ func handleRdbPartImport(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.RdbParts, idx)
+	p, err := findRdbPart(state.Parts, idx)
 	if err != nil {
 		return err
 	}
@@ -2352,16 +2432,22 @@ func handleRdbPartKill(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.RdbParts, idx)
-	if err != nil {
-		return err
+	found := false
+	for i := range state.Parts {
+		if state.Parts[i].Index == idx {
+			state.Parts[i].Status = "killed"
+			found = true
+			break
+		}
 	}
-	p.Status = "killed"
-	if err := saveMetadata(args[0], meta); err != nil {
+	if !found {
+		return fmt.Errorf("partition %d not found", idx)
+	}
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb partition killed", idx)
@@ -2379,19 +2465,25 @@ func handleRdbPartMove(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil || start < 0 {
 		return fmt.Errorf("invalid start: %s", args[2])
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.RdbParts, idx)
-	if err != nil {
+	found := false
+	for i := range state.Parts {
+		if state.Parts[i].Index == idx {
+			state.Parts[i].Start = start
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("partition %d not found", idx)
+	}
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
-	p.Start = start
-	if err := saveMetadata(args[0], meta); err != nil {
-		return err
-	}
-	return printSimpleStatus(stdout, opts, "rdb partition moved", p)
+	return printSimpleStatus(stdout, opts, "rdb partition moved", idx)
 }
 
 func handleRdbPartFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -2402,19 +2494,25 @@ func handleRdbPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.RdbParts, idx)
-	if err != nil {
+	found := false
+	for i := range state.Parts {
+		if state.Parts[i].Index == idx {
+			state.Parts[i].Name = args[2]
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("partition %d not found", idx)
+	}
+	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
-	p.Name = args[2]
-	if err := saveMetadata(args[0], meta); err != nil {
-		return err
-	}
-	return printSimpleStatus(stdout, opts, "rdb partition formatted", p)
+	return printSimpleStatus(stdout, opts, "rdb partition formatted", idx)
 }
 
 func handleRdbUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -2428,15 +2526,12 @@ func handleRdbBackup(args []string, stdout io.Writer, opts GlobalOptions) error 
 	if len(args) < 2 {
 		return errors.New("usage: rdb backup <media> <output>")
 	}
-	meta, err := loadMetadata(args[0])
+	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(meta, "", "  ")
+	_, err = copyRange(args[0], args[1], 0, 0, state.RdbSize)
 	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(args[1], b, 0o644); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb backup written", args[1])
@@ -2446,19 +2541,206 @@ func handleRdbRestore(args []string, stdout io.Writer, opts GlobalOptions) error
 	if len(args) < 2 {
 		return errors.New("usage: rdb restore <media> <input>")
 	}
-	b, err := os.ReadFile(args[1])
+	backupInfo, err := os.Stat(args[1])
 	if err != nil {
 		return err
 	}
-	var meta MediaMetadata
-	if err := json.Unmarshal(b, &meta); err != nil {
+	if backupInfo.Size() <= 0 {
+		return errors.New("invalid backup size")
+	}
+	if _, err := copyRange(args[1], args[0], 0, 0, backupInfo.Size()); err != nil {
 		return err
 	}
-	meta.MediaPath = args[0]
-	if err := saveMetadata(args[0], meta); err != nil {
+	if _, err := readRdbState(args[0]); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb backup restored", args[0])
+}
+
+func initializeRdb(path string) error {
+	total := mediaSize(path)
+	if total <= rdbMetaStart+mbrSectorSize {
+		return errors.New("media too small for rdb")
+	}
+	rdbSize := int64(1 * 1024 * 1024)
+	if rdbSize > total/4 {
+		rdbSize = alignUp(total/4, mbrSectorSize)
+	}
+	if rdbSize < rdbMetaStart {
+		rdbSize = alignUp(rdbMetaStart, mbrSectorSize)
+	}
+	if rdbSize >= total {
+		rdbSize = alignUp(total/2, mbrSectorSize)
+	}
+	state := rdbState{
+		RdbSize:   rdbSize,
+		FsDataEnd: rdbMetaStart,
+		Fs:        []rdbFileSystem{},
+		Parts:     []rdbPart{},
+	}
+	return writeRdbState(path, state)
+}
+
+func readRdbState(path string) (rdbState, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return rdbState{}, err
+	}
+	defer f.Close()
+	header := make([]byte, rdbHeaderSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return rdbState{}, err
+	}
+	if string(header[:8]) != rdbSignature {
+		return rdbState{}, errors.New("rigid disk block not found")
+	}
+	length := binary.LittleEndian.Uint32(header[8:12])
+	wantCRC := binary.LittleEndian.Uint32(header[12:16])
+	if length == 0 || length > 4*1024*1024 {
+		return rdbState{}, errors.New("invalid rdb state length")
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(f, payload); err != nil {
+		return rdbState{}, err
+	}
+	if crc32.ChecksumIEEE(payload) != wantCRC {
+		return rdbState{}, errors.New("rdb state checksum mismatch")
+	}
+	var state rdbState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return rdbState{}, err
+	}
+	if state.FsDataEnd == 0 {
+		state.FsDataEnd = rdbMetaStart
+	}
+	return state, nil
+}
+
+func writeRdbState(path string, state rdbState) error {
+	if state.RdbSize < rdbMetaStart {
+		return fmt.Errorf("invalid rdb size: %d", state.RdbSize)
+	}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if int64(len(payload)+rdbHeaderSize) > state.RdbSize {
+		return errors.New("rdb metadata exceeds rdb size")
+	}
+	header := make([]byte, rdbHeaderSize)
+	copy(header[:8], []byte(rdbSignature))
+	binary.LittleEndian.PutUint32(header[8:12], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[12:16], crc32.ChecksumIEEE(payload))
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(header, 0); err != nil {
+		return err
+	}
+	if _, err := f.WriteAt(payload, rdbHeaderSize); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func nextRdbFsIndex(items []rdbFileSystem) int {
+	max := 0
+	for _, fs := range items {
+		if fs.Index > max {
+			max = fs.Index
+		}
+	}
+	return max + 1
+}
+
+func nextRdbPartIndex(items []rdbPart) int {
+	max := 0
+	for _, p := range items {
+		if p.Index > max {
+			max = p.Index
+		}
+	}
+	return max + 1
+}
+
+func findRdbPart(items []rdbPart, index int) (rdbPart, error) {
+	for _, p := range items {
+		if p.Index == index {
+			return p, nil
+		}
+	}
+	return rdbPart{}, fmt.Errorf("partition %d not found", index)
+}
+
+func rdbUsedEnd(items []rdbPart) int64 {
+	end := int64(0)
+	for _, p := range items {
+		if p.Start+p.Size > end {
+			end = p.Start + p.Size
+		}
+	}
+	return end
+}
+
+func resolveRdbPartSize(mediaPath, value string, state rdbState) (int64, error) {
+	if value != "*" {
+		size, err := parseSize(value)
+		if err != nil {
+			return 0, err
+		}
+		return alignUp(size, mbrSectorSize), nil
+	}
+	total := mediaSize(mediaPath)
+	start := alignUp(maxInt64(state.RdbSize, rdbUsedEnd(state.Parts)), mbrSectorSize)
+	remain := total - start
+	if remain < 0 {
+		remain = 0
+	}
+	return alignUp(remain, mbrSectorSize), nil
+}
+
+func writeBytesAt(path string, offset int64, data []byte) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteAt(data, offset)
+	return err
+}
+
+func readBytesAt(path string, offset, size int64) ([]byte, error) {
+	if size < 0 {
+		return nil, errors.New("size must be >= 0")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b := make([]byte, size)
+	_, err = io.ReadFull(io.NewSectionReader(f, offset, size), b)
+	return b, err
+}
+
+func alignUp(value int64, by int64) int64 {
+	if by <= 0 {
+		return value
+	}
+	rem := value % by
+	if rem == 0 {
+		return value
+	}
+	return value + (by - rem)
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func printSimpleStatus(stdout io.Writer, opts GlobalOptions, message string, details any) error {

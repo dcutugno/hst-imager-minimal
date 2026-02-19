@@ -467,3 +467,151 @@ func TestGptLowLevelBinaryParity(t *testing.T) {
 		t.Fatalf("expected 0 gpt partitions after delete, got %d", len(payload.Parts))
 	}
 }
+
+func TestRdbFullWorkflowParity(t *testing.T) {
+	tmp := t.TempDir()
+	mediaA := filepath.Join(tmp, "rdb-a.img")
+	mediaB := filepath.Join(tmp, "rdb-b.img")
+	fsBin := filepath.Join(tmp, "fs.bin")
+	fsOut := filepath.Join(tmp, "fs-out.bin")
+	partOut := filepath.Join(tmp, "part.bin")
+	backup := filepath.Join(tmp, "rdb.bak")
+	partIn := filepath.Join(tmp, "part-in.bin")
+	var out bytes.Buffer
+
+	if err := os.WriteFile(fsBin, []byte("filesystem-payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partIn, bytes.Repeat([]byte{0xcd}, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"blank", mediaA, "16MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"blank", mediaB, "16MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "init", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "init", mediaB}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run([]string{"rdb", "resize", mediaA, "2MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "fs", "add", mediaA, fsBin, "PDS3"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "fs", "update", mediaA, "1", "PFS3", "1.0"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "fs", "export", mediaA, "1", fsOut}, &out); err != nil {
+		t.Fatal(err)
+	}
+	gotFs, err := os.ReadFile(fsOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotFs) != "filesystem-payload" {
+		t.Fatalf("unexpected fs export payload: %q", string(gotFs))
+	}
+
+	if err := run([]string{"rdb", "part", "add", mediaA, "DH0", "PDS3", "4KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "add", mediaB, "DH0", "PDS3", "4KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "import", mediaA, "1", partIn}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "export", mediaA, "1", partOut}, &out); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := os.ReadFile(partOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(exported[:4096], bytes.Repeat([]byte{0xcd}, 4096)) {
+		t.Fatal("unexpected exported rdb partition payload")
+	}
+	if err := run([]string{"rdb", "part", "copy", mediaA, "1", mediaB, "1"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	verifyB := filepath.Join(tmp, "part-b.bin")
+	if err := run([]string{"rdb", "part", "export", mediaB, "1", verifyB}, &out); err != nil {
+		t.Fatal(err)
+	}
+	copyBytes, err := os.ReadFile(verifyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(copyBytes[:4096], bytes.Repeat([]byte{0xcd}, 4096)) {
+		t.Fatal("unexpected copied rdb partition payload")
+	}
+
+	if err := run([]string{"rdb", "part", "move", mediaA, "1", "3145728"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "kill", mediaA, "1"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "format", mediaA, "1", "WORK"}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var info struct {
+		RdbSize    int64  `json:"rdbSize"`
+		Partitions []Part `json:"partitions"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.RdbSize != 2*1024*1024 {
+		t.Fatalf("unexpected rdb size: %d", info.RdbSize)
+	}
+	if len(info.Partitions) != 1 || info.Partitions[0].Status != "killed" || info.Partitions[0].Name != "WORK" {
+		t.Fatalf("unexpected rdb partition info: %+v", info.Partitions)
+	}
+
+	if err := run([]string{"rdb", "backup", mediaA, backup}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "init", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "restore", mediaA, backup}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Partitions) != 1 || info.Partitions[0].Name != "WORK" {
+		t.Fatalf("unexpected restored rdb partition info: %+v", info.Partitions)
+	}
+
+	if err := run([]string{"rdb", "fs", "del", mediaA, "1"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var fullInfo map[string]any
+	if err := json.Unmarshal(out.Bytes(), &fullInfo); err != nil {
+		t.Fatal(err)
+	}
+	if fs, ok := fullInfo["filesystems"].([]any); !ok || len(fs) != 0 {
+		t.Fatalf("expected zero filesystems after delete: %+v", fullInfo["filesystems"])
+	}
+}

@@ -36,7 +36,8 @@ This Go prototype now has functional coverage for all commands currently exposed
 Low-level parity work is in progress:
 - MBR operations (`info`, `initialize`, `part add/delete/export/import/clone`) read/write real on-disk MBR sector structures.
 - GPT operations (`info`, `initialize`, `part add/delete/format`) read/write real on-disk GPT headers and partition entries (including CRC updates and protective MBR).
-Some advanced areas are still intentionally lightweight (notably RDB internals and parts of filesystem/media-format behavior) and do not yet reproduce full binary-level parity with the original .NET core.
+- RDB operations now use an on-media binary RDB state block and embedded data regions for filesystems/partitions, including `backup`/`restore` from raw RDB bytes.
+Some advanced areas (exact Amiga RDB binary layout parity, full filesystem/media-format compatibility breadth) are still in progress and not yet byte-identical with the original .NET core in every edge case.
 
 
 ## Verify local vs remote sync
