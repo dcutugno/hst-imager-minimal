@@ -672,3 +672,42 @@ func TestInfoDetectsPartitionTables(t *testing.T) {
 		t.Fatalf("expected RDB in info output: %s", out.String())
 	}
 }
+
+func TestCompressedTransferAndCompare(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.img")
+	gz := filepath.Join(tmp, "out.img.gz")
+	zipPath := filepath.Join(tmp, "out.img.zip")
+	plainFromGz := filepath.Join(tmp, "from-gz.img")
+	plainFromZip := filepath.Join(tmp, "from-zip.img")
+	var out bytes.Buffer
+
+	payload := bytes.Repeat([]byte("ABCD"), 1024)
+	if err := os.WriteFile(src, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"transfer", src, gz}, &out); err != nil {
+		t.Fatalf("transfer to gz failed: %v", err)
+	}
+	if err := run([]string{"transfer", src, zipPath}, &out); err != nil {
+		t.Fatalf("transfer to zip failed: %v", err)
+	}
+	if err := run([]string{"transfer", gz, plainFromGz}, &out); err != nil {
+		t.Fatalf("transfer from gz failed: %v", err)
+	}
+	if err := run([]string{"transfer", zipPath, plainFromZip}, &out); err != nil {
+		t.Fatalf("transfer from zip failed: %v", err)
+	}
+	if err := run([]string{"compare", src, plainFromGz}, &out); err != nil {
+		t.Fatalf("compare src/plainFromGz failed: %v", err)
+	}
+	if err := run([]string{"compare", src, plainFromZip}, &out); err != nil {
+		t.Fatalf("compare src/plainFromZip failed: %v", err)
+	}
+	if err := run([]string{"compare", src, gz}, &out); err != nil {
+		t.Fatalf("compare src/gz failed: %v", err)
+	}
+	if err := run([]string{"compare", src, zipPath}, &out); err != nil {
+		t.Fatalf("compare src/zip failed: %v", err)
+	}
+}

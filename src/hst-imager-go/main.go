@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
@@ -855,7 +856,7 @@ func parseSize(value string) (int64, error) {
 }
 
 func copyFile(source, destination string, size int64) (int64, error) {
-	src, err := os.Open(source)
+	src, err := openSourceReader(source)
 	if err != nil {
 		return 0, err
 	}
@@ -864,7 +865,7 @@ func copyFile(source, destination string, size int64) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil && filepath.Dir(destination) != "." {
 		return 0, err
 	}
-	dst, err := os.Create(destination)
+	dst, err := openDestinationWriter(destination)
 	if err != nil {
 		return 0, err
 	}
@@ -877,32 +878,55 @@ func copyFile(source, destination string, size int64) (int64, error) {
 }
 
 func compareFiles(source, destination string, size int64) (bool, int64, error) {
-	a, err := os.ReadFile(source)
+	a, err := openSourceReader(source)
 	if err != nil {
 		return false, 0, err
 	}
-	b, err := os.ReadFile(destination)
+	defer a.Close()
+	b, err := openSourceReader(destination)
 	if err != nil {
 		return false, 0, err
 	}
+	defer b.Close()
 
-	limit := len(a)
-	if len(b) < limit {
-		limit = len(b)
-	}
-	if size > 0 && int(size) < limit {
-		limit = int(size)
-	}
-
-	for i := 0; i < limit; i++ {
-		if a[i] != b[i] {
-			return false, int64(i + 1), nil
+	const bufSize = 64 * 1024
+	ab := make([]byte, bufSize)
+	bb := make([]byte, bufSize)
+	var compared int64
+	for {
+		if size > 0 && compared >= size {
+			return true, compared, nil
 		}
+		maxRead := bufSize
+		if size > 0 {
+			remaining := size - compared
+			if remaining < int64(maxRead) {
+				maxRead = int(remaining)
+			}
+		}
+		an, aerr := a.Read(ab[:maxRead])
+		if aerr != nil && !errors.Is(aerr, io.EOF) {
+			return false, compared, aerr
+		}
+		bn, berr := b.Read(bb[:maxRead])
+		if berr != nil && !errors.Is(berr, io.EOF) {
+			return false, compared, berr
+		}
+
+		if an == 0 && bn == 0 {
+			break
+		}
+		if an != bn {
+			return false, compared + int64(min(an, bn)), nil
+		}
+		for i := 0; i < an; i++ {
+			if ab[i] != bb[i] {
+				return false, compared + int64(i+1), nil
+			}
+		}
+		compared += int64(an)
 	}
-	if size == 0 && len(a) != len(b) {
-		return false, int64(limit), nil
-	}
-	return true, int64(limit), nil
+	return true, compared, nil
 }
 
 func fileType(info os.FileInfo) string {
@@ -3029,3 +3053,140 @@ func copyRange(srcPath, dstPath string, srcOffset, dstOffset, size int64) (int64
 	}
 	return written, nil
 }
+
+type readCloser struct {
+	reader io.Reader
+	closer io.Closer
+}
+
+func (r *readCloser) Read(p []byte) (int, error) { return r.reader.Read(p) }
+func (r *readCloser) Close() error               { return r.closer.Close() }
+
+type writeCloser struct {
+	writer io.Writer
+	close  func() error
+}
+
+func (w *writeCloser) Write(p []byte) (int, error) { return w.writer.Write(p) }
+func (w *writeCloser) Close() error                { return w.close() }
+
+func openSourceReader(path string) (io.ReadCloser, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".gz":
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &readCloser{
+			reader: gr,
+			closer: closerFunc(func() error {
+				err1 := gr.Close()
+				err2 := f.Close()
+				if err1 != nil {
+					return err1
+				}
+				return err2
+			}),
+		}, nil
+	case ".zip":
+		zr, err := zip.OpenReader(path)
+		if err != nil {
+			return nil, err
+		}
+		if len(zr.File) == 0 {
+			_ = zr.Close()
+			return nil, errors.New("zip archive has no entries")
+		}
+		var picked *zip.File
+		for _, f := range zr.File {
+			if !f.FileInfo().IsDir() {
+				picked = f
+				break
+			}
+		}
+		if picked == nil {
+			_ = zr.Close()
+			return nil, errors.New("zip archive has no file entries")
+		}
+		rc, err := picked.Open()
+		if err != nil {
+			_ = zr.Close()
+			return nil, err
+		}
+		return &readCloser{
+			reader: rc,
+			closer: closerFunc(func() error {
+				err1 := rc.Close()
+				err2 := zr.Close()
+				if err1 != nil {
+					return err1
+				}
+				return err2
+			}),
+		}, nil
+	default:
+		return os.Open(path)
+	}
+}
+
+func openDestinationWriter(path string) (io.WriteCloser, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".gz":
+		f, err := os.Create(path)
+		if err != nil {
+			return nil, err
+		}
+		gw := gzip.NewWriter(f)
+		return &writeCloser{
+			writer: gw,
+			close: func() error {
+				err1 := gw.Close()
+				err2 := f.Close()
+				if err1 != nil {
+					return err1
+				}
+				return err2
+			},
+		}, nil
+	case ".zip":
+		f, err := os.Create(path)
+		if err != nil {
+			return nil, err
+		}
+		zw := zip.NewWriter(f)
+		entryName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if entryName == "" {
+			entryName = "data.img"
+		}
+		w, err := zw.Create(entryName)
+		if err != nil {
+			_ = zw.Close()
+			_ = f.Close()
+			return nil, err
+		}
+		return &writeCloser{
+			writer: w,
+			close: func() error {
+				err1 := zw.Close()
+				err2 := f.Close()
+				if err1 != nil {
+					return err1
+				}
+				return err2
+			},
+		}, nil
+	default:
+		return os.Create(path)
+	}
+}
+
+type closerFunc func() error
+
+func (c closerFunc) Close() error { return c() }
