@@ -12,7 +12,7 @@ Initial bootstrap for porting Hst Imager Console to Go.
   - `transfer <source> <destination> [--size <bytes>]`
   - `read` and `write` as transfer aliases
   - `compare <source> <destination> [--size <bytes>]`
-  - `list` (working-directory listing for local testability)
+  - `list` (enumerates removable/physical drives; OS-dependent)
 - automated tests for command tree, global option parsing, and end-to-end file flow
 
 ## Build

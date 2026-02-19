@@ -23,8 +23,8 @@ fi
 
 echo "[5/5] Running smoke test for JSON mode"
 JSON_OUT="$(go run . --format json list)"
-if [[ "$JSON_OUT" != *'"entries"'* ]]; then
-  echo "ERROR: json list output does not contain entries"
+if [[ "$JSON_OUT" != *'"drives"'* ]]; then
+  echo "ERROR: json list output does not contain drives"
   exit 1
 fi
 

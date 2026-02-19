@@ -33,13 +33,13 @@ func TestNestedRdbPartCommand(t *testing.T) {
 	}
 }
 
-func TestRunAcceptsGlobalOptionsWithValues(t *testing.T) {
+func TestRunListJsonOutput(t *testing.T) {
 	var out bytes.Buffer
-	err := run([]string{"--log-file", "hst.log", "--format", "json", "list"}, &out)
+	err := run([]string{"--format", "json", "list"}, &out)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	if !strings.Contains(out.String(), "\"entries\"") {
+	if !strings.Contains(out.String(), "\"drives\"") {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
 }

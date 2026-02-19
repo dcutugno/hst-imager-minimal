@@ -6,13 +6,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
 
 type GlobalOptions struct {
 	Format string
+}
+
+type DriveInfo struct {
+	Path      string `json:"path"`
+	Model     string `json:"model,omitempty"`
+	Size      uint64 `json:"size,omitempty"`
+	Removable bool   `json:"removable"`
 }
 
 func main() {
@@ -129,34 +138,128 @@ func handleList(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) != 0 {
 		return errors.New("usage: list")
 	}
-	cwd, err := os.Getwd()
+	drives, err := listPhysicalDrives()
 	if err != nil {
 		return err
-	}
-	entries, err := os.ReadDir(cwd)
-	if err != nil {
-		return err
-	}
-	type item struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-	}
-	items := make([]item, 0, len(entries))
-	for _, e := range entries {
-		t := "file"
-		if e.IsDir() {
-			t = "dir"
-		}
-		items = append(items, item{Name: e.Name(), Type: t})
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"cwd": cwd, "entries": items})
+		return writeJSON(stdout, map[string]any{"drives": drives})
 	}
-	fmt.Fprintf(stdout, "Working directory: %s\n", cwd)
-	for _, i := range items {
-		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+	if len(drives) == 0 {
+		fmt.Fprintln(stdout, "No removable drives found.")
+		return nil
+	}
+	for _, d := range drives {
+		fmt.Fprintf(stdout, "- %s", d.Path)
+		if d.Model != "" {
+			fmt.Fprintf(stdout, " (%s)", d.Model)
+		}
+		if d.Size > 0 {
+			fmt.Fprintf(stdout, " %d bytes", d.Size)
+		}
+		fmt.Fprintln(stdout)
 	}
 	return nil
+}
+
+func listPhysicalDrives() ([]DriveInfo, error) {
+	switch runtime.GOOS {
+	case "linux":
+		return listLinuxDrives()
+	case "darwin":
+		return listDarwinDrives()
+	case "windows":
+		return listWindowsDrives()
+	default:
+		return nil, fmt.Errorf("list is not supported on OS: %s", runtime.GOOS)
+	}
+}
+
+func listLinuxDrives() ([]DriveInfo, error) {
+	out, err := exec.Command("lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,MODEL,RM,TYPE,TRAN").Output()
+	if err != nil {
+		return nil, err
+	}
+	type block struct {
+		Name  string `json:"name"`
+		Path  string `json:"path"`
+		Model string `json:"model"`
+		Size  uint64 `json:"size"`
+		Rm    bool   `json:"rm"`
+		Type  string `json:"type"`
+		Tran  string `json:"tran"`
+	}
+	var payload struct {
+		Blockdevices []block `json:"blockdevices"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return nil, err
+	}
+	drives := make([]DriveInfo, 0)
+	for _, b := range payload.Blockdevices {
+		if b.Type != "disk" {
+			continue
+		}
+		removable := b.Rm || strings.EqualFold(b.Tran, "usb")
+		if !removable {
+			continue
+		}
+		path := b.Path
+		if path == "" && b.Name != "" {
+			path = "/dev/" + strings.TrimSpace(b.Name)
+		}
+		drives = append(drives, DriveInfo{Path: strings.TrimSpace(path), Model: strings.TrimSpace(b.Model), Size: b.Size, Removable: true})
+	}
+	return drives, nil
+}
+
+func listDarwinDrives() ([]DriveInfo, error) {
+	out, err := exec.Command("diskutil", "list", "external", "physical").Output()
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(out), "\n")
+	drives := make([]DriveInfo, 0)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "/dev/disk") {
+			drives = append(drives, DriveInfo{Path: strings.Fields(line)[0], Removable: true})
+		}
+	}
+	return drives, nil
+}
+
+func listWindowsDrives() ([]DriveInfo, error) {
+	script := "Get-CimInstance Win32_DiskDrive | Select-Object DeviceID,Model,Size,MediaType,InterfaceType | ConvertTo-Json -Compress"
+	out, err := exec.Command("powershell", "-NoProfile", "-Command", script).Output()
+	if err != nil {
+		return nil, err
+	}
+	type disk struct {
+		DeviceID      string `json:"DeviceID"`
+		Model         string `json:"Model"`
+		Size          string `json:"Size"`
+		MediaType     string `json:"MediaType"`
+		InterfaceType string `json:"InterfaceType"`
+	}
+	var many []disk
+	if err := json.Unmarshal(out, &many); err != nil {
+		var one disk
+		if err2 := json.Unmarshal(out, &one); err2 != nil {
+			return nil, err
+		}
+		many = []disk{one}
+	}
+	drives := make([]DriveInfo, 0)
+	for _, d := range many {
+		isRemovable := strings.Contains(strings.ToLower(d.MediaType), "removable") || strings.EqualFold(d.InterfaceType, "USB")
+		if !isRemovable {
+			continue
+		}
+		sz, _ := strconv.ParseUint(strings.TrimSpace(d.Size), 10, 64)
+		drives = append(drives, DriveInfo{Path: d.DeviceID, Model: strings.TrimSpace(d.Model), Size: sz, Removable: true})
+	}
+	return drives, nil
 }
 
 func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {
