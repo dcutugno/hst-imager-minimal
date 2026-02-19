@@ -13,6 +13,10 @@ Initial bootstrap for porting Hst Imager Console to Go.
   - `read` and `write` as transfer aliases
   - `compare <source> <destination> [--size <bytes>]`
   - `list` (enumerates removable/physical drives; OS-dependent)
+  - `settings list|update`
+  - `fs dir [path]` (local filesystem)
+  - `archive list <zip-path>`
+  - `script <path>` (line-by-line command execution)
 - automated tests for command tree, global option parsing, and end-to-end file flow
 
 ## Build
@@ -26,8 +30,7 @@ go test ./...
 ```
 
 ## Status
-This is still a prototype: many command groups are currently stubs.
-Core file-based flow is now executable and testable while maintaining a CLI-compatibility-first approach.
+This is a significantly expanded prototype with working implementations for list, file flow, settings, fs dir, archive list and script execution. Some advanced command groups (mbr/gpt/rdb/adf/full fs parity) are still pending.
 
 
 ## Verify local vs remote sync

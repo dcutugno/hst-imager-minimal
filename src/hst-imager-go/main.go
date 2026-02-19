@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -23,6 +26,8 @@ type DriveInfo struct {
 	Size      uint64 `json:"size,omitempty"`
 	Removable bool   `json:"removable"`
 }
+
+type Settings map[string]string
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
@@ -69,6 +74,16 @@ func run(args []string, stdout io.Writer) error {
 		return handleTransfer(remaining, stdout, consumedPath, opts)
 	case "compare":
 		return handleCompare(remaining, stdout, opts)
+	case "settings list":
+		return handleSettingsList(remaining, stdout, opts)
+	case "settings update":
+		return handleSettingsUpdate(remaining, stdout, opts)
+	case "fs dir":
+		return handleFsDir(remaining, stdout, opts)
+	case "archive list":
+		return handleArchiveList(remaining, stdout, opts)
+	case "script":
+		return handleScript(remaining, stdout)
 	default:
 		if len(remaining) > 0 {
 			return fmt.Errorf("unknown command path: %s", strings.Join(commandArgs, " "))
@@ -260,6 +275,177 @@ func listWindowsDrives() ([]DriveInfo, error) {
 		drives = append(drives, DriveInfo{Path: d.DeviceID, Model: strings.TrimSpace(d.Model), Size: sz, Removable: true})
 	}
 	return drives, nil
+}
+
+func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
+	path := "."
+	if len(args) > 0 {
+		path = args[0]
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	type item struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}
+	items := make([]item, 0, len(entries))
+	for _, e := range entries {
+		t := "file"
+		if e.IsDir() {
+			t = "dir"
+		}
+		items = append(items, item{Name: e.Name(), Type: t})
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{"path": path, "entries": items})
+	}
+	for _, i := range items {
+		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+	}
+	return nil
+}
+
+func handleArchiveList(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) < 1 {
+		return errors.New("usage: archive list <path-to-zip>")
+	}
+	zr, err := zip.OpenReader(args[0])
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	type entry struct {
+		Name string `json:"name"`
+		Size uint64 `json:"size"`
+	}
+	items := make([]entry, 0, len(zr.File))
+	for _, f := range zr.File {
+		items = append(items, entry{Name: f.Name, Size: f.UncompressedSize64})
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{"path": args[0], "entries": items})
+	}
+	for _, i := range items {
+		fmt.Fprintf(stdout, "- %s (%d bytes)\n", i.Name, i.Size)
+	}
+	return nil
+}
+
+func handleScript(args []string, stdout io.Writer) error {
+	if len(args) < 1 {
+		return errors.New("usage: script <path>")
+	}
+	f, err := os.Open(args[0])
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	lineNo := 0
+	for s.Scan() {
+		lineNo++
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if err := run(strings.Fields(line), stdout); err != nil {
+			return fmt.Errorf("script line %d failed: %w", lineNo, err)
+		}
+	}
+	return s.Err()
+}
+
+func settingsFilePath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(configDir, "hst-imager-go")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "settings.json"), nil
+}
+
+func readSettings() (Settings, error) {
+	path, err := settingsFilePath()
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Settings{}, nil
+		}
+		return nil, err
+	}
+	var s Settings
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, err
+	}
+	if s == nil {
+		s = Settings{}
+	}
+	return s, nil
+}
+
+func writeSettings(s Settings) error {
+	path, err := settingsFilePath()
+	if err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
+
+func handleSettingsList(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) != 0 {
+		return errors.New("usage: settings list")
+	}
+	s, err := readSettings()
+	if err != nil {
+		return err
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, s)
+	}
+	keys := make([]string, 0, len(s))
+	for k := range s {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(stdout, "%s=%s\n", k, s[k])
+	}
+	if len(keys) == 0 {
+		fmt.Fprintln(stdout, "No settings.")
+	}
+	return nil
+}
+
+func handleSettingsUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) < 2 {
+		return errors.New("usage: settings update <key> <value>")
+	}
+	s, err := readSettings()
+	if err != nil {
+		return err
+	}
+	key, value := args[0], args[1]
+	s[key] = value
+	if err := writeSettings(s); err != nil {
+		return err
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{"updated": key, "value": value})
+	}
+	fmt.Fprintf(stdout, "Updated setting %s=%s\n", key, value)
+	return nil
 }
 
 func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {

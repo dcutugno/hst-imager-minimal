@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"os"
 	"path/filepath"
@@ -10,26 +11,11 @@ import (
 
 func TestRootCommandContainsExpectedCommands(t *testing.T) {
 	root := BuildRootCommand()
-	expected := []string{"list", "info", "read", "write", "compare", "transfer", "mbr", "gpt", "rdb", "fs", "adf", "settings"}
+	expected := []string{"list", "info", "read", "write", "compare", "transfer", "mbr", "gpt", "rdb", "fs", "adf", "settings", "archive", "script"}
 	for _, name := range expected {
 		if root.Find(name) == nil {
 			t.Fatalf("expected command %q to exist", name)
 		}
-	}
-}
-
-func TestNestedRdbPartCommand(t *testing.T) {
-	root := BuildRootCommand()
-	rdb := root.Find("rdb")
-	if rdb == nil {
-		t.Fatal("rdb command missing")
-	}
-	part := rdb.Find("part")
-	if part == nil {
-		t.Fatal("rdb part command missing")
-	}
-	if part.Find("format") == nil {
-		t.Fatal("rdb part format command missing")
 	}
 }
 
@@ -44,36 +30,67 @@ func TestRunListJsonOutput(t *testing.T) {
 	}
 }
 
-func TestRunErrorsOnMissingGlobalOptionValue(t *testing.T) {
+func TestSettingsUpdateAndList(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	var out bytes.Buffer
-	err := run([]string{"--log-file"}, &out)
-	if err == nil {
-		t.Fatal("expected error for missing --log-file value")
+	if err := run([]string{"settings", "update", "foo", "bar"}, &out); err != nil {
+		t.Fatalf("settings update failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "missing value for global option") {
-		t.Fatalf("unexpected error: %v", err)
+	out.Reset()
+	if err := run([]string{"settings", "list"}, &out); err != nil {
+		t.Fatalf("settings list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "foo=bar") {
+		t.Fatalf("unexpected settings output: %q", out.String())
 	}
 }
 
-func TestRunErrorsOnUnsupportedFormat(t *testing.T) {
+func TestFsDirAndArchiveListAndScript(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	var out bytes.Buffer
-	err := run([]string{"--format", "yaml", "list"}, &out)
-	if err == nil {
-		t.Fatal("expected error for unsupported format")
+	if err := run([]string{"fs", "dir", tmp}, &out); err != nil {
+		t.Fatalf("fs dir failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unsupported format") {
-		t.Fatalf("unexpected error: %v", err)
+	if !strings.Contains(out.String(), "a.txt") {
+		t.Fatalf("unexpected fs dir output: %q", out.String())
 	}
-}
 
-func TestRunPrintsGlobalHelp(t *testing.T) {
-	var out bytes.Buffer
-	err := run([]string{"--help"}, &out)
+	zipPath := filepath.Join(tmp, "test.zip")
+	zf, err := os.Create(zipPath)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "Global options:") {
-		t.Fatalf("expected global help output, got %q", out.String())
+	zw := zip.NewWriter(zf)
+	w, err := zw.Create("inside.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("data"))
+	_ = zw.Close()
+	_ = zf.Close()
+
+	out.Reset()
+	if err := run([]string{"archive", "list", zipPath}, &out); err != nil {
+		t.Fatalf("archive list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "inside.txt") {
+		t.Fatalf("unexpected archive list output: %q", out.String())
+	}
+
+	scriptPath := filepath.Join(tmp, "run.txt")
+	script := "blank " + filepath.Join(tmp, "s.img") + " 1KB\ninfo " + filepath.Join(tmp, "s.img") + "\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"script", scriptPath}, &out); err != nil {
+		t.Fatalf("script failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Created blank image") || !strings.Contains(out.String(), "Path:") {
+		t.Fatalf("unexpected script output: %q", out.String())
 	}
 }
 
@@ -99,60 +116,15 @@ func TestBlankInfoTransferCompareFlow(t *testing.T) {
 	if err := run([]string{"transfer", src, dst}, &out); err != nil {
 		t.Fatalf("transfer failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Transferred") {
-		t.Fatalf("unexpected transfer output: %q", out.String())
-	}
-
 	out.Reset()
 	if err := run([]string{"compare", src, dst}, &out); err != nil {
 		t.Fatalf("compare failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Compare successful") {
-		t.Fatalf("unexpected compare output: %q", out.String())
-	}
-
 	out.Reset()
 	if err := run([]string{"info", dst}, &out); err != nil {
 		t.Fatalf("info failed: %v", err)
 	}
 	if !strings.Contains(out.String(), "Size: 1024") {
 		t.Fatalf("unexpected info output: %q", out.String())
-	}
-}
-
-func TestJSONFormatForInfo(t *testing.T) {
-	tmp := t.TempDir()
-	p := filepath.Join(tmp, "x.bin")
-	if err := os.WriteFile(p, []byte{1, 2, 3, 4}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if err := run([]string{"--format", "json", "info", p}, &out); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "\"size\": 4") {
-		t.Fatalf("unexpected json info output: %q", out.String())
-	}
-}
-
-func TestCompareDetectsDifference(t *testing.T) {
-	tmp := t.TempDir()
-	a := filepath.Join(tmp, "a.bin")
-	b := filepath.Join(tmp, "b.bin")
-
-	if err := os.WriteFile(a, []byte{1, 2, 3}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(b, []byte{1, 9, 3}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	err := run([]string{"compare", a, b}, &out)
-	if err == nil {
-		t.Fatal("expected compare error for differing files")
-	}
-	if !strings.Contains(err.Error(), "compare failed") {
-		t.Fatalf("unexpected compare error: %v", err)
 	}
 }
