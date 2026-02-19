@@ -5,19 +5,21 @@ Initial bootstrap for porting Hst Imager Console to Go.
 ## What it includes
 - CLI structure with a high-level compatible command tree
 - global options (`--verbose`, `--log-file`, `--format`) with `table|json` output modes
-- subcommand tree for `mbr`, `gpt`, `rdb`, `fs`, `adf`, `archive`, `settings`
-- basic working file-based commands for early testing:
-  - `blank <path> <size>`
-  - `info <path>`
-  - `transfer <source> <destination> [--size <bytes>]`
-  - `read` and `write` as transfer aliases
-  - `compare <source> <destination> [--size <bytes>]`
-  - `list` (enumerates removable/physical drives; OS-dependent)
-  - `settings list|update`
-  - `fs dir [path]` (local filesystem)
-  - `archive list <zip-path>`
-  - `script <path>` (line-by-line command execution)
-- automated tests for command tree, global option parsing, and end-to-end file flow
+- working handlers for all top-level command groups and subcommands in the current Go command tree:
+  - imaging: `list`, `blank`, `convert`, `transfer`, `read`, `write`, `compare`, `info`, `optimize`, `format`
+  - block: `block read`, `block view`
+  - settings: `settings list`, `settings update`
+  - filesystem: `fs dir`, `fs copy`, `fs extract`, `fs mkdir`
+  - archive/script/adf: `archive list`, `script`, `adf create`
+  - partition tables:
+    - `mbr info|initialize|part add|delete|format|export|import|clone`
+    - `gpt info|initialize|part add|delete|format`
+    - `rdb info|initialize|resize|filesystem add|delete|import|export|update|part add|update|delete|copy|export|import|kill|move|format|update|backup|restore`
+- command aliases to match original CLI habits:
+  - `init` -> `initialize`
+  - `del` -> `delete`
+  - `rdb fs ...` -> `rdb filesystem ...`
+- automated tests for command tree, global option parsing, file flow, and expanded advanced command families
 
 ## Build
 ```bash
@@ -30,7 +32,8 @@ go test ./...
 ```
 
 ## Status
-This is a significantly expanded prototype with working implementations for list, file flow, settings, fs dir, archive list and script execution. Some advanced command groups (mbr/gpt/rdb/adf/full fs parity) are still pending.
+This Go prototype now has functional coverage for all commands currently exposed in `command_tree.go`.
+Implementation is intentionally lightweight in some advanced areas (metadata-backed partition-table operations, local-filesystem-focused fs behavior) and does not yet reproduce full binary-level parity with the original .NET core for every media/filesystem format.
 
 
 ## Verify local vs remote sync

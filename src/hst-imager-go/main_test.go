@@ -128,3 +128,146 @@ func TestBlankInfoTransferCompareFlow(t *testing.T) {
 		t.Fatalf("unexpected info output: %q", out.String())
 	}
 }
+
+func TestAdvancedCommandFamilies(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("XDG_CACHE_HOME", tmp)
+
+	media := filepath.Join(tmp, "disk.img")
+	fsBin := filepath.Join(tmp, "pfs3aio")
+	if err := os.WriteFile(fsBin, []byte("filesystem-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "8KB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"mbr", "init", media}, &out); err != nil {
+		t.Fatalf("mbr init failed: %v", err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "FAT32", "1KB"}, &out); err != nil {
+		t.Fatalf("mbr part add failed: %v", err)
+	}
+	if err := run([]string{"mbr", "part", "format", media, "1", "PC"}, &out); err != nil {
+		t.Fatalf("mbr part format failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "mbr", "info", media}, &out); err != nil {
+		t.Fatalf("mbr info failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "\"parts\"") {
+		t.Fatalf("unexpected mbr info output: %q", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"gpt", "init", media}, &out); err != nil {
+		t.Fatalf("gpt init failed: %v", err)
+	}
+	if err := run([]string{"gpt", "part", "add", media, "LINUX", "2KB"}, &out); err != nil {
+		t.Fatalf("gpt part add failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatalf("gpt info failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "\"parts\"") {
+		t.Fatalf("unexpected gpt info output: %q", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"rdb", "init", media}, &out); err != nil {
+		t.Fatalf("rdb init failed: %v", err)
+	}
+	if err := run([]string{"rdb", "fs", "add", media, fsBin, "PDS3"}, &out); err != nil {
+		t.Fatalf("rdb fs add failed: %v", err)
+	}
+	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "1KB"}, &out); err != nil {
+		t.Fatalf("rdb part add failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", media}, &out); err != nil {
+		t.Fatalf("rdb info failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "\"filesystems\"") || !strings.Contains(out.String(), "\"partitions\"") {
+		t.Fatalf("unexpected rdb info output: %q", out.String())
+	}
+}
+
+func TestFsBlockOptimizeAndAdfCommands(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", tmp)
+
+	srcDir := filepath.Join(tmp, "src")
+	dstDir := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "file.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "mkdir", dstDir}, &out); err != nil {
+		t.Fatalf("fs mkdir failed: %v", err)
+	}
+	if err := run([]string{"fs", "copy", srcDir, dstDir, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs copy failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "file.txt")); err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+
+	image := filepath.Join(tmp, "image.bin")
+	if err := os.WriteFile(image, append([]byte("abcd"), make([]byte, 128)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"optimize", image}, &out); err != nil {
+		t.Fatalf("optimize failed: %v", err)
+	}
+	info, err := os.Stat(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 4 {
+		t.Fatalf("expected optimized size 4, got %d", info.Size())
+	}
+
+	blockOut := filepath.Join(tmp, "block.bin")
+	out.Reset()
+	if err := run([]string{"block", "read", image, "0", "2", blockOut}, &out); err != nil {
+		t.Fatalf("block read failed: %v", err)
+	}
+	b, err := os.ReadFile(blockOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "ab" {
+		t.Fatalf("unexpected block read content: %q", string(b))
+	}
+
+	out.Reset()
+	if err := run([]string{"block", "view", image, "0", "4"}, &out); err != nil {
+		t.Fatalf("block view failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "61 62 63 64") {
+		t.Fatalf("unexpected block view output: %q", out.String())
+	}
+
+	adf := filepath.Join(tmp, "disk.adf")
+	out.Reset()
+	if err := run([]string{"adf", "create", adf}, &out); err != nil {
+		t.Fatalf("adf create failed: %v", err)
+	}
+	adfInfo, err := os.Stat(adf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adfInfo.Size() != 901120 {
+		t.Fatalf("unexpected adf size: %d", adfInfo.Size())
+	}
+}
