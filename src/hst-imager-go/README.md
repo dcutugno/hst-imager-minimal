@@ -37,6 +37,7 @@ Low-level parity work is in progress:
 - MBR operations (`info`, `initialize`, `part add/delete/export/import/clone`) read/write real on-disk MBR sector structures.
 - GPT operations (`info`, `initialize`, `part add/delete/format`) read/write real on-disk GPT headers and partition entries (including CRC updates and protective MBR).
 - RDB operations now use an on-media binary RDB state block and embedded data regions for filesystems/partitions, including `backup`/`restore` from raw RDB bytes.
+- `info <path>` now inspects and reports detected partition-table structures (MBR/GPT/RDB) instead of only file metadata.
 Some advanced areas (exact Amiga RDB binary layout parity, full filesystem/media-format compatibility breadth) are still in progress and not yet byte-identical with the original .NET core in every edge case.
 
 

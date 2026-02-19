@@ -651,18 +651,110 @@ func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
 		return errors.New("usage: info <path>")
 	}
-	info, err := os.Stat(args[0])
+	path := args[0]
+	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
 	fType := fileType(info)
-	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": args[0], "type": fType, "size": info.Size()})
+	mbrParts, hasMbr := tryReadMbr(path)
+	gptHeader, gptParts, hasGpt := tryReadGpt(path)
+	rdbStateValue, hasRdb := tryReadRdb(path)
+
+	partitionTables := make([]string, 0)
+	if hasMbr {
+		partitionTables = append(partitionTables, "MBR")
 	}
-	fmt.Fprintf(stdout, "Path: %s\n", args[0])
+	if hasGpt {
+		partitionTables = append(partitionTables, "GPT")
+	}
+	if hasRdb {
+		partitionTables = append(partitionTables, "RDB")
+	}
+
+	if opts.Format == "json" {
+		out := map[string]any{
+			"path":            path,
+			"type":            fType,
+			"size":            info.Size(),
+			"partitionTables": partitionTables,
+		}
+		if hasMbr {
+			parts := make([]Part, 0, len(mbrParts))
+			for _, p := range mbrParts {
+				parts = append(parts, mbrPartitionToPart(p))
+			}
+			out["mbr"] = map[string]any{"parts": parts}
+		}
+		if hasGpt {
+			parts := make([]Part, 0, len(gptParts))
+			for _, p := range gptParts {
+				parts = append(parts, Part{
+					Index: p.Index,
+					Type:  gptGUIDToString(p.TypeGUID),
+					Name:  p.Name,
+					Start: int64(p.FirstLBA) * mbrSectorSize,
+					Size:  int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
+				})
+			}
+			out["gpt"] = map[string]any{
+				"firstUsableLBA": gptHeader.FirstUsable,
+				"lastUsableLBA":  gptHeader.LastUsable,
+				"parts":          parts,
+			}
+		}
+		if hasRdb {
+			parts := make([]Part, 0, len(rdbStateValue.Parts))
+			for _, p := range rdbStateValue.Parts {
+				parts = append(parts, Part{
+					Index:  p.Index,
+					Name:   p.Name,
+					Type:   p.Type,
+					Start:  p.Start,
+					Size:   p.Size,
+					Status: p.Status,
+				})
+			}
+			out["rdb"] = map[string]any{
+				"rdbSize": rdbStateValue.RdbSize,
+				"parts":   parts,
+			}
+		}
+		return writeJSON(stdout, out)
+	}
+	fmt.Fprintf(stdout, "Path: %s\n", path)
 	fmt.Fprintf(stdout, "Type: %s\n", fType)
 	fmt.Fprintf(stdout, "Size: %d\n", info.Size())
+	if len(partitionTables) == 0 {
+		fmt.Fprintln(stdout, "PartitionTables: none")
+		return nil
+	}
+	fmt.Fprintf(stdout, "PartitionTables: %s\n", strings.Join(partitionTables, ", "))
+	if hasMbr {
+		fmt.Fprintf(stdout, "MBR partitions: %d\n", len(mbrParts))
+	}
+	if hasGpt {
+		fmt.Fprintf(stdout, "GPT partitions: %d\n", len(gptParts))
+	}
+	if hasRdb {
+		fmt.Fprintf(stdout, "RDB partitions: %d\n", len(rdbStateValue.Parts))
+	}
 	return nil
+}
+
+func tryReadMbr(path string) ([]mbrPartition, bool) {
+	parts, err := readMbrPartitions(path)
+	return parts, err == nil
+}
+
+func tryReadGpt(path string) (gptHeader, []gptPartitionEntry, bool) {
+	header, parts, err := readGpt(path)
+	return header, parts, err == nil
+}
+
+func tryReadRdb(path string) (rdbState, bool) {
+	state, err := readRdbState(path)
+	return state, err == nil
 }
 
 func handleTransfer(args []string, stdout io.Writer, command string, opts GlobalOptions) error {

@@ -615,3 +615,60 @@ func TestRdbFullWorkflowParity(t *testing.T) {
 		t.Fatalf("expected zero filesystems after delete: %+v", fullInfo["filesystems"])
 	}
 }
+
+func TestInfoDetectsPartitionTables(t *testing.T) {
+	tmp := t.TempDir()
+	mbrMedia := filepath.Join(tmp, "mbr.img")
+	gptMedia := filepath.Join(tmp, "gpt.img")
+	rdbMedia := filepath.Join(tmp, "rdb.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", mbrMedia, "4MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "init", mbrMedia}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", mbrMedia, "fat32", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "info", mbrMedia}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var mbrInfo map[string]any
+	if err := json.Unmarshal(out.Bytes(), &mbrInfo); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "\"MBR\"") {
+		t.Fatalf("expected MBR in info output: %s", out.String())
+	}
+
+	if err := run([]string{"blank", gptMedia, "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "init", gptMedia}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "info", gptMedia}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "\"GPT\"") {
+		t.Fatalf("expected GPT in info output: %s", out.String())
+	}
+
+	if err := run([]string{"blank", rdbMedia, "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "init", rdbMedia}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "info", rdbMedia}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "\"RDB\"") {
+		t.Fatalf("expected RDB in info output: %s", out.String())
+	}
+}
