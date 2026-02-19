@@ -38,6 +38,14 @@ See [Hst Imager Gui](src/Hst.Imager.GuiApp#hst-imager-gui) page for installation
 
 See [Hst Imager Console](src/Hst.Imager.ConsoleApp#hst-imager-console) page for installation and usage of Hst Imager Console.
 
+See [Go porting proposal](go-porting-proposal.md) for a migration plan to a minimal cross-platform console app without Electron/Chrome runtime dependencies.
+
+See [Go porting roadmap](go-porting-roadmap.md) for feature parity checklist, priorities and measurable acceptance criteria.
+
+### Go prototype
+
+An initial Go console prototype bootstrap is available in [src/hst-imager-go](src/hst-imager-go).
+
 ## Features
 
 Hst Imager Gui comes with following features:
