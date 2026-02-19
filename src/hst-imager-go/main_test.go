@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,7 +142,7 @@ func TestAdvancedCommandFamilies(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := run([]string{"blank", media, "8KB"}, &out); err != nil {
+	if err := run([]string{"blank", media, "8MB"}, &out); err != nil {
 		t.Fatalf("blank failed: %v", err)
 	}
 
@@ -269,5 +270,124 @@ func TestFsBlockOptimizeAndAdfCommands(t *testing.T) {
 	}
 	if adfInfo.Size() != 901120 {
 		t.Fatalf("unexpected adf size: %d", adfInfo.Size())
+	}
+}
+
+func TestMbrLowLevelBinaryParity(t *testing.T) {
+	tmp := t.TempDir()
+	mediaA := filepath.Join(tmp, "disk-a.img")
+	mediaB := filepath.Join(tmp, "disk-b.img")
+	exportPath := filepath.Join(tmp, "part.bin")
+
+	var out bytes.Buffer
+	if err := run([]string{"blank", mediaA, "1MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"blank", mediaB, "1MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "init", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "init", mediaB}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	sector0, err := os.ReadFile(mediaA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sector0[510] != 0x55 || sector0[511] != 0xaa {
+		t.Fatalf("missing mbr signature: %x %x", sector0[510], sector0[511])
+	}
+
+	if err := run([]string{"mbr", "part", "add", mediaA, "fat32", "16KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", mediaB, "fat32", "16KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "mbr", "info", mediaA}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Parts []Part `json:"parts"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Parts) != 1 {
+		t.Fatalf("expected 1 mbr partition, got %d", len(payload.Parts))
+	}
+	if payload.Parts[0].Start != 63*512 {
+		t.Fatalf("unexpected start offset: %d", payload.Parts[0].Start)
+	}
+	if payload.Parts[0].Size != 16*1024 {
+		t.Fatalf("unexpected partition size: %d", payload.Parts[0].Size)
+	}
+
+	// Write pattern directly at MBR partition start.
+	pattern := bytes.Repeat([]byte{0xab}, 16*1024)
+	fa, err := os.OpenFile(mediaA, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fa.WriteAt(pattern, int64(payload.Parts[0].Start)); err != nil {
+		t.Fatal(err)
+	}
+	_ = fa.Close()
+
+	if err := run([]string{"mbr", "part", "export", mediaA, "1", exportPath}, &out); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := os.ReadFile(exportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(exported, pattern) {
+		t.Fatal("exported bytes do not match source partition bytes")
+	}
+
+	zeroes := make([]byte, len(pattern))
+	fa, err = os.OpenFile(mediaA, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fa.WriteAt(zeroes, int64(payload.Parts[0].Start)); err != nil {
+		t.Fatal(err)
+	}
+	_ = fa.Close()
+	if err := run([]string{"mbr", "part", "import", mediaA, "1", exportPath}, &out); err != nil {
+		t.Fatal(err)
+	}
+	restored := make([]byte, len(pattern))
+	fa, err = os.Open(mediaA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fa.ReadAt(restored, int64(payload.Parts[0].Start)); err != nil {
+		t.Fatal(err)
+	}
+	_ = fa.Close()
+	if !bytes.Equal(restored, pattern) {
+		t.Fatal("import did not restore partition bytes")
+	}
+
+	if err := run([]string{"mbr", "part", "clone", mediaA, "1", mediaB, "1"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	cloned := make([]byte, len(pattern))
+	fb, err := os.Open(mediaB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fb.ReadAt(cloned, int64(payload.Parts[0].Start)); err != nil {
+		t.Fatal(err)
+	}
+	_ = fb.Close()
+	if !bytes.Equal(cloned, pattern) {
+		t.Fatal("cloned bytes do not match source partition bytes")
 	}
 }

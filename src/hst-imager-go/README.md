@@ -33,7 +33,8 @@ go test ./...
 
 ## Status
 This Go prototype now has functional coverage for all commands currently exposed in `command_tree.go`.
-Implementation is intentionally lightweight in some advanced areas (metadata-backed partition-table operations, local-filesystem-focused fs behavior) and does not yet reproduce full binary-level parity with the original .NET core for every media/filesystem format.
+Low-level parity work is in progress: MBR operations (`info`, `initialize`, `part add/delete/export/import/clone`) now read/write real on-disk MBR sector structures.
+Some advanced areas are still intentionally lightweight (notably GPT/RDB internals and parts of filesystem/media-format behavior) and do not yet reproduce full binary-level parity with the original .NET core.
 
 
 ## Verify local vs remote sync

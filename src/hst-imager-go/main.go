@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,6 +55,16 @@ type MediaMetadata struct {
 	RdbSize   int64           `json:"rdbSize,omitempty"`
 	RdbParts  []Part          `json:"rdbParts,omitempty"`
 	RdbFs     []RdbFileSystem `json:"rdbFileSystems,omitempty"`
+}
+
+const mbrSectorSize = 512
+
+type mbrPartition struct {
+	Index       int
+	Bootable    bool
+	TypeCode    byte
+	StartLBA    uint32
+	SectorCount uint32
 }
 
 func main() {
@@ -1058,19 +1069,24 @@ func handleMbrInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
 		return errors.New("usage: mbr info <media>")
 	}
-	meta, err := loadMetadata(args[0])
+	parts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"media": args[0], "parts": meta.MbrParts})
+		outParts := make([]Part, 0, len(parts))
+		for _, p := range parts {
+			outParts = append(outParts, mbrPartitionToPart(p))
+		}
+		return writeJSON(stdout, map[string]any{"media": args[0], "parts": outParts})
 	}
-	if len(meta.MbrParts) == 0 {
+	if len(parts) == 0 {
 		fmt.Fprintln(stdout, "No MBR partitions.")
 		return nil
 	}
-	for _, p := range meta.MbrParts {
-		fmt.Fprintf(stdout, "#%d type=%s start=%d size=%d name=%s\n", p.Index, p.Type, p.Start, p.Size, p.Name)
+	for _, p := range parts {
+		part := mbrPartitionToPart(p)
+		fmt.Fprintf(stdout, "#%d type=%s start=%d size=%d name=%s\n", part.Index, part.Type, part.Start, part.Size, part.Name)
 	}
 	return nil
 }
@@ -1079,12 +1095,7 @@ func handleMbrInitialize(args []string, stdout io.Writer, opts GlobalOptions) er
 	if len(args) < 1 {
 		return errors.New("usage: mbr initialize <media>")
 	}
-	meta, err := loadMetadata(args[0])
-	if err != nil {
-		return err
-	}
-	meta.MbrParts = nil
-	if err := saveMetadata(args[0], meta); err != nil {
+	if err := initializeMbr(args[0]); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "mbr initialized", args[0])
@@ -1094,21 +1105,52 @@ func handleMbrPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	if len(args) < 3 {
 		return errors.New("usage: mbr part add <media> <type> <size|*>")
 	}
-	meta, err := loadMetadata(args[0])
+	parts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
-	size, err := resolvePartSize(args[0], args[2], meta.MbrParts)
+	if len(parts) >= 4 {
+		return errors.New("mbr supports maximum 4 primary partitions")
+	}
+	sizeBytes, err := resolveMbrPartSize(args[0], args[2], parts)
 	if err != nil {
 		return err
 	}
-	start := usedBytes(meta.MbrParts)
-	part := Part{Index: nextPartIndex(meta.MbrParts), Type: args[1], Start: start, Size: size}
-	meta.MbrParts = append(meta.MbrParts, part)
-	if err := saveMetadata(args[0], meta); err != nil {
+	typeCode, err := parseMbrPartitionType(args[1])
+	if err != nil {
 		return err
 	}
-	return printSimpleStatus(stdout, opts, "mbr partition added", part)
+	const firstUsableLBA uint32 = 63
+	nextStart := firstUsableLBA
+	for _, p := range parts {
+		end := p.StartLBA + p.SectorCount
+		if end > nextStart {
+			nextStart = end
+		}
+	}
+	sizeSectors := uint32(sizeBytes / mbrSectorSize)
+	if sizeSectors == 0 {
+		return errors.New("partition size must be at least 512 bytes")
+	}
+	capacitySectors, err := mediaCapacitySectors(args[0])
+	if err != nil {
+		return err
+	}
+	if uint64(nextStart)+uint64(sizeSectors) > uint64(capacitySectors) {
+		return errors.New("partition does not fit in media")
+	}
+	p := mbrPartition{
+		Index:       nextMbrPartitionIndex(parts),
+		Bootable:    false,
+		TypeCode:    typeCode,
+		StartLBA:    nextStart,
+		SectorCount: sizeSectors,
+	}
+	parts = append(parts, p)
+	if err := writeMbrPartitions(args[0], parts); err != nil {
+		return err
+	}
+	return printSimpleStatus(stdout, opts, "mbr partition added", mbrPartitionToPart(p))
 }
 
 func handleMbrPartDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -1119,13 +1161,13 @@ func handleMbrPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	parts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
-	newParts := make([]Part, 0, len(meta.MbrParts))
+	newParts := make([]mbrPartition, 0, len(parts))
 	found := false
-	for _, p := range meta.MbrParts {
+	for _, p := range parts {
 		if p.Index == idx {
 			found = true
 			continue
@@ -1135,8 +1177,7 @@ func handleMbrPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 	if !found {
 		return fmt.Errorf("partition %d not found", idx)
 	}
-	meta.MbrParts = newParts
-	if err := saveMetadata(args[0], meta); err != nil {
+	if err := writeMbrPartitions(args[0], newParts); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "mbr partition deleted", idx)
@@ -1150,19 +1191,17 @@ func handleMbrPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	parts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.MbrParts, idx)
+	p, err := findMbrPart(parts, idx)
 	if err != nil {
 		return err
 	}
-	p.Name = args[2]
-	if err := saveMetadata(args[0], meta); err != nil {
-		return err
-	}
-	return printSimpleStatus(stdout, opts, "mbr partition formatted", p)
+	part := mbrPartitionToPart(p)
+	part.Name = args[2]
+	return printSimpleStatus(stdout, opts, "mbr partition format requested", part)
 }
 
 func handleMbrPartExport(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -1173,15 +1212,17 @@ func handleMbrPartExport(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	parts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.MbrParts, idx)
+	p, err := findMbrPart(parts, idx)
 	if err != nil {
 		return err
 	}
-	written, err := copyRange(args[0], args[2], p.Start, 0, p.Size)
+	start := int64(p.StartLBA) * mbrSectorSize
+	size := int64(p.SectorCount) * mbrSectorSize
+	written, err := copyRange(args[0], args[2], start, 0, size)
 	if err != nil {
 		return err
 	}
@@ -1196,15 +1237,17 @@ func handleMbrPartImport(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	meta, err := loadMetadata(args[0])
+	parts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
-	p, err := findPart(meta.MbrParts, idx)
+	p, err := findMbrPart(parts, idx)
 	if err != nil {
 		return err
 	}
-	written, err := copyRange(args[2], args[0], 0, p.Start, p.Size)
+	start := int64(p.StartLBA) * mbrSectorSize
+	size := int64(p.SectorCount) * mbrSectorSize
+	written, err := copyRange(args[2], args[0], 0, start, size)
 	if err != nil {
 		return err
 	}
@@ -1223,31 +1266,224 @@ func handleMbrPartClone(args []string, stdout io.Writer, opts GlobalOptions) err
 	if err != nil {
 		return err
 	}
-	srcMeta, err := loadMetadata(args[0])
+	srcParts, err := readMbrPartitions(args[0])
 	if err != nil {
 		return err
 	}
-	dstMeta, err := loadMetadata(args[2])
+	dstParts, err := readMbrPartitions(args[2])
 	if err != nil {
 		return err
 	}
-	srcPart, err := findPart(srcMeta.MbrParts, srcIdx)
+	srcPart, err := findMbrPart(srcParts, srcIdx)
 	if err != nil {
 		return err
 	}
-	dstPart, err := findPart(dstMeta.MbrParts, dstIdx)
+	dstPart, err := findMbrPart(dstParts, dstIdx)
 	if err != nil {
 		return err
 	}
-	size := srcPart.Size
-	if dstPart.Size < size {
-		size = dstPart.Size
+	size := int64(srcPart.SectorCount) * mbrSectorSize
+	dstSize := int64(dstPart.SectorCount) * mbrSectorSize
+	if dstSize < size {
+		size = dstSize
 	}
-	written, err := copyRange(args[0], args[2], srcPart.Start, dstPart.Start, size)
+	srcStart := int64(srcPart.StartLBA) * mbrSectorSize
+	dstStart := int64(dstPart.StartLBA) * mbrSectorSize
+	written, err := copyRange(args[0], args[2], srcStart, dstStart, size)
 	if err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "mbr partition cloned", map[string]any{"bytes": written})
+}
+
+func initializeMbr(path string) error {
+	sector := make([]byte, mbrSectorSize)
+	sector[510] = 0x55
+	sector[511] = 0xaa
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(sector, 0); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func readMbrPartitions(path string) ([]mbrPartition, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sector := make([]byte, mbrSectorSize)
+	if _, err := io.ReadFull(f, sector); err != nil {
+		return nil, err
+	}
+	if sector[510] != 0x55 || sector[511] != 0xaa {
+		return nil, errors.New("master boot record not found")
+	}
+	parts := make([]mbrPartition, 0, 4)
+	for i := 0; i < 4; i++ {
+		offset := 446 + i*16
+		boot := sector[offset]
+		typeCode := sector[offset+4]
+		start := binary.LittleEndian.Uint32(sector[offset+8 : offset+12])
+		count := binary.LittleEndian.Uint32(sector[offset+12 : offset+16])
+		if typeCode == 0 || count == 0 {
+			continue
+		}
+		parts = append(parts, mbrPartition{
+			Index:       i + 1,
+			Bootable:    boot == 0x80,
+			TypeCode:    typeCode,
+			StartLBA:    start,
+			SectorCount: count,
+		})
+	}
+	return parts, nil
+}
+
+func writeMbrPartitions(path string, parts []mbrPartition) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sector := make([]byte, mbrSectorSize)
+	if _, err := io.ReadFull(f, sector); err != nil {
+		return err
+	}
+	for i := 0; i < 4; i++ {
+		offset := 446 + i*16
+		clear(sector[offset : offset+16])
+	}
+	for _, p := range parts {
+		if p.Index < 1 || p.Index > 4 {
+			return fmt.Errorf("invalid mbr partition index: %d", p.Index)
+		}
+		offset := 446 + (p.Index-1)*16
+		if p.Bootable {
+			sector[offset] = 0x80
+		}
+		// CHS placeholders for modern LBA-based layout.
+		sector[offset+1] = 0xfe
+		sector[offset+2] = 0xff
+		sector[offset+3] = 0xff
+		sector[offset+4] = p.TypeCode
+		sector[offset+5] = 0xfe
+		sector[offset+6] = 0xff
+		sector[offset+7] = 0xff
+		binary.LittleEndian.PutUint32(sector[offset+8:offset+12], p.StartLBA)
+		binary.LittleEndian.PutUint32(sector[offset+12:offset+16], p.SectorCount)
+	}
+	sector[510] = 0x55
+	sector[511] = 0xaa
+	if _, err := f.WriteAt(sector, 0); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func mbrPartitionToPart(p mbrPartition) Part {
+	return Part{
+		Index:    p.Index,
+		Type:     fmt.Sprintf("0x%02x", p.TypeCode),
+		Start:    int64(p.StartLBA) * mbrSectorSize,
+		Size:     int64(p.SectorCount) * mbrSectorSize,
+		Bootable: p.Bootable,
+	}
+}
+
+func nextMbrPartitionIndex(parts []mbrPartition) int {
+	used := map[int]bool{}
+	for _, p := range parts {
+		used[p.Index] = true
+	}
+	for i := 1; i <= 4; i++ {
+		if !used[i] {
+			return i
+		}
+	}
+	return 0
+}
+
+func findMbrPart(parts []mbrPartition, index int) (mbrPartition, error) {
+	for _, p := range parts {
+		if p.Index == index {
+			return p, nil
+		}
+	}
+	return mbrPartition{}, fmt.Errorf("partition %d not found", index)
+}
+
+func mediaCapacitySectors(path string) (uint32, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.Size() < mbrSectorSize {
+		return 0, errors.New("media size too small")
+	}
+	return uint32(info.Size() / mbrSectorSize), nil
+}
+
+func resolveMbrPartSize(mediaPath, value string, parts []mbrPartition) (int64, error) {
+	if value != "*" {
+		size, err := parseSize(value)
+		if err != nil {
+			return 0, err
+		}
+		return (size / mbrSectorSize) * mbrSectorSize, nil
+	}
+	capacitySectors, err := mediaCapacitySectors(mediaPath)
+	if err != nil {
+		return 0, err
+	}
+	const firstUsableLBA uint32 = 63
+	var usedEnd uint32 = firstUsableLBA
+	for _, p := range parts {
+		end := p.StartLBA + p.SectorCount
+		if end > usedEnd {
+			usedEnd = end
+		}
+	}
+	if usedEnd >= capacitySectors {
+		return 0, errors.New("no free sectors available")
+	}
+	return int64(capacitySectors-usedEnd) * mbrSectorSize, nil
+}
+
+func parseMbrPartitionType(value string) (byte, error) {
+	v := strings.TrimSpace(strings.ToLower(value))
+	if strings.HasPrefix(v, "0x") {
+		n, err := strconv.ParseUint(v[2:], 16, 8)
+		if err != nil {
+			return 0, fmt.Errorf("invalid partition type: %s", value)
+		}
+		return byte(n), nil
+	}
+	switch v {
+	case "fat12":
+		return 0x01, nil
+	case "fat16small":
+		return 0x04, nil
+	case "fat16":
+		return 0x06, nil
+	case "ntfs", "exfat":
+		return 0x07, nil
+	case "fat32":
+		return 0x0b, nil
+	case "fat16lba":
+		return 0x0e, nil
+	case "fat32lba":
+		return 0x0c, nil
+	case "pistormrdb":
+		return 0x76, nil
+	default:
+		return 0, fmt.Errorf("unsupported partition type '%s'", value)
+	}
 }
 
 func handleGptInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
