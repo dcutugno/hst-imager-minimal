@@ -45,6 +45,7 @@ Low-level parity work is in progress:
 - RDB operations now use an on-media binary RDB state block and embedded data regions for filesystems/partitions, including `backup`/`restore` from raw RDB bytes.
 - `info <path>` now inspects and reports detected partition-table structures (MBR/GPT/RDB) instead of only file metadata.
 - native Amiga `RDSK` partition-chain parsing is supported for `info`, `fs dir <media>\rdb`, and partition-path reads (`<media>\rdb\N`).
+- native Amiga `RDSK` update-path support is available for `rdb part format/kill/move` and `rdb fs update` with checksum-correct block rewrites.
 Some advanced areas (exact Amiga RDB binary layout parity, full filesystem/media-format compatibility breadth) are still in progress and not yet byte-identical with the original .NET core in every edge case.
 
 

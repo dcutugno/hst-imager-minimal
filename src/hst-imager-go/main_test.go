@@ -853,3 +853,57 @@ func TestNativeRdbImageInfoAndPartitionRead(t *testing.T) {
 		t.Fatalf("unexpected native rdb partition read size: %d", info.Size())
 	}
 }
+
+func TestNativeRdbMutationCommands(t *testing.T) {
+	src := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "rigid-disk-block.img")
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "native-rdb-mutate.img")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(media, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+
+	if err := run([]string{"rdb", "part", "format", media, "1", "SYS"}, &out); err != nil {
+		t.Fatalf("rdb part format failed: %v", err)
+	}
+	if err := run([]string{"rdb", "part", "kill", media, "1"}, &out); err != nil {
+		t.Fatalf("rdb part kill failed: %v", err)
+	}
+	if err := run([]string{"rdb", "part", "move", media, "1", "1048576"}, &out); err != nil {
+		t.Fatalf("rdb part move failed: %v", err)
+	}
+	if err := run([]string{"rdb", "fs", "update", media, "1", "PDS2", "2.1"}, &out); err != nil {
+		t.Fatalf("rdb fs update failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", media}, &out); err != nil {
+		t.Fatalf("rdb info failed: %v", err)
+	}
+	var info struct {
+		Partitions  []Part          `json:"partitions"`
+		FileSystems []RdbFileSystem `json:"filesystems"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Partitions) == 0 {
+		t.Fatal("expected native rdb partitions")
+	}
+	if info.Partitions[0].Name != "SYS" {
+		t.Fatalf("expected partition name SYS, got %q", info.Partitions[0].Name)
+	}
+	if info.Partitions[0].Status != "inactive" {
+		t.Fatalf("expected partition inactive, got %q", info.Partitions[0].Status)
+	}
+	if info.Partitions[0].Start != 1048576 {
+		t.Fatalf("expected moved start 1048576, got %d", info.Partitions[0].Start)
+	}
+	if len(info.FileSystems) > 0 && info.FileSystems[0].DosType != "PDS2" {
+		t.Fatalf("expected fs dos type PDS2, got %q", info.FileSystems[0].DosType)
+	}
+}

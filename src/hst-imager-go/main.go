@@ -122,6 +122,19 @@ type rdbPart struct {
 	Status string `json:"status"`
 }
 
+type nativeRdbContext struct {
+	blockSize  int64
+	cylBytes   int64
+	rdskBlock  []byte
+	partBlocks []nativeRdbChainBlock
+	fsBlocks   []nativeRdbChainBlock
+}
+
+type nativeRdbChainBlock struct {
+	blockIndex int32
+	block      []byte
+}
+
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -2920,7 +2933,7 @@ func readRdbState(path string) (rdbState, error) {
 
 func writeRdbState(path string, state rdbState) error {
 	if state.Native {
-		return errors.New("native amiga rdb modification is not supported in this prototype")
+		return writeNativeRdbState(path, state)
 	}
 	if state.RdbSize < rdbMetaStart {
 		return fmt.Errorf("invalid rdb size: %d", state.RdbSize)
@@ -2956,12 +2969,57 @@ func trySeekStart(f *os.File) error {
 }
 
 func readNativeRdbState(f *os.File) (rdbState, error) {
-	sector := make([]byte, mbrSectorSize)
-	if _, err := io.ReadFull(f, sector); err != nil {
+	ctx, err := readNativeRdbContextFromFile(f)
+	if err != nil {
 		return rdbState{}, err
 	}
+	return nativeContextToState(ctx), nil
+}
+
+func writeNativeRdbState(path string, state rdbState) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ctx, err := readNativeRdbContextFromFile(f)
+	if err != nil {
+		return err
+	}
+	if len(ctx.partBlocks) == 0 && len(state.Parts) > 0 {
+		return errors.New("native rdb add requires existing PART template")
+	}
+	if len(ctx.fsBlocks) == 0 && len(state.Fs) > 0 {
+		return errors.New("native rdb fs add requires existing FSHD template")
+	}
+	if err := applyNativePartState(&ctx, state); err != nil {
+		return err
+	}
+	if err := applyNativeFsState(&ctx, state); err != nil {
+		return err
+	}
+	return writeNativeRdbContextToFile(f, ctx)
+}
+
+func readNativeRdbContext(path string) (nativeRdbContext, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nativeRdbContext{}, err
+	}
+	defer f.Close()
+	return readNativeRdbContextFromFile(f)
+}
+
+func readNativeRdbContextFromFile(f *os.File) (nativeRdbContext, error) {
+	if err := trySeekStart(f); err != nil {
+		return nativeRdbContext{}, err
+	}
+	sector := make([]byte, mbrSectorSize)
+	if _, err := io.ReadFull(f, sector); err != nil {
+		return nativeRdbContext{}, err
+	}
 	if string(sector[:4]) != "RDSK" {
-		return rdbState{}, errors.New("native rdb not found")
+		return nativeRdbContext{}, errors.New("native rdb not found")
 	}
 	blockSize := int64(readBeU32(sector, 0x10))
 	if blockSize <= 0 {
@@ -2975,36 +3033,64 @@ func readNativeRdbState(f *os.File) (rdbState, error) {
 	if heads <= 0 {
 		heads = 16
 	}
-	cylBytes := sectorsPerTrack * heads * blockSize
+	ctx := nativeRdbContext{
+		blockSize: blockSize,
+		cylBytes:  sectorsPerTrack * heads * blockSize,
+		rdskBlock: append([]byte(nil), sector...),
+	}
 	partPtr := int32(readBeU32(sector, 0x1c))
 	fsPtr := int32(readBeU32(sector, 0x20))
-
-	state := rdbState{
-		RdbSize:   rdbMetaStart,
-		FsDataEnd: rdbMetaStart,
-		Fs:        []rdbFileSystem{},
-		Parts:     []rdbPart{},
+	partBlocks, err := readNativeChainBlocks(f, blockSize, partPtr, "PART")
+	if err != nil {
+		return nativeRdbContext{}, err
 	}
-	visited := map[int32]bool{}
-	maxBlock := int32(0)
+	fsBlocks, err := readNativeChainBlocks(f, blockSize, fsPtr, "FSHD")
+	if err != nil {
+		return nativeRdbContext{}, err
+	}
+	ctx.partBlocks = partBlocks
+	ctx.fsBlocks = fsBlocks
+	return ctx, nil
+}
 
-	idx := 1
-	for ptr := partPtr; ptr >= 0; {
+func readNativeChainBlocks(f *os.File, blockSize int64, start int32, kind string) ([]nativeRdbChainBlock, error) {
+	blocks := make([]nativeRdbChainBlock, 0)
+	visited := map[int32]bool{}
+	for ptr := start; ptr >= 0; {
 		if visited[ptr] {
 			break
 		}
 		visited[ptr] = true
-		if ptr > maxBlock {
-			maxBlock = ptr
-		}
 		block, err := readBlockAt(f, int64(ptr)*blockSize, int(blockSize))
 		if err != nil {
+			return nil, err
+		}
+		if string(block[:4]) != kind {
 			break
 		}
-		if string(block[:4]) != "PART" {
-			break
+		blocks = append(blocks, nativeRdbChainBlock{
+			blockIndex: ptr,
+			block:      block,
+		})
+		ptr = int32(readBeU32(block, 0x10))
+	}
+	return blocks, nil
+}
+
+func nativeContextToState(ctx nativeRdbContext) rdbState {
+	state := rdbState{
+		Native:    true,
+		RdbSize:   ctx.blockSize,
+		FsDataEnd: ctx.blockSize,
+		Fs:        []rdbFileSystem{},
+		Parts:     []rdbPart{},
+	}
+	maxBlock := int32(0)
+	for i, pb := range ctx.partBlocks {
+		if pb.blockIndex > maxBlock {
+			maxBlock = pb.blockIndex
 		}
-		next := int32(readBeU32(block, 0x10))
+		block := pb.block
 		name := readBString(block, 0x24)
 		flags := readBeU32(block, 0x14)
 		lowCyl := int64(readBeU32(block, 0xa4))
@@ -3013,65 +3099,198 @@ func readNativeRdbState(f *os.File) (rdbState, error) {
 		if highCyl < lowCyl {
 			highCyl = lowCyl
 		}
-		start := lowCyl * cylBytes
-		size := (highCyl - lowCyl + 1) * cylBytes
 		status := "active"
 		if flags&0x1 == 0 {
 			status = "inactive"
 		}
 		state.Parts = append(state.Parts, rdbPart{
-			Index:  idx,
+			Index:  i + 1,
 			Name:   name,
 			Type:   dosType,
-			Start:  start,
-			Size:   size,
+			Start:  lowCyl * ctx.cylBytes,
+			Size:   (highCyl - lowCyl + 1) * ctx.cylBytes,
 			Status: status,
 		})
-		idx++
-		ptr = next
 	}
-
-	visitedFs := map[int32]bool{}
-	fsIndex := 1
-	for ptr := fsPtr; ptr >= 0; {
-		if visitedFs[ptr] {
-			break
+	for i, fb := range ctx.fsBlocks {
+		if fb.blockIndex > maxBlock {
+			maxBlock = fb.blockIndex
 		}
-		visitedFs[ptr] = true
-		if ptr > maxBlock {
-			maxBlock = ptr
-		}
-		block, err := readBlockAt(f, int64(ptr)*blockSize, int(blockSize))
-		if err != nil {
-			break
-		}
-		if string(block[:4]) != "FSHD" {
-			break
-		}
-		next := int32(readBeU32(block, 0x10))
+		block := fb.block
 		dosType := string(block[0x20:0x24])
 		version := fmt.Sprintf("%d.%d", readBeU16(block, 0x24), readBeU16(block, 0x26))
-		name := readAsciiCString(block, 0xac, int(blockSize-0xac))
+		name := readAsciiCString(block, 0xac, int(ctx.blockSize-0xac))
 		if name == "" {
-			name = fmt.Sprintf("fs-%d", fsIndex)
+			name = fmt.Sprintf("fs-%d", i+1)
 		}
 		state.Fs = append(state.Fs, rdbFileSystem{
-			Index:      fsIndex,
+			Index:      i + 1,
 			Name:       name,
 			DosType:    dosType,
 			Version:    version,
-			DataOffset: int64(ptr) * blockSize,
-			DataSize:   blockSize,
+			DataOffset: int64(fb.blockIndex) * ctx.blockSize,
+			DataSize:   ctx.blockSize,
 		})
-		fsIndex++
-		ptr = next
 	}
+	state.RdbSize = int64(maxBlock+1) * ctx.blockSize
+	if state.RdbSize < ctx.blockSize {
+		state.RdbSize = ctx.blockSize
+	}
+	state.FsDataEnd = state.RdbSize
+	return state
+}
 
-	state.RdbSize = int64(maxBlock+1) * blockSize
-	if state.RdbSize < blockSize {
-		state.RdbSize = blockSize
+func applyNativePartState(ctx *nativeRdbContext, state rdbState) error {
+	desired := len(state.Parts)
+	current := len(ctx.partBlocks)
+	if desired > current {
+		if current == 0 {
+			return errors.New("cannot add native rdb partition without template")
+		}
+		maxIdx := maxNativeBlockIndex(ctx)
+		template := append([]byte(nil), ctx.partBlocks[current-1].block...)
+		for i := current; i < desired; i++ {
+			maxIdx++
+			block := append([]byte(nil), template...)
+			ctx.partBlocks = append(ctx.partBlocks, nativeRdbChainBlock{blockIndex: maxIdx, block: block})
+		}
 	}
-	return state, nil
+	if desired < current {
+		ctx.partBlocks = ctx.partBlocks[:desired]
+	}
+	for i := 0; i < len(ctx.partBlocks); i++ {
+		block := ctx.partBlocks[i].block
+		next := int32(-1)
+		if i+1 < len(ctx.partBlocks) {
+			next = ctx.partBlocks[i+1].blockIndex
+		}
+		writeBeU32(block, 0x10, uint32(next))
+	}
+	for i, p := range state.Parts {
+		if i >= len(ctx.partBlocks) {
+			break
+		}
+		block := ctx.partBlocks[i].block
+		flags := readBeU32(block, 0x14)
+		if p.Status == "inactive" || p.Status == "killed" {
+			flags &^= 0x1
+		} else {
+			flags |= 0x1
+		}
+		writeBeU32(block, 0x14, flags)
+		lowCyl := uint32(0)
+		if ctx.cylBytes > 0 {
+			lowCyl = uint32(maxInt64(p.Start, 0) / ctx.cylBytes)
+		}
+		cylCount := uint32(1)
+		if ctx.cylBytes > 0 && p.Size > 0 {
+			cylCount = uint32((p.Size + ctx.cylBytes - 1) / ctx.cylBytes)
+			if cylCount == 0 {
+				cylCount = 1
+			}
+		}
+		highCyl := lowCyl + cylCount - 1
+		writeBeU32(block, 0xa4, lowCyl)
+		writeBeU32(block, 0xa8, highCyl)
+		writeBString(block, 0x24, p.Name)
+		writeFourCC(block, 0xc0, p.Type)
+		updateAmigaBlockChecksum(block)
+	}
+	return nil
+}
+
+func applyNativeFsState(ctx *nativeRdbContext, state rdbState) error {
+	desired := len(state.Fs)
+	current := len(ctx.fsBlocks)
+	if desired > current {
+		if current == 0 {
+			return errors.New("cannot add native rdb filesystem without template")
+		}
+		maxIdx := maxNativeBlockIndex(ctx)
+		template := append([]byte(nil), ctx.fsBlocks[current-1].block...)
+		for i := current; i < desired; i++ {
+			maxIdx++
+			block := append([]byte(nil), template...)
+			ctx.fsBlocks = append(ctx.fsBlocks, nativeRdbChainBlock{blockIndex: maxIdx, block: block})
+		}
+	}
+	if desired < current {
+		ctx.fsBlocks = ctx.fsBlocks[:desired]
+	}
+	for i := 0; i < len(ctx.fsBlocks); i++ {
+		block := ctx.fsBlocks[i].block
+		next := int32(-1)
+		if i+1 < len(ctx.fsBlocks) {
+			next = ctx.fsBlocks[i+1].blockIndex
+		}
+		writeBeU32(block, 0x10, uint32(next))
+	}
+	for i, fs := range state.Fs {
+		if i >= len(ctx.fsBlocks) {
+			break
+		}
+		block := ctx.fsBlocks[i].block
+		writeFourCC(block, 0x20, fs.DosType)
+		if fs.Version != "" {
+			parts := strings.SplitN(fs.Version, ".", 2)
+			major, _ := strconv.Atoi(parts[0])
+			minor := 0
+			if len(parts) > 1 {
+				minor, _ = strconv.Atoi(parts[1])
+			}
+			writeBeU16(block, 0x24, uint16(major))
+			writeBeU16(block, 0x26, uint16(minor))
+		}
+		writeAsciiCString(block, 0xac, fs.Name)
+		updateAmigaBlockChecksum(block)
+	}
+	return nil
+}
+
+func writeNativeRdbContextToFile(f *os.File, ctx nativeRdbContext) error {
+	partPtr := int32(-1)
+	if len(ctx.partBlocks) > 0 {
+		partPtr = ctx.partBlocks[0].blockIndex
+	}
+	fsPtr := int32(-1)
+	if len(ctx.fsBlocks) > 0 {
+		fsPtr = ctx.fsBlocks[0].blockIndex
+	}
+	writeBeU32(ctx.rdskBlock, 0x1c, uint32(partPtr))
+	writeBeU32(ctx.rdskBlock, 0x20, uint32(fsPtr))
+	updateAmigaBlockChecksum(ctx.rdskBlock)
+
+	if _, err := f.WriteAt(ctx.rdskBlock, 0); err != nil {
+		return err
+	}
+	for _, pb := range ctx.partBlocks {
+		updateAmigaBlockChecksum(pb.block)
+		if _, err := f.WriteAt(pb.block, int64(pb.blockIndex)*ctx.blockSize); err != nil {
+			return err
+		}
+	}
+	for _, fb := range ctx.fsBlocks {
+		updateAmigaBlockChecksum(fb.block)
+		if _, err := f.WriteAt(fb.block, int64(fb.blockIndex)*ctx.blockSize); err != nil {
+			return err
+		}
+	}
+	return f.Sync()
+}
+
+func maxNativeBlockIndex(ctx *nativeRdbContext) int32 {
+	maxIdx := int32(0)
+	for _, p := range ctx.partBlocks {
+		if p.blockIndex > maxIdx {
+			maxIdx = p.blockIndex
+		}
+	}
+	for _, fs := range ctx.fsBlocks {
+		if fs.blockIndex > maxIdx {
+			maxIdx = fs.blockIndex
+		}
+	}
+	return maxIdx
 }
 
 func readBlockAt(f *os.File, offset int64, size int) ([]byte, error) {
@@ -3092,6 +3311,20 @@ func readBeU16(b []byte, offset int) uint16 {
 		return 0
 	}
 	return binary.BigEndian.Uint16(b[offset : offset+2])
+}
+
+func writeBeU32(b []byte, offset int, value uint32) {
+	if offset+4 > len(b) {
+		return
+	}
+	binary.BigEndian.PutUint32(b[offset:offset+4], value)
+}
+
+func writeBeU16(b []byte, offset int, value uint16) {
+	if offset+2 > len(b) {
+		return
+	}
+	binary.BigEndian.PutUint16(b[offset:offset+2], value)
 }
 
 func readBString(b []byte, offset int) string {
@@ -3125,6 +3358,83 @@ func readAsciiCString(b []byte, offset int, max int) string {
 		}
 	}
 	return strings.TrimSpace(string(buf[:n]))
+}
+
+func writeBString(b []byte, offset int, value string) {
+	if offset >= len(b) {
+		return
+	}
+	maxLen := len(b) - offset - 1
+	if maxLen < 0 {
+		return
+	}
+	if maxLen > 31 {
+		maxLen = 31
+	}
+	v := []byte(value)
+	if len(v) > maxLen {
+		v = v[:maxLen]
+	}
+	b[offset] = byte(len(v))
+	copy(b[offset+1:], v)
+	end := offset + 1 + len(v)
+	for i := end; i < offset+1+maxLen && i < len(b); i++ {
+		b[i] = 0
+	}
+}
+
+func writeFourCC(b []byte, offset int, value string) {
+	if offset+4 > len(b) {
+		return
+	}
+	raw := []byte(value)
+	for i := 0; i < 4; i++ {
+		if i < len(raw) {
+			b[offset+i] = raw[i]
+		} else {
+			b[offset+i] = 0
+		}
+	}
+}
+
+func writeAsciiCString(b []byte, offset int, value string) {
+	if offset >= len(b) {
+		return
+	}
+	maxLen := len(b) - offset
+	raw := []byte(value)
+	if len(raw) >= maxLen {
+		raw = raw[:maxLen-1]
+	}
+	copy(b[offset:], raw)
+	end := offset + len(raw)
+	if end < len(b) {
+		b[end] = 0
+	}
+}
+
+func updateAmigaBlockChecksum(block []byte) {
+	if len(block) < 12 {
+		return
+	}
+	longs := int(binary.BigEndian.Uint32(block[:4]))
+	if longs <= 0 {
+		return
+	}
+	limit := longs * 4
+	if limit > len(block) {
+		limit = len(block) - (len(block) % 4)
+	}
+	if limit < 12 {
+		return
+	}
+	binary.BigEndian.PutUint32(block[8:12], 0)
+	var sum uint32
+	for i := 0; i+3 < limit; i += 4 {
+		sum += binary.BigEndian.Uint32(block[i : i+4])
+	}
+	checksum := uint32(0) - sum
+	binary.BigEndian.PutUint32(block[8:12], checksum)
 }
 
 func nextRdbFsIndex(items []rdbFileSystem) int {
