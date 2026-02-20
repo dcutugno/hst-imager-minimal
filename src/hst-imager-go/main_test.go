@@ -799,3 +799,57 @@ func TestFsDirPartitionContainers(t *testing.T) {
 		t.Fatalf("expected rdb partition listing, got: %q", out.String())
 	}
 }
+
+func TestArchiveListNonZipLhaWhenSupported(t *testing.T) {
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "amiga.lha")
+	var out bytes.Buffer
+	err := run([]string{"archive", "list", lhaPath}, &out)
+	if err != nil {
+		t.Skipf("lha listing not supported in this runtime: %v", err)
+	}
+	if strings.TrimSpace(out.String()) == "" {
+		t.Fatalf("expected non-empty archive list output for lha")
+	}
+}
+
+func TestNativeRdbImageInfoAndPartitionRead(t *testing.T) {
+	src := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "rigid-disk-block.img")
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "native-rdb.img")
+	outFile := filepath.Join(tmp, "part.bin")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(media, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "info", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "\"RDB\"") {
+		t.Fatalf("expected RDB partition table detection: %s", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"fs", "dir", media + `\rdb`}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "1") {
+		t.Fatalf("expected rdb partition container entries: %s", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"read", media + `\rdb\1`, outFile, "--size", "1KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 1024 {
+		t.Fatalf("unexpected native rdb partition read size: %d", info.Size())
+	}
+}

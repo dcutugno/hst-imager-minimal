@@ -23,6 +23,7 @@ Initial bootstrap for porting Hst Imager Console to Go.
 - transfer/read/write/compare support compressed image flows:
   - read from `.gz` and `.zip`
   - write to `.gz` and `.zip`
+- archive listing/extract now supports non-zip formats via `bsdtar` fallback (including `.lha`/`.lzx` when available in runtime tar support)
 - partition path support in I/O commands using `\mbr\N`, `\gpt\N`, `\rdb\N` suffixes
 - `fs dir <media>\mbr|gpt|rdb` lists partition containers
 
@@ -43,6 +44,7 @@ Low-level parity work is in progress:
 - GPT operations (`info`, `initialize`, `part add/delete/format`) read/write real on-disk GPT headers and partition entries (including CRC updates and protective MBR).
 - RDB operations now use an on-media binary RDB state block and embedded data regions for filesystems/partitions, including `backup`/`restore` from raw RDB bytes.
 - `info <path>` now inspects and reports detected partition-table structures (MBR/GPT/RDB) instead of only file metadata.
+- native Amiga `RDSK` partition-chain parsing is supported for `info`, `fs dir <media>\rdb`, and partition-path reads (`<media>\rdb\N`).
 Some advanced areas (exact Amiga RDB binary layout parity, full filesystem/media-format compatibility breadth) are still in progress and not yet byte-identical with the original .NET core in every edge case.
 
 

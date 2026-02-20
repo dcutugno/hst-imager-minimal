@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha1"
@@ -96,6 +97,7 @@ type gptPartitionEntry struct {
 }
 
 type rdbState struct {
+	Native    bool            `json:"-"`
 	RdbSize   int64           `json:"rdbSize"`
 	FsDataEnd int64           `json:"fsDataEnd"`
 	Fs        []rdbFileSystem `json:"filesystems"`
@@ -458,6 +460,9 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) > 0 {
 		path = args[0]
 	}
+	if archivePath, innerPath, ok := splitArchivePath(path); ok {
+		return handleFsDirArchive(archivePath, innerPath, stdout, opts)
+	}
 	if basePath, table, ok := parsePartitionContainerPath(path); ok {
 		return handleFsDirPartitionContainer(basePath, table, stdout, opts)
 	}
@@ -482,6 +487,69 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	for _, i := range items {
 		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+	}
+	return nil
+}
+
+func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts GlobalOptions) error {
+	entries, err := listArchiveEntries(archivePath)
+	if err != nil {
+		return err
+	}
+	type item struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+		Size int64  `json:"size"`
+	}
+	items := make([]item, 0)
+	prefix := normalizeArchivePath(innerPath)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		name := normalizeArchivePath(e.Name)
+		if prefix != "" {
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			name = strings.TrimPrefix(name, prefix)
+		}
+		name = strings.TrimPrefix(name, "/")
+		if name == "" {
+			continue
+		}
+		parts := strings.SplitN(name, "/", 2)
+		if len(parts) == 1 {
+			key := parts[0]
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			items = append(items, item{Name: key, Type: "file", Size: e.Size})
+			continue
+		}
+		key := parts[0]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		items = append(items, item{Name: key, Type: "dir", Size: 0})
+	}
+	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{"path": archivePath, "innerPath": innerPath, "entries": items})
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(stdout, "No entries.")
+		return nil
+	}
+	for _, i := range items {
+		if i.Type == "dir" {
+			fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+		} else {
+			fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", i.Type, i.Name, i.Size)
+		}
 	}
 	return nil
 }
@@ -551,20 +619,11 @@ func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opt
 
 func handleArchiveList(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
-		return errors.New("usage: archive list <path-to-zip>")
+		return errors.New("usage: archive list <path-to-archive>")
 	}
-	zr, err := zip.OpenReader(args[0])
+	items, err := listArchiveEntries(args[0])
 	if err != nil {
 		return err
-	}
-	defer zr.Close()
-	type entry struct {
-		Name string `json:"name"`
-		Size uint64 `json:"size"`
-	}
-	items := make([]entry, 0, len(zr.File))
-	for _, f := range zr.File {
-		items = append(items, entry{Name: f.Name, Size: f.UncompressedSize64})
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{"path": args[0], "entries": items})
@@ -1288,6 +1347,27 @@ func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
 }
 
 func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) >= 2 {
+		if archivePath, innerPath, ok := splitArchivePath(args[0]); ok {
+			recursive := false
+			for _, arg := range args[2:] {
+				if arg == "--recursive" {
+					recursive = true
+				}
+			}
+			if !recursive && innerPath == "" {
+				return errors.New("fs extract archive requires --recursive or specific inner path")
+			}
+			if err := extractArchive(archivePath, innerPath, args[1]); err != nil {
+				return err
+			}
+			if opts.Format == "json" {
+				return writeJSON(stdout, map[string]any{"source": args[0], "destination": args[1], "status": "extracted"})
+			}
+			fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
+			return nil
+		}
+	}
 	return handleFsCopy(args, stdout, opts)
 }
 
@@ -2806,6 +2886,14 @@ func readRdbState(path string) (rdbState, error) {
 		return rdbState{}, err
 	}
 	if string(header[:8]) != rdbSignature {
+		if err := trySeekStart(f); err != nil {
+			return rdbState{}, err
+		}
+		native, err := readNativeRdbState(f)
+		if err == nil {
+			native.Native = true
+			return native, nil
+		}
 		return rdbState{}, errors.New("rigid disk block not found")
 	}
 	length := binary.LittleEndian.Uint32(header[8:12])
@@ -2831,6 +2919,9 @@ func readRdbState(path string) (rdbState, error) {
 }
 
 func writeRdbState(path string, state rdbState) error {
+	if state.Native {
+		return errors.New("native amiga rdb modification is not supported in this prototype")
+	}
 	if state.RdbSize < rdbMetaStart {
 		return fmt.Errorf("invalid rdb size: %d", state.RdbSize)
 	}
@@ -2857,6 +2948,183 @@ func writeRdbState(path string, state rdbState) error {
 		return err
 	}
 	return f.Sync()
+}
+
+func trySeekStart(f *os.File) error {
+	_, err := f.Seek(0, io.SeekStart)
+	return err
+}
+
+func readNativeRdbState(f *os.File) (rdbState, error) {
+	sector := make([]byte, mbrSectorSize)
+	if _, err := io.ReadFull(f, sector); err != nil {
+		return rdbState{}, err
+	}
+	if string(sector[:4]) != "RDSK" {
+		return rdbState{}, errors.New("native rdb not found")
+	}
+	blockSize := int64(readBeU32(sector, 0x10))
+	if blockSize <= 0 {
+		blockSize = mbrSectorSize
+	}
+	sectorsPerTrack := int64(readBeU32(sector, 0x48))
+	heads := int64(readBeU32(sector, 0x4c))
+	if sectorsPerTrack <= 0 {
+		sectorsPerTrack = 63
+	}
+	if heads <= 0 {
+		heads = 16
+	}
+	cylBytes := sectorsPerTrack * heads * blockSize
+	partPtr := int32(readBeU32(sector, 0x1c))
+	fsPtr := int32(readBeU32(sector, 0x20))
+
+	state := rdbState{
+		RdbSize:   rdbMetaStart,
+		FsDataEnd: rdbMetaStart,
+		Fs:        []rdbFileSystem{},
+		Parts:     []rdbPart{},
+	}
+	visited := map[int32]bool{}
+	maxBlock := int32(0)
+
+	idx := 1
+	for ptr := partPtr; ptr >= 0; {
+		if visited[ptr] {
+			break
+		}
+		visited[ptr] = true
+		if ptr > maxBlock {
+			maxBlock = ptr
+		}
+		block, err := readBlockAt(f, int64(ptr)*blockSize, int(blockSize))
+		if err != nil {
+			break
+		}
+		if string(block[:4]) != "PART" {
+			break
+		}
+		next := int32(readBeU32(block, 0x10))
+		name := readBString(block, 0x24)
+		flags := readBeU32(block, 0x14)
+		lowCyl := int64(readBeU32(block, 0xa4))
+		highCyl := int64(readBeU32(block, 0xa8))
+		dosType := string(block[0xc0:0xc4])
+		if highCyl < lowCyl {
+			highCyl = lowCyl
+		}
+		start := lowCyl * cylBytes
+		size := (highCyl - lowCyl + 1) * cylBytes
+		status := "active"
+		if flags&0x1 == 0 {
+			status = "inactive"
+		}
+		state.Parts = append(state.Parts, rdbPart{
+			Index:  idx,
+			Name:   name,
+			Type:   dosType,
+			Start:  start,
+			Size:   size,
+			Status: status,
+		})
+		idx++
+		ptr = next
+	}
+
+	visitedFs := map[int32]bool{}
+	fsIndex := 1
+	for ptr := fsPtr; ptr >= 0; {
+		if visitedFs[ptr] {
+			break
+		}
+		visitedFs[ptr] = true
+		if ptr > maxBlock {
+			maxBlock = ptr
+		}
+		block, err := readBlockAt(f, int64(ptr)*blockSize, int(blockSize))
+		if err != nil {
+			break
+		}
+		if string(block[:4]) != "FSHD" {
+			break
+		}
+		next := int32(readBeU32(block, 0x10))
+		dosType := string(block[0x20:0x24])
+		version := fmt.Sprintf("%d.%d", readBeU16(block, 0x24), readBeU16(block, 0x26))
+		name := readAsciiCString(block, 0xac, int(blockSize-0xac))
+		if name == "" {
+			name = fmt.Sprintf("fs-%d", fsIndex)
+		}
+		state.Fs = append(state.Fs, rdbFileSystem{
+			Index:      fsIndex,
+			Name:       name,
+			DosType:    dosType,
+			Version:    version,
+			DataOffset: int64(ptr) * blockSize,
+			DataSize:   blockSize,
+		})
+		fsIndex++
+		ptr = next
+	}
+
+	state.RdbSize = int64(maxBlock+1) * blockSize
+	if state.RdbSize < blockSize {
+		state.RdbSize = blockSize
+	}
+	return state, nil
+}
+
+func readBlockAt(f *os.File, offset int64, size int) ([]byte, error) {
+	b := make([]byte, size)
+	_, err := f.ReadAt(b, offset)
+	return b, err
+}
+
+func readBeU32(b []byte, offset int) uint32 {
+	if offset+4 > len(b) {
+		return 0
+	}
+	return binary.BigEndian.Uint32(b[offset : offset+4])
+}
+
+func readBeU16(b []byte, offset int) uint16 {
+	if offset+2 > len(b) {
+		return 0
+	}
+	return binary.BigEndian.Uint16(b[offset : offset+2])
+}
+
+func readBString(b []byte, offset int) string {
+	if offset >= len(b) {
+		return ""
+	}
+	n := int(b[offset])
+	if n <= 0 {
+		return ""
+	}
+	if offset+1+n > len(b) {
+		n = len(b) - offset - 1
+	}
+	return string(bytes.TrimSpace(b[offset+1 : offset+1+n]))
+}
+
+func readAsciiCString(b []byte, offset int, max int) string {
+	if offset >= len(b) || max <= 0 {
+		return ""
+	}
+	end := offset + max
+	if end > len(b) {
+		end = len(b)
+	}
+	buf := b[offset:end]
+	n := len(buf)
+	for i, c := range buf {
+		if c == 0 {
+			n = i
+			break
+		}
+	}
+	return strings.TrimSpace(string(buf[:n]))
 }
 
 func nextRdbFsIndex(items []rdbFileSystem) int {
@@ -3176,6 +3444,11 @@ type partitionRegion struct {
 	Size     int64
 }
 
+type archiveEntry struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
 func openSourceReader(path string) (io.ReadCloser, error) {
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
 		return nil, err
@@ -3444,4 +3717,140 @@ func findGptPart(parts []gptPartitionEntry, index int) (gptPartitionEntry, error
 		}
 	}
 	return gptPartitionEntry{}, fmt.Errorf("partition %d not found", index)
+}
+
+func listArchiveEntries(path string) ([]archiveEntry, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".zip" {
+		zr, err := zip.OpenReader(path)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		items := make([]archiveEntry, 0, len(zr.File))
+		for _, f := range zr.File {
+			items = append(items, archiveEntry{Name: f.Name, Size: int64(f.UncompressedSize64)})
+		}
+		return items, nil
+	}
+	if _, err := exec.LookPath("bsdtar"); err != nil {
+		return nil, fmt.Errorf("archive format '%s' requires bsdtar: %w", ext, err)
+	}
+	out, err := exec.Command("bsdtar", "-tf", path).Output()
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(out), "\r\n", "\n"), "\n")
+	items := make([]archiveEntry, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		items = append(items, archiveEntry{Name: line, Size: 0})
+	}
+	return items, nil
+}
+
+func splitArchivePath(path string) (archivePath string, innerPath string, ok bool) {
+	lower := strings.ToLower(path)
+	for _, ext := range []string{".zip", ".lha", ".lzx", ".tar", ".gz", ".xz", ".bz2", ".rar", ".z"} {
+		pos := strings.Index(lower, ext)
+		if pos < 0 {
+			continue
+		}
+		end := pos + len(ext)
+		if end == len(path) {
+			return path, "", true
+		}
+		next := path[end]
+		if next == '\\' || next == '/' {
+			return path[:end], strings.Trim(path[end+1:], `\/`), true
+		}
+	}
+	return "", "", false
+}
+
+func normalizeArchivePath(path string) string {
+	return strings.Trim(strings.ReplaceAll(path, "\\", "/"), "/")
+}
+
+func extractArchive(archivePath, innerPath, destination string) error {
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return err
+	}
+	ext := strings.ToLower(filepath.Ext(archivePath))
+	if ext == ".zip" {
+		return extractZip(archivePath, innerPath, destination)
+	}
+	if _, err := exec.LookPath("bsdtar"); err != nil {
+		return fmt.Errorf("archive extract for '%s' requires bsdtar: %w", ext, err)
+	}
+	args := []string{"-xf", archivePath, "-C", destination}
+	if innerPath != "" {
+		args = append(args, strings.ReplaceAll(innerPath, "\\", "/"))
+	}
+	cmd := exec.Command("bsdtar", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("archive extract failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func extractZip(archivePath, innerPath, destination string) error {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	prefix := normalizeArchivePath(innerPath)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	for _, f := range zr.File {
+		name := normalizeArchivePath(f.Name)
+		if prefix != "" {
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			name = strings.TrimPrefix(name, prefix)
+			name = strings.TrimPrefix(name, "/")
+		}
+		if name == "" {
+			continue
+		}
+		target := filepath.Join(destination, filepath.FromSlash(name))
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			_ = rc.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, rc)
+		closeErr1 := out.Close()
+		closeErr2 := rc.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr1 != nil {
+			return closeErr1
+		}
+		if closeErr2 != nil {
+			return closeErr2
+		}
+	}
+	return nil
 }
