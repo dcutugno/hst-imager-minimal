@@ -1338,50 +1338,75 @@ func handleBlockView(args []string, stdout io.Writer, opts GlobalOptions) error 
 
 func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: fs copy <source> <destination> [--recursive]")
+		return errors.New("usage: fs copy <source> <destination> [--recursive] [--uaemetadata <none|uaefsdb|uaemetafile>]")
 	}
-	recursive := false
-	if len(args) > 2 {
-		if len(args) == 3 && args[2] == "--recursive" {
-			recursive = true
-		} else {
-			return fmt.Errorf("unsupported arguments: %s", strings.Join(args[2:], " "))
-		}
+	fsOpts, err := parseFsOptions(args[2:])
+	if err != nil {
+		return err
 	}
-	count, err := copyPath(args[0], args[1], recursive)
+	count, err := copyPathWithOptions(args[0], args[1], fsOpts)
 	if err != nil {
 		return err
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"source": args[0], "destination": args[1], "entries": count})
+		return writeJSON(stdout, map[string]any{
+			"source":      args[0],
+			"destination": args[1],
+			"entries":     count,
+			"uaemetadata": fsOpts.uaeMetadata,
+		})
 	}
 	fmt.Fprintf(stdout, "Copied %d entries from '%s' to '%s'.\n", count, args[0], args[1])
 	return nil
 }
 
 func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) >= 2 {
-		if archivePath, innerPath, ok := splitArchivePath(args[0]); ok {
-			recursive := false
-			for _, arg := range args[2:] {
-				if arg == "--recursive" {
-					recursive = true
-				}
-			}
-			if !recursive && innerPath == "" {
-				return errors.New("fs extract archive requires --recursive or specific inner path")
-			}
-			if err := extractArchive(archivePath, innerPath, args[1]); err != nil {
-				return err
-			}
-			if opts.Format == "json" {
-				return writeJSON(stdout, map[string]any{"source": args[0], "destination": args[1], "status": "extracted"})
-			}
-			fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
-			return nil
-		}
+	if len(args) < 2 {
+		return errors.New("usage: fs extract <source> <destination> [--recursive] [--uaemetadata <none|uaefsdb|uaemetafile>]")
 	}
-	return handleFsCopy(args, stdout, opts)
+	fsOpts, err := parseFsOptions(args[2:])
+	if err != nil {
+		return err
+	}
+	if archivePath, innerPath, ok := splitArchivePath(args[0]); ok {
+		if !fsOpts.recursive && innerPath == "" {
+			return errors.New("fs extract archive requires --recursive or specific inner path")
+		}
+		tmpDir, err := os.MkdirTemp("", "hst-imager-go-extract-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(tmpDir)
+		if err := extractArchive(archivePath, innerPath, tmpDir); err != nil {
+			return err
+		}
+		if _, err := copyPathWithOptions(tmpDir, args[1], fsOpts); err != nil {
+			return err
+		}
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      args[0],
+				"destination": args[1],
+				"status":      "extracted",
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
+		return nil
+	}
+	if _, err := copyPathWithOptions(args[0], args[1], fsOpts); err != nil {
+		return err
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{
+			"source":      args[0],
+			"destination": args[1],
+			"status":      "extracted",
+			"uaemetadata": fsOpts.uaeMetadata,
+		})
+	}
+	fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
+	return nil
 }
 
 func handleFsMkdir(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -3579,6 +3604,213 @@ func copyPath(source, destination string, recursive bool) (int, error) {
 		return nil
 	})
 	return count, err
+}
+
+type fsPathOptions struct {
+	recursive   bool
+	uaeMetadata string
+}
+
+type uaeFsDbNode struct {
+	AmigaName  string `json:"amigaName"`
+	NormalName string `json:"normalName"`
+	Type       string `json:"type"`
+}
+
+func parseFsOptions(args []string) (fsPathOptions, error) {
+	opts := fsPathOptions{
+		recursive:   false,
+		uaeMetadata: "uaefsdb",
+	}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--recursive":
+			opts.recursive = true
+		case "--uaemetadata", "-uae":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --uaemetadata")
+			}
+			val := strings.ToLower(strings.TrimSpace(args[i+1]))
+			switch val {
+			case "none", "uaefsdb", "uaemetafile":
+				opts.uaeMetadata = val
+			default:
+				return opts, fmt.Errorf("unsupported uaemetadata '%s' (supported: none, uaefsdb, uaemetafile)", args[i+1])
+			}
+			i++
+		default:
+			return opts, fmt.Errorf("unsupported arguments: %s", strings.Join(args[i:], " "))
+		}
+	}
+	return opts, nil
+}
+
+func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, error) {
+	info, err := os.Stat(source)
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		target := destination
+		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
+			mappedName, _, _ := mapLocalNameForUae(filepath.Base(source), opts.uaeMetadata)
+			target = filepath.Join(destination, mappedName)
+			if err := writeUaeMetadataForEntry(destination, filepath.Base(source), mappedName, "file", opts.uaeMetadata); err != nil {
+				return 0, err
+			}
+		}
+		_, err := copyFile(source, target, 0)
+		return 1, err
+	}
+	if !opts.recursive {
+		return 0, errors.New("source is a directory, use --recursive")
+	}
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return 0, err
+	}
+	return copyDirectoryRecursiveWithUae(source, destination, opts)
+}
+
+func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOptions) (int, error) {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		srcPath := filepath.Join(source, entry.Name())
+		mappedName, changed, _ := mapLocalNameForUae(entry.Name(), opts.uaeMetadata)
+		dstPath := filepath.Join(destination, mappedName)
+		if changed {
+			entryType := "file"
+			if entry.IsDir() {
+				entryType = "dir"
+			}
+			if err := writeUaeMetadataForEntry(destination, entry.Name(), mappedName, entryType, opts.uaeMetadata); err != nil {
+				return count, err
+			}
+		}
+		if entry.IsDir() {
+			if err := os.MkdirAll(dstPath, 0o755); err != nil {
+				return count, err
+			}
+			childCount, err := copyDirectoryRecursiveWithUae(srcPath, dstPath, opts)
+			count += childCount
+			if err != nil {
+				return count, err
+			}
+			count++
+			continue
+		}
+		if _, err := copyFile(srcPath, dstPath, 0); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func mapLocalNameForUae(name, mode string) (mapped string, changed bool, metaName string) {
+	if mode == "none" {
+		return name, false, name
+	}
+	if !isUnsafeWindowsName(name) {
+		return name, false, name
+	}
+	switch mode {
+	case "uaefsdb":
+		return "__uae___" + sanitizeUnsafeName(name), true, name
+	case "uaemetafile":
+		return percentEncodeName(name), true, name
+	default:
+		return name, false, name
+	}
+}
+
+func isUnsafeWindowsName(name string) bool {
+	if name == "" {
+		return false
+	}
+	base := name
+	if dot := strings.Index(base, "."); dot >= 0 {
+		base = base[:dot]
+	}
+	baseUpper := strings.ToUpper(strings.TrimSpace(base))
+	reserved := map[string]bool{
+		"CON": true, "PRN": true, "AUX": true, "NUL": true,
+		"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
+		"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+	}
+	if reserved[baseUpper] {
+		return true
+	}
+	for _, c := range name {
+		switch c {
+		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
+			return true
+		}
+	}
+	return strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ")
+}
+
+func sanitizeUnsafeName(name string) string {
+	runes := []rune(name)
+	for i, c := range runes {
+		switch c {
+		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
+			runes[i] = '_'
+		}
+	}
+	for i := len(runes) - 1; i >= 0; i-- {
+		if runes[i] == '.' || runes[i] == ' ' {
+			runes[i] = '_'
+			continue
+		}
+		break
+	}
+	return string(runes)
+}
+
+func percentEncodeName(name string) string {
+	var b strings.Builder
+	for _, ch := range []byte(name) {
+		b.WriteString(fmt.Sprintf("%%%02x", ch))
+	}
+	return b.String()
+}
+
+func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string) error {
+	switch mode {
+	case "uaefsdb":
+		uaeFsDbPath := filepath.Join(dirPath, "_UAEFSDB.___")
+		nodes := make([]uaeFsDbNode, 0)
+		existing, err := os.ReadFile(uaeFsDbPath)
+		if err == nil && len(existing) > 0 {
+			_ = json.Unmarshal(existing, &nodes)
+		}
+		replaced := false
+		for i := range nodes {
+			if nodes[i].AmigaName == amigaName {
+				nodes[i] = uaeFsDbNode{AmigaName: amigaName, NormalName: mappedName, Type: entryType}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			nodes = append(nodes, uaeFsDbNode{AmigaName: amigaName, NormalName: mappedName, Type: entryType})
+		}
+		payload, err := json.MarshalIndent(nodes, "", "  ")
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(uaeFsDbPath, payload, 0o644)
+	case "uaemetafile":
+		uaemPath := filepath.Join(dirPath, mappedName+".uaem")
+		content := fmt.Sprintf("amiga_name=%s\nnormal_name=%s\ntype=%s\n", amigaName, mappedName, entryType)
+		return os.WriteFile(uaemPath, []byte(content), 0o644)
+	default:
+		return nil
+	}
 }
 
 func createBlankFile(path string, size int64) error {

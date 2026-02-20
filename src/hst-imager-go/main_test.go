@@ -907,3 +907,75 @@ func TestNativeRdbMutationCommands(t *testing.T) {
 		t.Fatalf("expected fs dos type PDS2, got %q", info.FileSystems[0].DosType)
 	}
 }
+
+func TestFsCopyWithUaeFsDbMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "AUX"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "file1*"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "dir1*"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "dir1*", "file4."), []byte("c"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs copy with uaefsdb failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "__uae___AUX")); err != nil {
+		t.Fatalf("expected __uae___AUX: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "__uae___file1_")); err != nil {
+		t.Fatalf("expected __uae___file1_: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "__uae___dir1_")); err != nil {
+		t.Fatalf("expected __uae___dir1_: %v", err)
+	}
+	uaeFsDb := filepath.Join(dst, "_UAEFSDB.___")
+	b, err := os.ReadFile(uaeFsDb)
+	if err != nil {
+		t.Fatalf("expected _UAEFSDB.___: %v", err)
+	}
+	if !strings.Contains(string(b), "\"amigaName\": \"AUX\"") || !strings.Contains(string(b), "\"amigaName\": \"file1*\"") {
+		t.Fatalf("unexpected uaefsdb content: %s", string(b))
+	}
+}
+
+func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "AUX.info"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "uaemetafile"}, &out); err != nil {
+		t.Fatalf("fs copy with uaemetafile failed: %v", err)
+	}
+	encoded := "%41%55%58%2e%69%6e%66%6f"
+	if _, err := os.Stat(filepath.Join(dst, encoded)); err != nil {
+		t.Fatalf("expected encoded file %s: %v", encoded, err)
+	}
+	uaem := filepath.Join(dst, encoded+".uaem")
+	b, err := os.ReadFile(uaem)
+	if err != nil {
+		t.Fatalf("expected uaem sidecar: %v", err)
+	}
+	if !strings.Contains(string(b), "amiga_name=AUX.info") {
+		t.Fatalf("unexpected uaem content: %s", string(b))
+	}
+}
