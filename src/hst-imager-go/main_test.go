@@ -439,6 +439,9 @@ func TestWriteFromXzCompressedSource(t *testing.T) {
 	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
 	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")
 	dest := filepath.Join(t.TempDir(), "out.txt")
+	if err := os.WriteFile(dest, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	var out bytes.Buffer
 	if err := run([]string{"write", xzPath, dest}, &out); err != nil {

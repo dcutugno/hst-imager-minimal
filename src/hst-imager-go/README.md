@@ -37,6 +37,19 @@ go build ./...
 go test ./...
 ```
 
+## Differential parity check (Go vs legacy backend)
+Run a command/file-tree parity harness against the published legacy backend:
+
+```bash
+cd /Users/davide/Downloads/Git-Sources/hst-imager-minimal/src/hst-imager-go
+./scripts/verify-go-legacy-parity.sh
+```
+
+Notes:
+- Set `HST_IMAGER_LEGACY_BIN` to override legacy binary location.
+- Set `HST_PARITY_HEAVY=1` to include heavy large-image write parity cases.
+- On failures, the script prints a temp directory containing `.diff` artifacts for each failed case.
+
 ## Status
 This Go prototype now has functional coverage for all commands currently exposed in `command_tree.go`.
 Low-level parity work is in progress:

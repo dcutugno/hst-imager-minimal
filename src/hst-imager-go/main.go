@@ -649,6 +649,21 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return err
 	}
 	if archivePath, innerPath, ok := splitArchivePath(path); ok {
+		if innerPath == "" {
+			mediaItems, mediaOK, mediaErr := tryFsDirCompressedMediaEntries(archivePath)
+			if mediaErr != nil {
+				return mediaErr
+			}
+			if mediaOK {
+				if opts.Format == "json" {
+					return writeJSON(stdout, map[string]any{"path": archivePath, "entries": mediaItems})
+				}
+				for _, i := range mediaItems {
+					fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", "dir", i.Name, i.Size)
+				}
+				return nil
+			}
+		}
 		return handleFsDirArchive(archivePath, innerPath, stdout, opts)
 	}
 	if basePath, table, ok := parsePartitionContainerPath(path); ok {
@@ -677,6 +692,13 @@ type fsDirItem struct {
 	Type           string `json:"type"`
 	ProtectionBits *int   `json:"protectionBits,omitempty"`
 	Comment        string `json:"comment,omitempty"`
+}
+
+type fsDirLegacyStyleItem struct {
+	Name       string `json:"name"`
+	Type       int    `json:"type"`
+	Size       int64  `json:"size"`
+	Attributes string `json:"attributes,omitempty"`
 }
 
 type uaeMetadataNodeInfo struct {
@@ -979,9 +1001,9 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 		return err
 	}
 	type item struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-		Size int64  `json:"size"`
+		Name  string
+		IsDir bool
+		Size  int64
 	}
 	items := make([]item, 0)
 	prefix := normalizeArchivePath(innerPath)
@@ -1008,7 +1030,7 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 				continue
 			}
 			seen[key] = true
-			items = append(items, item{Name: key, Type: "file", Size: e.Size})
+			items = append(items, item{Name: key, IsDir: false, Size: e.Size})
 			continue
 		}
 		key := parts[0]
@@ -1016,24 +1038,90 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 			continue
 		}
 		seen[key] = true
-		items = append(items, item{Name: key, Type: "dir", Size: 0})
+		items = append(items, item{Name: key, IsDir: true, Size: 0})
 	}
 	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": archivePath, "innerPath": innerPath, "entries": items})
+		jsonItems := make([]fsDirLegacyStyleItem, 0, len(items))
+		for _, i := range items {
+			typeValue := 1
+			if i.IsDir {
+				typeValue = 0
+			}
+			jsonItems = append(jsonItems, fsDirLegacyStyleItem{
+				Name:       i.Name,
+				Type:       typeValue,
+				Size:       i.Size,
+				Attributes: "----RWED",
+			})
+		}
+		return writeJSON(stdout, map[string]any{"path": archivePath, "innerPath": innerPath, "entries": jsonItems})
 	}
 	if len(items) == 0 {
 		fmt.Fprintln(stdout, "No entries.")
 		return nil
 	}
 	for _, i := range items {
-		if i.Type == "dir" {
-			fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+		if i.IsDir {
+			fmt.Fprintf(stdout, "- %-4s %s\n", "dir", i.Name)
 		} else {
-			fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", i.Type, i.Name, i.Size)
+			fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", "file", i.Name, i.Size)
 		}
 	}
 	return nil
+}
+
+func tryFsDirCompressedMediaEntries(path string) ([]fsDirLegacyStyleItem, bool, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".rar", ".gz", ".xz":
+	default:
+		return nil, false, nil
+	}
+
+	src, err := openSourceReader(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer src.Close()
+
+	header := make([]byte, mbrSectorSize)
+	n, err := io.ReadFull(src, header)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if n < mbrSectorSize {
+		return nil, false, nil
+	}
+	if string(header[:4]) != "RDSK" {
+		return nil, false, nil
+	}
+
+	blockSize := int64(readBeU32(header, 0x10))
+	if blockSize <= 0 {
+		blockSize = mbrSectorSize
+	}
+	cylinders := int64(readBeU32(header, 0x40))
+	sectorsPerTrack := int64(readBeU32(header, 0x44))
+	heads := int64(readBeU32(header, 0x48))
+	if cylinders <= 0 || sectorsPerTrack <= 0 || heads <= 0 {
+		return nil, false, nil
+	}
+	size := cylinders * sectorsPerTrack * heads * blockSize
+	if size <= 0 {
+		return nil, false, nil
+	}
+
+	return []fsDirLegacyStyleItem{
+		{
+			Name: "RDB",
+			Type: 0,
+			Size: size,
+		},
+	}, true, nil
 }
 
 func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opts GlobalOptions) error {
@@ -1399,7 +1487,12 @@ func handleTransfer(args []string, stdout io.Writer, command string, opts Global
 	if err != nil {
 		return err
 	}
-	written, err := copyFile(source, destination, copySize)
+	copyOpts := copyFileOptions{}
+	if strings.EqualFold(command, "write") {
+		copyOpts.requireExistingDestination = true
+		copyOpts.preserveDestinationSize = true
+	}
+	written, err := copyFileWithOptions(source, destination, copySize, copyOpts)
 	if err != nil {
 		return err
 	}
@@ -1486,17 +1579,28 @@ func parseSize(value string) (int64, error) {
 	return base * multiplier, nil
 }
 
+type copyFileOptions struct {
+	requireExistingDestination bool
+	preserveDestinationSize    bool
+}
+
 func copyFile(source, destination string, size int64) (int64, error) {
+	return copyFileWithOptions(source, destination, size, copyFileOptions{})
+}
+
+func copyFileWithOptions(source, destination string, size int64, opts copyFileOptions) (int64, error) {
 	src, err := openSourceReader(source)
 	if err != nil {
 		return 0, err
 	}
 	defer src.Close()
 
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil && filepath.Dir(destination) != "." {
-		return 0, err
+	if !opts.requireExistingDestination {
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil && filepath.Dir(destination) != "." {
+			return 0, err
+		}
 	}
-	dst, err := openDestinationWriter(destination)
+	dst, err := openDestinationWriterWithOptions(destination, opts.requireExistingDestination, opts.preserveDestinationSize)
 	if err != nil {
 		return 0, err
 	}
@@ -5059,6 +5163,10 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 }
 
 func openDestinationWriter(path string) (io.WriteCloser, error) {
+	return openDestinationWriterWithOptions(path, false, false)
+}
+
+func openDestinationWriterWithOptions(path string, requireExisting, preserveSize bool) (io.WriteCloser, error) {
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
 		return nil, err
 	} else if ok {
@@ -5076,6 +5184,11 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".gz":
+		if requireExisting {
+			if _, err := os.Stat(path); err != nil {
+				return nil, err
+			}
+		}
 		f, err := os.Create(path)
 		if err != nil {
 			return nil, err
@@ -5093,6 +5206,11 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 			},
 		}, nil
 	case ".xz":
+		if requireExisting {
+			if _, err := os.Stat(path); err != nil {
+				return nil, err
+			}
+		}
 		f, err := os.Create(path)
 		if err != nil {
 			return nil, err
@@ -5114,6 +5232,11 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 			},
 		}, nil
 	case ".zip":
+		if requireExisting {
+			if _, err := os.Stat(path); err != nil {
+				return nil, err
+			}
+		}
 		f, err := os.Create(path)
 		if err != nil {
 			return nil, err
@@ -5141,6 +5264,31 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 			},
 		}, nil
 	default:
+		if requireExisting {
+			if _, err := os.Stat(path); err != nil {
+				return nil, err
+			}
+			f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			return f, nil
+		}
+		if preserveSize {
+			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			return f, nil
+		}
 		return os.Create(path)
 	}
 }
