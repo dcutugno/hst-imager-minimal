@@ -1,2 +1,2 @@
-github.com/dictav/go-lha v0.0.3 h1:gGb84ezIjk2Z3TjP5mc9uEKvEi0jb+6NiclnGj7OUf4=
-github.com/dictav/go-lha v0.0.3/go.mod h1:eaMskxi8A2s6Q/Bj9lQYqYyQeZ+lAJ9kww2q/U+2FUc=
+github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=

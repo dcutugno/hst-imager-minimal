@@ -25,7 +25,7 @@ import (
 	"time"
 	"unicode/utf16"
 
-	lhago "github.com/dictav/go-lha"
+	lhago "github.com/koron-go/lha"
 )
 
 type GlobalOptions struct {
