@@ -313,6 +313,81 @@ func TestFsExtractLhaCompressedNative(t *testing.T) {
 	}
 }
 
+func TestArchiveListLzxStoredWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	lzxPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzx", "dirs-files.lzx")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", lzxPath}, &out); err != nil {
+		t.Fatalf("archive list lzx without bsdtar failed: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "dir1/dir3/") || !strings.Contains(got, "dir1/file1.txt") || !strings.Contains(got, "dir2/") {
+		t.Fatalf("unexpected lzx list output: %q", got)
+	}
+}
+
+func TestFsExtractLzxStoredWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	lzxPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzx", "dirs-files.lzx")
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", lzxPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract lzx stored without bsdtar failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "dir1", "dir3")); err != nil {
+		t.Fatalf("expected extracted directory dir1/dir3: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dest, "dir1", "file1.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file dir1/file1.txt: %v", err)
+	}
+	if info.Size() != 1 {
+		t.Fatalf("expected file1.txt size 1, got %d", info.Size())
+	}
+	if _, err := os.Stat(filepath.Join(dest, "dir2")); err != nil {
+		t.Fatalf("expected extracted directory dir2: %v", err)
+	}
+}
+
+func TestArchiveListLzxCompressedWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	lzxPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzx", "amiga.lzx")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", lzxPath}, &out); err != nil {
+		t.Fatalf("archive list lzx compressed without bsdtar failed: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "test1.info") || !strings.Contains(got, "test1/test2.info") {
+		t.Fatalf("unexpected compressed lzx list output: %q", got)
+	}
+}
+
+func TestFsExtractLzxCompressedWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	lzxPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzx", "amiga.lzx")
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", lzxPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract lzx compressed without bsdtar failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dest, "test1.info"))
+	if err != nil {
+		t.Fatalf("expected extracted file test1.info: %v", err)
+	}
+	if info.Size() != 900 {
+		t.Fatalf("expected test1.info size 900, got %d", info.Size())
+	}
+	info, err = os.Stat(filepath.Join(dest, "test1", "test2.info"))
+	if err != nil {
+		t.Fatalf("expected extracted file test1/test2.info: %v", err)
+	}
+	if info.Size() != 900 {
+		t.Fatalf("expected test1/test2.info size 900, got %d", info.Size())
+	}
+}
+
 func writeTarGzArchive(path string, files map[string]string) error {
 	f, err := os.Create(path)
 	if err != nil {

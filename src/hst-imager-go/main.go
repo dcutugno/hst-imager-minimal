@@ -4914,10 +4914,12 @@ const (
 	archiveFormatTar    archiveFormat = "tar"
 	archiveFormatTarGz  archiveFormat = "targz"
 	archiveFormatLha    archiveFormat = "lha"
+	archiveFormatLzx    archiveFormat = "lzx"
 	archiveFormatLegacy archiveFormat = "legacy"
 )
 
 var errUnsupportedLhaFeature = errors.New("unsupported lha feature")
+var errUnsupportedLzxFeature = errors.New("unsupported lzx feature")
 
 func openSourceReader(path string) (io.ReadCloser, error) {
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
@@ -5215,6 +5217,14 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		if !errors.Is(err, errUnsupportedLhaFeature) {
 			return nil, err
 		}
+	case archiveFormatLzx:
+		items, err := listLzxArchiveEntries(path)
+		if err == nil {
+			return items, nil
+		}
+		if !errors.Is(err, errUnsupportedLzxFeature) {
+			return nil, err
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(path))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
@@ -5328,6 +5338,12 @@ func extractArchive(archivePath, innerPath, destination string) error {
 		} else if !errors.Is(err, errUnsupportedLhaFeature) {
 			return err
 		}
+	case archiveFormatLzx:
+		if err := extractLzxArchive(archivePath, innerPath, destination); err == nil {
+			return nil
+		} else if !errors.Is(err, errUnsupportedLzxFeature) {
+			return err
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(archivePath))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
@@ -5356,6 +5372,8 @@ func detectArchiveFormat(path string) archiveFormat {
 		return archiveFormatTar
 	case strings.HasSuffix(lower, ".lha"), strings.HasSuffix(lower, ".lzh"):
 		return archiveFormatLha
+	case strings.HasSuffix(lower, ".lzx"):
+		return archiveFormatLzx
 	default:
 		return archiveFormatLegacy
 	}
@@ -5472,6 +5490,796 @@ func extractTarArchive(archivePath, innerPath, destination string, gzipped bool)
 		}
 	}
 	return nil
+}
+
+const (
+	lzxInfoHeaderSize    = 10
+	lzxArchiveHeaderSize = 31
+	lzxMergedFlag        = 1
+	lzxPackModeStore     = 0
+	lzxPackModeNormal    = 2
+)
+
+type lzxEntry struct {
+	Name         string
+	Comment      string
+	Attributes   byte
+	PackMode     byte
+	Flags        byte
+	PackedSize   uint32
+	UnpackedSize uint32
+	DataCRC      uint32
+	DataOffset   int64
+	IsDir        bool
+}
+
+func listLzxArchiveEntries(path string) ([]archiveEntry, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := parseLzxEntries(b)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]archiveEntry, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, archiveEntry{
+			Name: e.Name,
+			Size: int64(e.UnpackedSize),
+		})
+	}
+	return items, nil
+}
+
+func extractLzxArchive(archivePath, innerPath, destination string) error {
+	b, err := os.ReadFile(archivePath)
+	if err != nil {
+		return err
+	}
+	entries, err := parseLzxEntries(b)
+	if err != nil {
+		return err
+	}
+
+	group := make([]lzxEntry, 0)
+	for _, entry := range entries {
+		group = append(group, entry)
+		if entry.PackedSize == 0 {
+			continue
+		}
+		if err := extractLzxGroup(b, group, innerPath, destination); err != nil {
+			return err
+		}
+		group = group[:0]
+	}
+	if len(group) > 0 {
+		if err := extractLzxGroup(b, group, innerPath, destination); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func extractLzxGroup(data []byte, group []lzxEntry, innerPath, destination string) error {
+	anchorIndex := -1
+	for i := len(group) - 1; i >= 0; i-- {
+		if group[i].PackedSize > 0 {
+			anchorIndex = i
+			break
+		}
+	}
+
+	if anchorIndex < 0 {
+		for _, entry := range group {
+			relPath, ok := resolveArchiveEntryRelativePath(entry.Name, innerPath)
+			if !ok || relPath == "" {
+				continue
+			}
+			target, err := safeArchiveTargetPath(destination, relPath, entry.Name)
+			if err != nil {
+				return err
+			}
+			if entry.IsDir {
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					return err
+				}
+				continue
+			}
+			if entry.UnpackedSize != 0 {
+				return errUnsupportedLzxFeature
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(target, nil, 0o644); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	anchor := group[anchorIndex]
+	start := int(anchor.DataOffset)
+	end := start + int(anchor.PackedSize)
+	if start < 0 || end < start || end > len(data) {
+		return fmt.Errorf("invalid lzx data range for '%s'", anchor.Name)
+	}
+	payload := data[start:end]
+
+	totalUnpacked := uint64(0)
+	maxInt := uint64(int(^uint(0) >> 1))
+	for _, entry := range group {
+		if entry.IsDir {
+			continue
+		}
+		totalUnpacked += uint64(entry.UnpackedSize)
+		if totalUnpacked > maxInt {
+			return fmt.Errorf("lzx group unpacked size exceeds platform limits")
+		}
+	}
+
+	var mergedData []byte
+	switch anchor.PackMode {
+	case lzxPackModeStore:
+		mergedData = payload
+	case lzxPackModeNormal:
+		decoded, err := decodeLzxNormalPayload(payload, int(totalUnpacked))
+		if err != nil {
+			return fmt.Errorf("failed to decode lzx payload for '%s': %w", anchor.Name, err)
+		}
+		mergedData = decoded
+	default:
+		return errUnsupportedLzxFeature
+	}
+
+	cursor := 0
+
+	for _, entry := range group {
+		var fileData []byte
+		if !entry.IsDir {
+			size := int(entry.UnpackedSize)
+			if size < 0 || cursor+size > len(mergedData) {
+				return fmt.Errorf("invalid lzx merged data for '%s'", entry.Name)
+			}
+			fileData = mergedData[cursor : cursor+size]
+			cursor += size
+			if entry.DataCRC != 0 && crc32.ChecksumIEEE(fileData) != entry.DataCRC {
+				return fmt.Errorf("lzx data crc mismatch for '%s'", entry.Name)
+			}
+		}
+
+		relPath, ok := resolveArchiveEntryRelativePath(entry.Name, innerPath)
+		if !ok || relPath == "" {
+			continue
+		}
+		target, err := safeArchiveTargetPath(destination, relPath, entry.Name)
+		if err != nil {
+			return err
+		}
+
+		if entry.IsDir {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, fileData, 0o644); err != nil {
+			return err
+		}
+	}
+
+	if cursor != len(mergedData) {
+		return fmt.Errorf("invalid lzx payload split: consumed %d of %d", cursor, len(mergedData))
+	}
+	return nil
+}
+
+func parseLzxEntries(data []byte) ([]lzxEntry, error) {
+	if len(data) < lzxInfoHeaderSize {
+		return nil, fmt.Errorf("invalid lzx file size %d", len(data))
+	}
+	info := data[:lzxInfoHeaderSize]
+	if string(info[:3]) != "LZX" {
+		return nil, errUnsupportedLzxFeature
+	}
+
+	entries := make([]lzxEntry, 0)
+	offset := lzxInfoHeaderSize
+	for offset < len(data) {
+		if len(data)-offset < lzxArchiveHeaderSize {
+			return nil, fmt.Errorf("invalid lzx header at offset %d", offset)
+		}
+		header := data[offset : offset+lzxArchiveHeaderSize]
+		offset += lzxArchiveHeaderSize
+
+		nameLen := int(header[30])
+		commentLen := int(header[14])
+		if nameLen < 0 || commentLen < 0 {
+			return nil, fmt.Errorf("invalid lzx name/comment length at offset %d", offset-lzxArchiveHeaderSize)
+		}
+		if offset+nameLen+commentLen > len(data) {
+			return nil, fmt.Errorf("invalid lzx variable header data at offset %d", offset-lzxArchiveHeaderSize)
+		}
+		nameBytes := data[offset : offset+nameLen]
+		offset += nameLen
+		commentBytes := data[offset : offset+commentLen]
+		offset += commentLen
+
+		expectedHeaderCRC := binary.LittleEndian.Uint32(header[26:30])
+		headerCopy := append([]byte(nil), header...)
+		for i := 26; i < 30; i++ {
+			headerCopy[i] = 0
+		}
+		sum := crc32.ChecksumIEEE(headerCopy)
+		sum = crc32.Update(sum, crc32.IEEETable, nameBytes)
+		sum = crc32.Update(sum, crc32.IEEETable, commentBytes)
+		if sum != expectedHeaderCRC {
+			return nil, fmt.Errorf("lzx header crc mismatch at offset %d", offset-lzxArchiveHeaderSize-nameLen-commentLen)
+		}
+
+		packedSize := binary.LittleEndian.Uint32(header[6:10])
+		dataOffset := offset
+		if dataOffset+int(packedSize) > len(data) {
+			return nil, fmt.Errorf("invalid lzx packed size at offset %d", offset-lzxArchiveHeaderSize-nameLen-commentLen)
+		}
+
+		name := normalizeLzxEntryName(string(nameBytes))
+		isDir := strings.HasSuffix(name, "/")
+		entries = append(entries, lzxEntry{
+			Name:         name,
+			Comment:      string(commentBytes),
+			Attributes:   header[0],
+			PackMode:     header[11],
+			Flags:        header[12],
+			PackedSize:   packedSize,
+			UnpackedSize: binary.LittleEndian.Uint32(header[2:6]),
+			DataCRC:      binary.LittleEndian.Uint32(header[22:26]),
+			DataOffset:   int64(dataOffset),
+			IsDir:        isDir,
+		})
+
+		offset += int(packedSize)
+	}
+	return entries, nil
+}
+
+func normalizeLzxEntryName(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = strings.TrimLeft(name, "/")
+	if strings.HasSuffix(name, "/") {
+		name = strings.TrimSuffix(name, "/")
+		if name == "" {
+			return ""
+		}
+		return name + "/"
+	}
+	return strings.TrimSuffix(name, "/")
+}
+
+var (
+	lzxTableOne = [32]uint8{
+		0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+		7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14,
+	}
+	lzxTableTwo = [32]uint32{
+		0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192,
+		256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
+		12288, 16384, 24576, 32768, 49152,
+	}
+	lzxTableThree = [16]uint32{
+		0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767,
+	}
+	lzxTableFour = [34]uint8{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+	}
+)
+
+type lzxBitReader struct {
+	data      []byte
+	offset    int
+	control   uint32
+	bitsAvail int
+}
+
+func newLzxBitReader(data []byte) *lzxBitReader {
+	return &lzxBitReader{
+		data: data,
+	}
+}
+
+func (r *lzxBitReader) ensureBits(n int) error {
+	if n < 0 || n > 24 {
+		return fmt.Errorf("invalid lzx bit count %d", n)
+	}
+	for r.bitsAvail < n {
+		if r.offset+2 > len(r.data) {
+			return io.ErrUnexpectedEOF
+		}
+		word := (uint32(r.data[r.offset]) << 8) | uint32(r.data[r.offset+1])
+		r.control |= word << r.bitsAvail
+		r.offset += 2
+		r.bitsAvail += 16
+	}
+	return nil
+}
+
+func (r *lzxBitReader) mask(n int) uint32 {
+	if n == 0 {
+		return 0
+	}
+	return (1 << n) - 1
+}
+
+func (r *lzxBitReader) peekBits(n int) (uint32, error) {
+	if n == 0 {
+		return 0, nil
+	}
+	if err := r.ensureBits(n); err != nil {
+		return 0, err
+	}
+	return r.control & r.mask(n), nil
+}
+
+func (r *lzxBitReader) readBits(n int) (uint32, error) {
+	if n == 0 {
+		return 0, nil
+	}
+	if err := r.ensureBits(n); err != nil {
+		return 0, err
+	}
+	v := r.control & r.mask(n)
+	r.control >>= n
+	r.bitsAvail -= n
+	return v, nil
+}
+
+type lzxNormalDecoder struct {
+	reader         *lzxBitReader
+	decrunchMethod uint32
+	decrunchLength int
+	lastOffset     uint32
+	offsetLen      [8]byte
+	offsetTable    [128]uint16
+	huffman20Len   [20]byte
+	huffman20Table [96]uint16
+	literalLen     [768]byte
+	literalTable   [5120]uint16
+	window         [65536]byte
+	windowWritePos int
+}
+
+func newLzxNormalDecoder(payload []byte) *lzxNormalDecoder {
+	return &lzxNormalDecoder{
+		reader:     newLzxBitReader(payload),
+		lastOffset: 1,
+	}
+}
+
+func decodeLzxNormalPayload(payload []byte, totalUnpacked int) ([]byte, error) {
+	if totalUnpacked < 0 {
+		return nil, fmt.Errorf("invalid lzx unpacked size %d", totalUnpacked)
+	}
+	if totalUnpacked == 0 {
+		return []byte{}, nil
+	}
+
+	d := newLzxNormalDecoder(payload)
+	out := make([]byte, 0, totalUnpacked)
+	for len(out) < totalUnpacked {
+		if d.decrunchLength <= 0 {
+			if err := d.readLiteralTable(); err != nil {
+				return nil, err
+			}
+			if d.decrunchLength <= 0 {
+				return nil, fmt.Errorf("invalid lzx decrunch length %d", d.decrunchLength)
+			}
+		}
+
+		written, err := d.decodeNextSymbol(&out, totalUnpacked-len(out))
+		if err != nil {
+			return nil, err
+		}
+		d.decrunchLength -= written
+	}
+
+	return out, nil
+}
+
+func (d *lzxNormalDecoder) decodeNextSymbol(out *[]byte, remaining int) (int, error) {
+	symbol, err := d.decodeSymbol(d.literalTable[:], d.literalLen[:], 12, 768)
+	if err != nil {
+		return 0, err
+	}
+	if symbol < 256 {
+		if remaining <= 0 {
+			return 0, fmt.Errorf("lzx output overflow")
+		}
+		d.pushByte(byte(symbol), out)
+		return 1, nil
+	}
+
+	symbol -= 256
+
+	temp := symbol & 31
+	if temp < 0 || temp >= len(lzxTableOne) {
+		return 0, fmt.Errorf("invalid lzx offset symbol %d", temp)
+	}
+
+	offset := lzxTableTwo[temp]
+	tempBits := int(lzxTableOne[temp])
+	if tempBits >= 3 && d.decrunchMethod == 3 {
+		tempBits -= 3
+		extra, err := d.reader.readBits(tempBits)
+		if err != nil {
+			return 0, err
+		}
+		offset += extra << 3
+		offsetSymbol, err := d.decodeSymbol(d.offsetTable[:], d.offsetLen[:], 7, 8)
+		if err != nil {
+			return 0, err
+		}
+		if offsetSymbol < 0 || offsetSymbol >= len(d.offsetLen) {
+			return 0, fmt.Errorf("invalid lzx offset decode symbol %d", offsetSymbol)
+		}
+		offset += uint32(offsetSymbol)
+	} else {
+		extra, err := d.reader.readBits(tempBits)
+		if err != nil {
+			return 0, err
+		}
+		offset += extra
+		if offset == 0 {
+			offset = d.lastOffset
+		}
+	}
+	d.lastOffset = offset
+
+	lengthClass := (symbol >> 5) & 15
+	if lengthClass < 0 || lengthClass >= 16 {
+		return 0, fmt.Errorf("invalid lzx length class %d", lengthClass)
+	}
+	length := lzxTableTwo[lengthClass] + 3
+	lengthExtraBits := int(lzxTableOne[lengthClass])
+	lengthExtra, err := d.reader.readBits(lengthExtraBits)
+	if err != nil {
+		return 0, err
+	}
+	length += lengthExtra
+
+	matchLen := int(length)
+	if matchLen < 0 || matchLen > remaining {
+		return 0, fmt.Errorf("lzx decoded length %d exceeds remaining %d", matchLen, remaining)
+	}
+	if err := d.copyFromWindow(matchLen, int(d.lastOffset), out); err != nil {
+		return 0, err
+	}
+	return matchLen, nil
+}
+
+func (d *lzxNormalDecoder) copyFromWindow(length, offset int, out *[]byte) error {
+	if offset <= 0 || offset > len(d.window) {
+		return fmt.Errorf("invalid lzx offset %d", offset)
+	}
+	readPos := d.windowWritePos - offset
+	if readPos < 0 {
+		readPos += len(d.window)
+	}
+
+	for i := 0; i < length; i++ {
+		b := d.window[readPos]
+		readPos = (readPos + 1) & 0xffff
+		d.pushByte(b, out)
+	}
+	return nil
+}
+
+func (d *lzxNormalDecoder) pushByte(b byte, out *[]byte) {
+	d.window[d.windowWritePos] = b
+	d.windowWritePos = (d.windowWritePos + 1) & 0xffff
+	*out = append(*out, b)
+}
+
+func (d *lzxNormalDecoder) decodeSymbol(table []uint16, lengths []byte, tableBits int, symbolLimit int) (int, error) {
+	if tableBits <= 0 {
+		return 0, fmt.Errorf("invalid lzx table bits %d", tableBits)
+	}
+	peek, err := d.reader.peekBits(tableBits)
+	if err != nil {
+		return 0, err
+	}
+	if int(peek) >= len(table) {
+		return 0, fmt.Errorf("invalid lzx decode index %d", peek)
+	}
+	symbol := int(table[peek])
+	if symbol >= symbolLimit {
+		if _, err := d.reader.readBits(tableBits); err != nil {
+			return 0, err
+		}
+		for symbol >= symbolLimit {
+			bit, err := d.reader.readBits(1)
+			if err != nil {
+				return 0, err
+			}
+			next := (symbol << 1) + int(bit)
+			if next < 0 || next >= len(table) {
+				return 0, fmt.Errorf("invalid lzx decode tree index %d", next)
+			}
+			symbol = int(table[next])
+		}
+		return symbol, nil
+	}
+
+	if symbol < 0 || symbol >= len(lengths) {
+		return 0, fmt.Errorf("invalid lzx symbol %d", symbol)
+	}
+	bits := int(lengths[symbol])
+	if bits <= 0 {
+		return 0, fmt.Errorf("invalid lzx code length for symbol %d", symbol)
+	}
+	if _, err := d.reader.readBits(bits); err != nil {
+		return 0, err
+	}
+	return symbol, nil
+}
+
+func (d *lzxNormalDecoder) readLiteralTable() error {
+	method, err := d.reader.readBits(3)
+	if err != nil {
+		return err
+	}
+	d.decrunchMethod = method
+
+	if d.decrunchMethod == 3 {
+		for i := 0; i < len(d.offsetLen); i++ {
+			v, err := d.reader.readBits(3)
+			if err != nil {
+				return err
+			}
+			d.offsetLen[i] = byte(v)
+		}
+		if makeDecodeTable(8, 7, d.offsetLen[:], d.offsetTable[:]) {
+			return fmt.Errorf("failed to build lzx offset decode table")
+		}
+	}
+
+	b1, err := d.reader.readBits(8)
+	if err != nil {
+		return err
+	}
+	b2, err := d.reader.readBits(8)
+	if err != nil {
+		return err
+	}
+	b3, err := d.reader.readBits(8)
+	if err != nil {
+		return err
+	}
+	d.decrunchLength = int((b1 << 16) | (b2 << 8) | b3)
+
+	if d.decrunchMethod == 1 {
+		return nil
+	}
+
+	pos := 0
+	fix := 1
+	maxSymbol := 256
+
+	for {
+		for i := 0; i < len(d.huffman20Len); i++ {
+			v, err := d.reader.readBits(4)
+			if err != nil {
+				return err
+			}
+			d.huffman20Len[i] = byte(v)
+		}
+		if makeDecodeTable(20, 6, d.huffman20Len[:], d.huffman20Table[:]) {
+			return fmt.Errorf("failed to build lzx huffman20 decode table")
+		}
+
+		for pos < maxSymbol {
+			symbol, err := d.decodeSymbol(d.huffman20Table[:], d.huffman20Len[:], 6, 20)
+			if err != nil {
+				return err
+			}
+
+			switch symbol {
+			case 17, 18:
+				var bits int
+				var count uint32
+				if symbol == 17 {
+					bits = 4
+					count = 3
+				} else {
+					bits = 6 - fix
+					count = 19
+				}
+				extra, err := d.reader.readBits(bits)
+				if err != nil {
+					return err
+				}
+				count += extra + uint32(fix)
+				for count > 0 && pos < maxSymbol {
+					d.literalLen[pos] = 0
+					pos++
+					count--
+				}
+			case 19:
+				extraCount, err := d.reader.readBits(1)
+				if err != nil {
+					return err
+				}
+				count := int(extraCount) + 3 + fix
+
+				nextSymbol, err := d.decodeSymbol(d.huffman20Table[:], d.huffman20Len[:], 6, 20)
+				if err != nil {
+					return err
+				}
+				if pos >= len(d.literalLen) {
+					return fmt.Errorf("invalid lzx literal position %d", pos)
+				}
+				nextLen, err := lzxAdjustedLen(d.literalLen[pos], nextSymbol)
+				if err != nil {
+					return err
+				}
+				for count > 0 && pos < maxSymbol {
+					d.literalLen[pos] = nextLen
+					pos++
+					count--
+				}
+			default:
+				if pos >= len(d.literalLen) {
+					return fmt.Errorf("invalid lzx literal position %d", pos)
+				}
+				nextLen, err := lzxAdjustedLen(d.literalLen[pos], symbol)
+				if err != nil {
+					return err
+				}
+				d.literalLen[pos] = nextLen
+				pos++
+			}
+		}
+
+		fix--
+		maxSymbol += 512
+		if maxSymbol != 768 {
+			break
+		}
+	}
+
+	if makeDecodeTable(768, 12, d.literalLen[:], d.literalTable[:]) {
+		return fmt.Errorf("failed to build lzx literal decode table")
+	}
+	return nil
+}
+
+func lzxAdjustedLen(current byte, symbol int) (byte, error) {
+	idx := int(current) + 17 - symbol
+	if idx < 0 || idx >= len(lzxTableFour) {
+		return 0, fmt.Errorf("invalid lzx literal length adjustment index %d", idx)
+	}
+	return lzxTableFour[idx], nil
+}
+
+func makeDecodeTable(numberSymbols, tableSize int, lengths []byte, table []uint16) bool {
+	for i := range table {
+		table[i] = 0
+	}
+
+	bitNum := 1
+	pos := uint32(0)
+	tableMask := uint32(1 << tableSize)
+	bitMask := tableMask >> 1
+	abort := false
+
+	for !abort && bitNum <= tableSize {
+		for symbol := 0; symbol < numberSymbols; symbol++ {
+			if int(lengths[symbol]) != bitNum {
+				continue
+			}
+			leaf := reverseBits(pos, tableSize)
+			pos += bitMask
+			if pos > tableMask {
+				abort = true
+				break
+			}
+
+			fill := int(bitMask)
+			nextSymbol := uint32(1 << bitNum)
+			for fill > 0 {
+				if int(leaf) >= len(table) {
+					abort = true
+					break
+				}
+				table[leaf] = uint16(symbol)
+				leaf += nextSymbol
+				fill--
+			}
+			if abort {
+				break
+			}
+		}
+		bitMask >>= 1
+		bitNum++
+	}
+
+	if !abort && pos != tableMask {
+		for symbol := pos; symbol < tableMask; symbol++ {
+			leaf := reverseBits(symbol, tableSize)
+			if int(leaf) >= len(table) {
+				return true
+			}
+			table[leaf] = 0
+		}
+
+		nextSymbol := tableMask >> 1
+		pos <<= 16
+		tableMask <<= 16
+		bitMask = 32768
+
+		for !abort && bitNum <= 16 {
+			for symbol := 0; symbol < numberSymbols; symbol++ {
+				if int(lengths[symbol]) != bitNum {
+					continue
+				}
+
+				leaf := reverseBits(pos>>16, tableSize)
+				for fill := 0; fill < bitNum-tableSize; fill++ {
+					if int(leaf) >= len(table) {
+						abort = true
+						break
+					}
+					if table[leaf] == 0 {
+						left := nextSymbol << 1
+						right := left + 1
+						if int(right) >= len(table) {
+							abort = true
+							break
+						}
+						table[left] = 0
+						table[right] = 0
+						table[leaf] = uint16(nextSymbol)
+						nextSymbol++
+					}
+					leaf = uint32(table[leaf]) << 1
+					leaf += (pos >> (15 - fill)) & 1
+				}
+				if abort {
+					break
+				}
+				if int(leaf) >= len(table) {
+					abort = true
+					break
+				}
+				table[leaf] = uint16(symbol)
+				pos += bitMask
+				if pos > tableMask {
+					abort = true
+					break
+				}
+			}
+			bitMask >>= 1
+			bitNum++
+		}
+	}
+
+	if pos != tableMask {
+		abort = true
+	}
+	return abort
+}
+
+func reverseBits(v uint32, width int) uint32 {
+	r := uint32(0)
+	for i := 0; i < width; i++ {
+		r = (r << 1) | (v & 1)
+		v >>= 1
+	}
+	return r
 }
 
 type lhaEntry struct {
