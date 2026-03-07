@@ -146,6 +146,41 @@ func TestFsExtractTarGzNative(t *testing.T) {
 	}
 }
 
+func TestArchiveListLhaNativeStored(t *testing.T) {
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "dirs-files.lha")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", lhaPath}, &out); err != nil {
+		t.Fatalf("archive list lha failed: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "dir1/dir3/") || !strings.Contains(got, "dir1/file1.txt") || !strings.Contains(got, "dir2/") {
+		t.Fatalf("unexpected lha list output: %q", got)
+	}
+}
+
+func TestFsExtractLhaStoredNative(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "dirs-files.lha")
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", lhaPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract lha failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "dir1", "dir3")); err != nil {
+		t.Fatalf("expected extracted directory dir1/dir3: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dest, "dir1", "file1.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file dir1/file1.txt: %v", err)
+	}
+	if info.Size() != 1 {
+		t.Fatalf("expected file1.txt size 1, got %d", info.Size())
+	}
+	if _, err := os.Stat(filepath.Join(dest, "dir2")); err != nil {
+		t.Fatalf("expected extracted directory dir2: %v", err)
+	}
+}
+
 func writeTarGzArchive(path string, files map[string]string) error {
 	f, err := os.Create(path)
 	if err != nil {

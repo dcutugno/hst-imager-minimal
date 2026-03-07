@@ -4898,8 +4898,11 @@ const (
 	archiveFormatZip    archiveFormat = "zip"
 	archiveFormatTar    archiveFormat = "tar"
 	archiveFormatTarGz  archiveFormat = "targz"
+	archiveFormatLha    archiveFormat = "lha"
 	archiveFormatLegacy archiveFormat = "legacy"
 )
+
+var errUnsupportedLhaFeature = errors.New("unsupported lha feature")
 
 func openSourceReader(path string) (io.ReadCloser, error) {
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
@@ -5189,6 +5192,14 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		return listTarArchiveEntries(path, false)
 	case archiveFormatTarGz:
 		return listTarArchiveEntries(path, true)
+	case archiveFormatLha:
+		items, err := listLhaArchiveEntries(path)
+		if err == nil {
+			return items, nil
+		}
+		if !errors.Is(err, errUnsupportedLhaFeature) {
+			return nil, err
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(path))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
@@ -5245,6 +5256,12 @@ func extractArchive(archivePath, innerPath, destination string) error {
 		return extractTarArchive(archivePath, innerPath, destination, false)
 	case archiveFormatTarGz:
 		return extractTarArchive(archivePath, innerPath, destination, true)
+	case archiveFormatLha:
+		if err := extractLhaArchive(archivePath, innerPath, destination); err == nil {
+			return nil
+		} else if !errors.Is(err, errUnsupportedLhaFeature) {
+			return err
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(archivePath))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
@@ -5271,6 +5288,8 @@ func detectArchiveFormat(path string) archiveFormat {
 		return archiveFormatTarGz
 	case strings.HasSuffix(lower, ".tar"):
 		return archiveFormatTar
+	case strings.HasSuffix(lower, ".lha"), strings.HasSuffix(lower, ".lzh"):
+		return archiveFormatLha
 	default:
 		return archiveFormatLegacy
 	}
@@ -5399,6 +5418,161 @@ func extractTarArchive(archivePath, innerPath, destination string, gzipped bool)
 		}
 	}
 	return nil
+}
+
+type lhaEntry struct {
+	Name           string
+	Method         string
+	CompressedSize uint32
+	OriginalSize   uint32
+	DataOffset     int
+	IsDir          bool
+}
+
+func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := parseLhaEntries(b)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]archiveEntry, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, archiveEntry{
+			Name: e.Name,
+			Size: int64(e.OriginalSize),
+		})
+	}
+	return items, nil
+}
+
+func extractLhaArchive(archivePath, innerPath, destination string) error {
+	b, err := os.ReadFile(archivePath)
+	if err != nil {
+		return err
+	}
+	entries, err := parseLhaEntries(b)
+	if err != nil {
+		return err
+	}
+
+	prefix := normalizeArchivePath(innerPath)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	base := filepath.Clean(destination)
+	for _, e := range entries {
+		name := normalizeArchivePath(e.Name)
+		if prefix != "" {
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			name = strings.TrimPrefix(name, prefix)
+			name = strings.TrimPrefix(name, "/")
+		}
+		if name == "" {
+			continue
+		}
+
+		target := filepath.Join(destination, filepath.FromSlash(name))
+		cleanTarget := filepath.Clean(target)
+		if !strings.HasPrefix(cleanTarget, base+string(filepath.Separator)) && cleanTarget != base {
+			return fmt.Errorf("lha entry escapes destination: %s", e.Name)
+		}
+
+		if e.IsDir || strings.EqualFold(e.Method, "-lhd-") {
+			if err := os.MkdirAll(cleanTarget, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if !strings.EqualFold(e.Method, "-lh0-") {
+			return errUnsupportedLhaFeature
+		}
+		if err := os.MkdirAll(filepath.Dir(cleanTarget), 0o755); err != nil {
+			return err
+		}
+		start := e.DataOffset
+		end := start + int(e.CompressedSize)
+		if start < 0 || end < start || end > len(b) {
+			return fmt.Errorf("invalid lha data range for '%s'", e.Name)
+		}
+		payload := b[start:end]
+		if e.OriginalSize < uint32(len(payload)) {
+			payload = payload[:e.OriginalSize]
+		}
+		if err := os.WriteFile(cleanTarget, payload, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseLhaEntries(data []byte) ([]lhaEntry, error) {
+	entries := make([]lhaEntry, 0)
+	offset := 0
+	for offset < len(data) {
+		if offset+1 > len(data) {
+			break
+		}
+		headerSize := int(data[offset])
+		if headerSize == 0 {
+			break
+		}
+
+		headerEnd := offset + 2 + headerSize
+		if headerEnd > len(data) {
+			return nil, fmt.Errorf("invalid lha header at offset %d", offset)
+		}
+		if offset+22 > len(data) {
+			return nil, fmt.Errorf("invalid lha header fields at offset %d", offset)
+		}
+
+		level := data[offset+20]
+		if level != 0 {
+			return nil, errUnsupportedLhaFeature
+		}
+
+		method := string(data[offset+2 : offset+7])
+		compressedSize := binary.LittleEndian.Uint32(data[offset+7 : offset+11])
+		originalSize := binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+		nameLen := int(data[offset+21])
+		nameStart := offset + 22
+		nameEnd := nameStart + nameLen
+		if nameEnd > headerEnd {
+			return nil, fmt.Errorf("invalid lha entry name length at offset %d", offset)
+		}
+
+		rawName := latin1Decode(data[nameStart:nameEnd])
+		isDir := strings.HasSuffix(rawName, "\\") || strings.HasSuffix(rawName, "/")
+		name := strings.ReplaceAll(rawName, "\\", "/")
+		name = strings.TrimLeft(name, "/")
+		if isDir {
+			name = strings.TrimSuffix(name, "/") + "/"
+		} else {
+			name = strings.TrimSuffix(name, "/")
+		}
+		dataOffset := headerEnd
+		nextOffset := dataOffset + int(compressedSize)
+		if nextOffset > len(data) {
+			return nil, fmt.Errorf("invalid lha entry data size at offset %d", offset)
+		}
+
+		entries = append(entries, lhaEntry{
+			Name:           name,
+			Method:         method,
+			CompressedSize: compressedSize,
+			OriginalSize:   originalSize,
+			DataOffset:     dataOffset,
+			IsDir:          isDir,
+		})
+
+		offset = nextOffset
+	}
+	return entries, nil
 }
 
 func extractZip(archivePath, innerPath, destination string) error {

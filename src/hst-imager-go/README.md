@@ -65,7 +65,9 @@ Pure-Go parity progress:
 - `fs dir` now reads `_UAEFSDB.___` and `.uaem` metadata in pure Go to resolve Amiga names/protection bits/comments, hides metadata files from listings, and supports recursive metadata-aware path mapping.
 - `fs copy`/`fs extract` now read source UAE metadata in pure Go and propagate metadata properties (protection bits/comments) to destination metadata files, including entries where names do not require remapping.
 - `fs dir`/`fs copy`/`fs extract` now resolve Amiga-style source path components via UAE metadata mappings (e.g. `file1*` -> `__uae___file1_` or `file1%2a`) in pure-Go mode.
-- archive handling now supports native non-zip tar-family formats in Go (`.tar`, `.tgz`, `.tar.gz`) for both `archive list` and `fs extract`; `bsdtar` fallback remains for legacy formats not yet implemented natively (e.g. `lha`, `lzx`, `rar`).
+- archive handling now supports native non-zip tar-family formats in Go (`.tar`, `.tgz`, `.tar.gz`) for both `archive list` and `fs extract`.
+- LHA now has native parsing for `archive list` and native extraction for stored (`-lh0-`) entries; compressed/advanced LHA features still fall back to `bsdtar`.
+- `bsdtar` fallback remains for legacy formats not yet implemented natively (e.g. `lzx`, `rar`) and unsupported advanced LHA variants.
 - Added parity-focused tests for binary layout, protection-bit formatting, and filename encoding edge cases.
 
 Example using your published artifacts:
