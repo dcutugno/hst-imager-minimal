@@ -24,7 +24,9 @@ import (
 )
 
 type GlobalOptions struct {
-	Format string
+	Format  string
+	Verbose bool
+	LogFile string
 }
 
 type DriveInfo struct {
@@ -66,6 +68,9 @@ const mbrSectorSize = 512
 const rdbSignature = "RDBGO100"
 const rdbHeaderSize = 16
 const rdbMetaStart = int64(64 * 1024)
+const defaultLegacyPublishDir = "/tmp/hst-imager-legacy"
+
+var errLegacyUnavailable = errors.New("legacy backend unavailable")
 
 type mbrPartition struct {
 	Index       int
@@ -166,6 +171,16 @@ func run(args []string, stdout io.Writer) error {
 	if len(remaining) > 0 {
 		if remaining[0] == "--help" || remaining[0] == "-h" {
 			PrintHelp(stdout, cmd, consumedPath)
+			return nil
+		}
+	}
+
+	if consumedPath != "" {
+		handled, err := tryRunLegacyBridge(consumedPath, remaining, stdout, opts)
+		if err != nil {
+			return err
+		}
+		if handled {
 			return nil
 		}
 	}
@@ -284,6 +299,151 @@ func run(args []string, stdout io.Writer) error {
 	}
 }
 
+func isAutoLegacyBridgeCommand(consumedPath string) bool {
+	switch consumedPath {
+	case "list", "blank", "convert", "transfer", "read", "write", "compare", "info", "optimize", "format":
+		return true
+	case "block read", "block view":
+		return true
+	case "settings list", "settings update":
+		return true
+	case "fs copy", "fs extract", "fs dir", "fs mkdir":
+		return true
+	case "adf create", "archive list", "script":
+		return true
+	case "mbr info", "mbr initialize", "mbr part add", "mbr part delete", "mbr part format", "mbr part export", "mbr part import", "mbr part clone":
+		return true
+	case "gpt info", "gpt initialize", "gpt part add", "gpt part delete", "gpt part format":
+		return true
+	case "rdb info", "rdb initialize", "rdb resize", "rdb filesystem add", "rdb filesystem delete", "rdb filesystem import", "rdb filesystem export", "rdb filesystem update":
+		return true
+	case "rdb part add", "rdb part update", "rdb part delete", "rdb part copy", "rdb part export", "rdb part import", "rdb part kill", "rdb part move", "rdb part format":
+		return true
+	case "rdb update", "rdb backup", "rdb restore":
+		return true
+	default:
+		return false
+	}
+}
+
+func tryRunLegacyBridge(consumedPath string, remaining []string, stdout io.Writer, opts GlobalOptions) (bool, error) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HST_IMAGER_LEGACY_MODE")))
+	switch mode {
+	case "", "auto", "on":
+		mode = "auto"
+	case "off", "false", "0", "disabled":
+		return false, nil
+	case "force", "strict":
+		mode = "force"
+	default:
+		return false, fmt.Errorf("invalid HST_IMAGER_LEGACY_MODE '%s' (supported: off, auto, force)", mode)
+	}
+
+	if mode == "auto" && !isAutoLegacyBridgeCommand(consumedPath) {
+		return false, nil
+	}
+	if mode == "auto" && strings.EqualFold(opts.Format, "json") && !legacyCommandSupportsJSON(consumedPath) {
+		return false, nil
+	}
+
+	err := runLegacyBridgeCommand(consumedPath, remaining, stdout, opts)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, errLegacyUnavailable) && mode == "auto" {
+		return false, nil
+	}
+	return false, err
+}
+
+func runLegacyBridgeCommand(consumedPath string, remaining []string, stdout io.Writer, opts GlobalOptions) error {
+	commandName, prefixArgs, extraEnv, err := resolveLegacyBackendCommand()
+	if err != nil {
+		return err
+	}
+
+	legacyArgs := make([]string, 0, 6+len(remaining))
+	if opts.Verbose {
+		legacyArgs = append(legacyArgs, "--verbose")
+	}
+	if opts.LogFile != "" {
+		legacyArgs = append(legacyArgs, "--log-file", opts.LogFile)
+	}
+	legacyArgs = append(legacyArgs, strings.Fields(consumedPath)...)
+	legacyArgs = append(legacyArgs, remaining...)
+	if consumedPath == "fs dir" && strings.EqualFold(opts.Format, "json") && !hasAnyArg(legacyArgs, "--format", "-f") {
+		legacyArgs = append(legacyArgs, "--format", "json")
+	}
+
+	command := exec.Command(commandName, append(prefixArgs, legacyArgs...)...)
+	command.Stdout = stdout
+	command.Stderr = stdout
+	if len(extraEnv) > 0 {
+		command.Env = append(os.Environ(), extraEnv...)
+	}
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("legacy backend command failed: %w", err)
+	}
+	return nil
+}
+
+func resolveLegacyBackendCommand() (string, []string, []string, error) {
+	legacyBin := strings.TrimSpace(os.Getenv("HST_IMAGER_LEGACY_BIN"))
+	if legacyBin == "" {
+		defaultDll := filepath.Join(defaultLegacyPublishDir, "Hst.Imager.ConsoleApp.dll")
+		if fileExists(defaultDll) {
+			if _, err := exec.LookPath("dotnet"); err == nil {
+				return "dotnet", []string{defaultDll}, []string{"DOTNET_ROLL_FORWARD=Major"}, nil
+			}
+		}
+
+		defaultExe := filepath.Join(defaultLegacyPublishDir, "Hst.Imager.ConsoleApp")
+		if fileExists(defaultExe) {
+			return defaultExe, nil, []string{"DOTNET_ROLL_FORWARD=Major"}, nil
+		}
+		return "", nil, nil, errLegacyUnavailable
+	}
+
+	if !fileExists(legacyBin) {
+		return "", nil, nil, fmt.Errorf("legacy backend not found at '%s'", legacyBin)
+	}
+	if strings.HasSuffix(strings.ToLower(legacyBin), ".dll") {
+		if _, err := exec.LookPath("dotnet"); err != nil {
+			return "", nil, nil, fmt.Errorf("dotnet runtime not found to execute '%s': %w", legacyBin, err)
+		}
+		return "dotnet", []string{legacyBin}, []string{"DOTNET_ROLL_FORWARD=Major"}, nil
+	}
+	return legacyBin, nil, []string{"DOTNET_ROLL_FORWARD=Major"}, nil
+}
+
+func hasAnyArg(args []string, values ...string) bool {
+	for _, arg := range args {
+		for _, value := range values {
+			if arg == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func legacyCommandSupportsJSON(consumedPath string) bool {
+	switch consumedPath {
+	case "fs dir":
+		return true
+	default:
+		return false
+	}
+}
+
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 func parseGlobalArgs(args []string, stdout io.Writer, root *Command) (GlobalOptions, []string, error) {
 	opts := GlobalOptions{Format: "table"}
 	commandArgs := make([]string, 0)
@@ -303,11 +463,13 @@ func parseGlobalArgs(args []string, stdout io.Writer, root *Command) (GlobalOpti
 			fmt.Fprintln(stdout, "hst-imager-go (prototype)")
 			return opts, nil, nil
 		case "--verbose":
+			opts.Verbose = true
 			continue
 		case "--log-file":
 			if i+1 >= len(args) {
 				return opts, nil, fmt.Errorf("missing value for global option: %s", arg)
 			}
+			opts.LogFile = args[i+1]
 			i++
 			continue
 		case "--format":

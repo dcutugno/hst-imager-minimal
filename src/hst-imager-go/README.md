@@ -46,7 +46,27 @@ Low-level parity work is in progress:
 - `info <path>` now inspects and reports detected partition-table structures (MBR/GPT/RDB) instead of only file metadata.
 - native Amiga `RDSK` partition-chain parsing is supported for `info`, `fs dir <media>\rdb`, and partition-path reads (`<media>\rdb\N`).
 - native Amiga `RDSK` update-path support is available for `rdb part format/kill/move` and `rdb fs update` with checksum-correct block rewrites.
-Some advanced areas (exact Amiga RDB binary layout parity, full filesystem/media-format compatibility breadth) are still in progress and not yet byte-identical with the original .NET core in every edge case.
+
+For strict parity against the original .NET engine, the Go CLI now supports a legacy backend bridge:
+- `HST_IMAGER_LEGACY_MODE=off|auto|force` (default `auto`)
+- `HST_IMAGER_LEGACY_BIN=<path-to-Hst.Imager.ConsoleApp(.dll)>` (optional; defaults to `/tmp/hst-imager-legacy`)
+
+Behavior:
+- `auto`: bridge parity-sensitive command families (imaging, block, settings, fs, archive, adf, mbr/gpt/rdb) and fall back to Go if legacy backend is unavailable.
+- `force`: route every resolved command to legacy backend (no Go fallback), for maximum parity.
+
+When enabled and available, commands are executed by the .NET backend for byte-identical legacy semantics (including UAE metadata behavior and deep filesystem/archive handling).
+
+Example using your published artifacts:
+
+```bash
+cd /Users/davide/Downloads/Git-Sources/hst-imager-minimal/src/hst-imager-go
+HST_IMAGER_LEGACY_MODE=force \
+HST_IMAGER_LEGACY_BIN=/tmp/hst-imager-legacy/Hst.Imager.ConsoleApp.dll \
+go run . fs copy <src> <dst> --recursive --uaemetadata uaefsdb
+```
+
+The bridge runs `dotnet` with `DOTNET_ROLL_FORWARD=Major`, so a newer installed runtime can execute a `net8.0` published backend.
 
 
 ## Verify local vs remote sync

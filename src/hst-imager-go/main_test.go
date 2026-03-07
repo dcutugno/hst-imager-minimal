@@ -4,11 +4,17 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	_ = os.Setenv("HST_IMAGER_LEGACY_MODE", "off")
+	os.Exit(m.Run())
+}
 
 func TestRootCommandContainsExpectedCommands(t *testing.T) {
 	root := BuildRootCommand()
@@ -977,5 +983,101 @@ func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "amiga_name=AUX.info") {
 		t.Fatalf("unexpected uaem content: %s", string(b))
+	}
+}
+
+func TestFsCopyLegacyBridgePassthrough(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	destination := filepath.Join(tmp, "destination")
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := filepath.Join(tmp, "legacy.sh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho legacy-ok\n", argsFile)
+	if err := os.WriteFile(legacyScript, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", source, destination, "--recursive", "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("legacy fs copy failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-ok") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := strings.Split(strings.TrimSpace(string(b)), "\n")
+	wantArgs := []string{"fs", "copy", source, destination, "--recursive", "--uaemetadata", "uaefsdb"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func TestFsDirLegacyBridgeAddsJsonFormat(t *testing.T) {
+	tmp := t.TempDir()
+	diskPath := filepath.Join(tmp, "disk")
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := filepath.Join(tmp, "legacy.sh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho legacy-dir\n", argsFile)
+	if err := os.WriteFile(legacyScript, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", diskPath}, &out); err != nil {
+		t.Fatalf("legacy fs dir failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-dir") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := strings.Split(strings.TrimSpace(string(b)), "\n")
+	wantArgs := []string{"fs", "dir", diskPath, "--format", "json"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func TestLegacyBridgeForceRoutesSettingsCommand(t *testing.T) {
+	tmp := t.TempDir()
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := filepath.Join(tmp, "legacy.sh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho settings-legacy\n", argsFile)
+	if err := os.WriteFile(legacyScript, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"settings", "list"}, &out); err != nil {
+		t.Fatalf("legacy settings list failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "settings-legacy") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := strings.Split(strings.TrimSpace(string(b)), "\n")
+	wantArgs := []string{"settings", "list"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
 	}
 }
