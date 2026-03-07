@@ -26,6 +26,8 @@ import (
 	"unicode/utf16"
 
 	lhago "github.com/koron-go/lha"
+	rardecode "github.com/nwaples/rardecode"
+	"github.com/ulikunitz/xz"
 )
 
 type GlobalOptions struct {
@@ -2239,14 +2241,19 @@ func writeMbrPartitions(path string, parts []mbrPartition) error {
 		if p.Bootable {
 			sector[offset] = 0x80
 		}
-		// CHS placeholders for modern LBA-based layout.
-		sector[offset+1] = 0xfe
-		sector[offset+2] = 0xff
-		sector[offset+3] = 0xff
+		startHead, startSectorCylinder, startCylinder := encodeMbrChs(p.StartLBA)
+		sector[offset+1] = startHead
+		sector[offset+2] = startSectorCylinder
+		sector[offset+3] = startCylinder
 		sector[offset+4] = p.TypeCode
-		sector[offset+5] = 0xfe
-		sector[offset+6] = 0xff
-		sector[offset+7] = 0xff
+		lastLBA := p.StartLBA
+		if p.SectorCount > 0 {
+			lastLBA = p.StartLBA + p.SectorCount - 1
+		}
+		endHead, endSectorCylinder, endCylinder := encodeMbrChs(lastLBA)
+		sector[offset+5] = endHead
+		sector[offset+6] = endSectorCylinder
+		sector[offset+7] = endCylinder
 		binary.LittleEndian.PutUint32(sector[offset+8:offset+12], p.StartLBA)
 		binary.LittleEndian.PutUint32(sector[offset+12:offset+16], p.SectorCount)
 	}
@@ -2256,6 +2263,26 @@ func writeMbrPartitions(path string, parts []mbrPartition) error {
 		return err
 	}
 	return f.Sync()
+}
+
+func encodeMbrChs(lba uint32) (head, sectorCylinder, cylinder byte) {
+	const sectorsPerTrack uint32 = 63
+	const headsPerCylinder uint32 = 255
+	const maxCylinder uint32 = 1023
+
+	if lba >= (maxCylinder+1)*headsPerCylinder*sectorsPerTrack {
+		return 0xfe, 0xff, 0xff
+	}
+
+	cyl := lba / (headsPerCylinder * sectorsPerTrack)
+	rem := lba % (headsPerCylinder * sectorsPerTrack)
+	hd := rem / sectorsPerTrack
+	sec := (rem % sectorsPerTrack) + 1
+
+	head = byte(hd)
+	sectorCylinder = byte((sec & 0x3f) | ((cyl >> 2) & 0xc0))
+	cylinder = byte(cyl & 0xff)
+	return head, sectorCylinder, cylinder
 }
 
 func mbrPartitionToPart(p mbrPartition) Part {
@@ -4915,11 +4942,13 @@ const (
 	archiveFormatTarGz  archiveFormat = "targz"
 	archiveFormatLha    archiveFormat = "lha"
 	archiveFormatLzx    archiveFormat = "lzx"
+	archiveFormatRar    archiveFormat = "rar"
 	archiveFormatLegacy archiveFormat = "legacy"
 )
 
 var errUnsupportedLhaFeature = errors.New("unsupported lha feature")
 var errUnsupportedLzxFeature = errors.New("unsupported lzx feature")
+var errUnsupportedRarFeature = errors.New("unsupported rar feature")
 
 func openSourceReader(path string) (io.ReadCloser, error) {
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
@@ -4955,6 +4984,20 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 				}
 				return err2
 			}),
+		}, nil
+	case ".xz":
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		xzr, err := xz.NewReader(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &readCloser{
+			reader: xzr,
+			closer: f,
 		}, nil
 	case ".zip":
 		zr, err := zip.OpenReader(path)
@@ -4992,6 +5035,24 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 				return err2
 			}),
 		}, nil
+	case ".rar":
+		rr, err := rardecode.OpenReader(path, "")
+		if err != nil {
+			return nil, err
+		}
+		for {
+			h, err := rr.Next()
+			if err != nil {
+				_ = rr.Close()
+				if errors.Is(err, io.EOF) {
+					return nil, errors.New("rar archive has no file entries")
+				}
+				return nil, err
+			}
+			if h != nil && !h.IsDir {
+				return rr, nil
+			}
+		}
 	default:
 		return os.Open(path)
 	}
@@ -5024,6 +5085,27 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 			writer: gw,
 			close: func() error {
 				err1 := gw.Close()
+				err2 := f.Close()
+				if err1 != nil {
+					return err1
+				}
+				return err2
+			},
+		}, nil
+	case ".xz":
+		f, err := os.Create(path)
+		if err != nil {
+			return nil, err
+		}
+		xzw, err := xz.NewWriter(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &writeCloser{
+			writer: xzw,
+			close: func() error {
+				err1 := xzw.Close()
 				err2 := f.Close()
 				if err1 != nil {
 					return err1
@@ -5225,6 +5307,14 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		if !errors.Is(err, errUnsupportedLzxFeature) {
 			return nil, err
 		}
+	case archiveFormatRar:
+		items, err := listRarArchiveEntries(path)
+		if err == nil {
+			return items, nil
+		}
+		if !errors.Is(err, errUnsupportedRarFeature) {
+			return nil, err
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(path))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
@@ -5344,6 +5434,12 @@ func extractArchive(archivePath, innerPath, destination string) error {
 		} else if !errors.Is(err, errUnsupportedLzxFeature) {
 			return err
 		}
+	case archiveFormatRar:
+		if err := extractRarArchive(archivePath, innerPath, destination); err == nil {
+			return nil
+		} else if !errors.Is(err, errUnsupportedRarFeature) {
+			return err
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(archivePath))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
@@ -5374,6 +5470,8 @@ func detectArchiveFormat(path string) archiveFormat {
 		return archiveFormatLha
 	case strings.HasSuffix(lower, ".lzx"):
 		return archiveFormatLzx
+	case strings.HasSuffix(lower, ".rar"):
+		return archiveFormatRar
 	default:
 		return archiveFormatLegacy
 	}
@@ -5758,6 +5856,135 @@ func normalizeLzxEntryName(name string) string {
 		return name + "/"
 	}
 	return strings.TrimSuffix(name, "/")
+}
+
+func listRarArchiveEntries(path string) ([]archiveEntry, error) {
+	rr, err := rardecode.OpenReader(path, "")
+	if err != nil {
+		if isRarUnsupportedFeatureError(err) {
+			return nil, errUnsupportedRarFeature
+		}
+		return nil, err
+	}
+	defer rr.Close()
+
+	items := make([]archiveEntry, 0)
+	for {
+		h, err := rr.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if isRarUnsupportedFeatureError(err) {
+				return nil, errUnsupportedRarFeature
+			}
+			return nil, err
+		}
+		if h == nil {
+			continue
+		}
+		entryName := normalizeRarEntryName(h.Name, h.IsDir)
+		if entryName == "" {
+			continue
+		}
+		items = append(items, archiveEntry{
+			Name: entryName,
+			Size: h.UnPackedSize,
+		})
+	}
+	return items, nil
+}
+
+func extractRarArchive(archivePath, innerPath, destination string) error {
+	rr, err := rardecode.OpenReader(archivePath, "")
+	if err != nil {
+		if isRarUnsupportedFeatureError(err) {
+			return errUnsupportedRarFeature
+		}
+		return err
+	}
+	defer rr.Close()
+
+	for {
+		h, err := rr.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if isRarUnsupportedFeatureError(err) {
+				return errUnsupportedRarFeature
+			}
+			return err
+		}
+		if h == nil {
+			continue
+		}
+
+		entryName := normalizeRarEntryName(h.Name, h.IsDir)
+		if entryName == "" {
+			continue
+		}
+		relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
+		if !ok || relPath == "" {
+			continue
+		}
+
+		target, err := safeArchiveTargetPath(destination, relPath, entryName)
+		if err != nil {
+			return err
+		}
+		if h.IsDir {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		mode := h.Mode()
+		if mode&os.ModeSymlink != 0 || mode&os.ModeNamedPipe != 0 || mode&os.ModeDevice != 0 {
+			return errUnsupportedRarFeature
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(out, rr)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+}
+
+func normalizeRarEntryName(name string, isDir bool) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = strings.TrimLeft(name, "/")
+	if isDir {
+		name = strings.TrimSuffix(name, "/")
+		if name == "" {
+			return ""
+		}
+		return name + "/"
+	}
+	return strings.TrimSuffix(name, "/")
+}
+
+func isRarUnsupportedFeatureError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported") ||
+		strings.Contains(msg, "unknown decoder version") ||
+		strings.Contains(msg, "unknown archive version") ||
+		strings.Contains(msg, "incorrect password") ||
+		strings.Contains(msg, "password")
 }
 
 var (

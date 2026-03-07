@@ -69,7 +69,10 @@ Pure-Go parity progress:
 - `fs extract` archive-root behavior now matches legacy semantics: when inner path is empty, extraction is recursive even without `--recursive`.
 - archive path extraction now handles exact single-file inner paths and case-insensitive matching (`archive\Dir\File`).
 - LHA now has native `archive list` and native `fs extract` for mixed archives, including compressed `-lh4-/-lh5-/-lh6-/-lh7-` and stored `-lh0-` through vendored `koron-go/lha`.
-- `bsdtar` fallback remains for legacy formats not yet implemented natively (currently `lzx`, `rar`) and unsupported/unknown LHA header variants.
+- LZX now has native `archive list` and native `fs extract`, including compressed mode (`pack_mode=2`) and merged-file groups.
+- RAR now has native `archive list` and native `fs extract` for standard single-archive inputs.
+- imaging read/write now supports native `.xz` and `.rar` source streams in pure-Go mode.
+- `bsdtar` fallback remains for unsupported/unknown LHA header variants and any legacy archive formats not yet implemented natively.
 - Added parity-focused tests for binary layout, protection-bit formatting, and filename encoding edge cases.
 
 Example using your published artifacts:

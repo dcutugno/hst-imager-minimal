@@ -388,6 +388,107 @@ func TestFsExtractLzxCompressedWorksWithoutBsdtar(t *testing.T) {
 	}
 }
 
+func TestArchiveListRarWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	rarPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "compressed-images", "1gb.img.rar")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", rarPath}, &out); err != nil {
+		t.Fatalf("archive list rar without bsdtar failed: %v", err)
+	}
+	got := strings.TrimSpace(out.String())
+	if got == "" || !strings.Contains(strings.ToLower(got), "1gb") {
+		t.Fatalf("unexpected rar list output: %q", got)
+	}
+}
+
+func TestOpenSourceReaderRarMatchesZipPrefix(t *testing.T) {
+	rarPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "compressed-images", "1gb.img.rar")
+	zipPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "compressed-images", "1gb.img.zip")
+
+	rarReader, err := openSourceReader(rarPath)
+	if err != nil {
+		t.Fatalf("openSourceReader rar failed: %v", err)
+	}
+	defer rarReader.Close()
+
+	zipReader, err := openSourceReader(zipPath)
+	if err != nil {
+		t.Fatalf("openSourceReader zip failed: %v", err)
+	}
+	defer zipReader.Close()
+
+	rarPrefix := make([]byte, 8192)
+	nRar, err := io.ReadFull(rarReader, rarPrefix)
+	if err != nil {
+		t.Fatalf("read rar prefix failed: %v", err)
+	}
+	zipPrefix := make([]byte, 8192)
+	nZip, err := io.ReadFull(zipReader, zipPrefix)
+	if err != nil {
+		t.Fatalf("read zip prefix failed: %v", err)
+	}
+	if nRar != nZip {
+		t.Fatalf("prefix sizes differ, rar=%d zip=%d", nRar, nZip)
+	}
+	if !bytes.Equal(rarPrefix[:nRar], zipPrefix[:nZip]) {
+		t.Fatal("rar and zip decoded prefixes differ")
+	}
+}
+
+func TestWriteFromXzCompressedSource(t *testing.T) {
+	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
+	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")
+	dest := filepath.Join(t.TempDir(), "out.txt")
+
+	var out bytes.Buffer
+	if err := run([]string{"write", xzPath, dest}, &out); err != nil {
+		t.Fatalf("write from xz source failed: %v", err)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("written data does not match uncompressed xz content")
+	}
+}
+
+func TestXzRoundTripViaSourceAndDestinationWriters(t *testing.T) {
+	tmp := t.TempDir()
+	xzPath := filepath.Join(tmp, "roundtrip.img.xz")
+	source := bytes.Repeat([]byte{0x5a, 0xa5, 0x11, 0xee}, 1024)
+
+	w, err := openDestinationWriter(xzPath)
+	if err != nil {
+		t.Fatalf("openDestinationWriter xz failed: %v", err)
+	}
+	if _, err := w.Write(source); err != nil {
+		t.Fatalf("write xz failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close xz writer failed: %v", err)
+	}
+
+	r, err := openSourceReader(xzPath)
+	if err != nil {
+		t.Fatalf("openSourceReader xz failed: %v", err)
+	}
+	defer r.Close()
+
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read xz failed: %v", err)
+	}
+	if !bytes.Equal(got, source) {
+		t.Fatal("xz roundtrip data mismatch")
+	}
+}
+
 func writeTarGzArchive(path string, files map[string]string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -624,6 +725,19 @@ func TestMbrLowLevelBinaryParity(t *testing.T) {
 	}
 	if err := run([]string{"mbr", "part", "add", mediaB, "fat32", "16KB"}, &out); err != nil {
 		t.Fatal(err)
+	}
+	sector0, err = os.ReadFile(mediaA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := sector0[446 : 446+16]
+	startHead, startSecCyl, startCyl := encodeMbrChs(63)
+	endHead, endSecCyl, endCyl := encodeMbrChs(63 + uint32((16*1024)/512) - 1)
+	if entry[1] != startHead || entry[2] != startSecCyl || entry[3] != startCyl {
+		t.Fatalf("unexpected start CHS bytes: %02x %02x %02x", entry[1], entry[2], entry[3])
+	}
+	if entry[5] != endHead || entry[6] != endSecCyl || entry[7] != endCyl {
+		t.Fatalf("unexpected end CHS bytes: %02x %02x %02x", entry[5], entry[6], entry[7])
 	}
 
 	out.Reset()
