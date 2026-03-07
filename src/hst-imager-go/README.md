@@ -63,6 +63,7 @@ Pure-Go parity progress:
   - `.uaem` files using the legacy text wire format (`<8 flags> <yyyy-MM-dd HH:mm:ss.ff> <comment>`).
 - UAE filename mapping now follows legacy helper semantics for special characters and mode-specific naming (`uaefsdb` vs `uaemetafile`).
 - `fs dir` now reads `_UAEFSDB.___` and `.uaem` metadata in pure Go to resolve Amiga names/protection bits/comments, hides metadata files from listings, and supports recursive metadata-aware path mapping.
+- `fs copy`/`fs extract` now read source UAE metadata in pure Go and propagate metadata properties (protection bits/comments) to destination metadata files, including entries where names do not require remapping.
 - Added parity-focused tests for binary layout, protection-bit formatting, and filename encoding edge cases.
 
 Example using your published artifacts:

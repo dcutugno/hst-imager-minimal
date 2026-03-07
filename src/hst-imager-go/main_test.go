@@ -998,6 +998,88 @@ func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
 	}
 }
 
+func TestFsCopyPropagatesSourceUaeFsDbProperties(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "locale"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pb := 32
+	if err := writeUaeFsDb(src, "locale", "locale", &pb, "file comment"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs copy failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "locale")); err != nil {
+		t.Fatalf("expected copied file locale: %v", err)
+	}
+	records, err := readUaeFsDbRecords(filepath.Join(dst, "_UAEFSDB.___"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) == 0 {
+		t.Fatal("expected uaefsdb records in destination")
+	}
+	var record *uaeFsDbRecord
+	for i := range records {
+		if records[i].AmigaName == "locale" {
+			record = &records[i]
+			break
+		}
+	}
+	if record == nil {
+		t.Fatalf("expected locale metadata record, got %+v", records)
+	}
+	if int(record.Mode) != pb {
+		t.Fatalf("expected mode %d, got %d", pb, record.Mode)
+	}
+	if record.Comment != "file comment" {
+		t.Fatalf("expected comment 'file comment', got %q", record.Comment)
+	}
+}
+
+func TestFsCopyPropagatesSourceUaeMetafileProperties(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "safe.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pb := 123
+	date := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
+	if err := writeUaeMetafile(src, "safe.txt", &pb, date, "source comment"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "uaemetafile"}, &out); err != nil {
+		t.Fatalf("fs copy failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "safe.txt")); err != nil {
+		t.Fatalf("expected copied file safe.txt: %v", err)
+	}
+	gotPb, gotComment, err := readUaeMetafile(filepath.Join(dst, "safe.txt.uaem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPb == nil || *gotPb != pb {
+		t.Fatalf("expected uaem protection bits %d, got %#v", pb, gotPb)
+	}
+	if gotComment != "source comment" {
+		t.Fatalf("expected source comment, got %q", gotComment)
+	}
+}
+
 func TestUaeFsDbNameMappingParitySamples(t *testing.T) {
 	tmp := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tmp, "__uae___file1_"), []byte("x"), 0o644); err != nil {

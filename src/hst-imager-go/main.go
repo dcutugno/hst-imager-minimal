@@ -3932,7 +3932,7 @@ func copyPath(source, destination string, recursive bool) (int, error) {
 		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
 			target = filepath.Join(destination, filepath.Base(source))
 		}
-		_, err := copyFile(source, target, 0)
+		_, err = copyFile(source, target, 0)
 		return 1, err
 	}
 	if !recursive {
@@ -3963,6 +3963,13 @@ func copyPath(source, destination string, recursive bool) (int, error) {
 type fsPathOptions struct {
 	recursive   bool
 	uaeMetadata string
+}
+
+type sourceUaeEntryInfo struct {
+	AmigaName      string
+	ProtectionBits *int
+	Comment        string
+	HasMetadata    bool
 }
 
 type uaeFsDbRecord struct {
@@ -4017,17 +4024,26 @@ func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, e
 		return 0, err
 	}
 	if !info.IsDir() {
+		sourceName := filepath.Base(source)
+		entryInfo, err := resolveSourceUaeEntryInfo(filepath.Dir(source), sourceName, opts.uaeMetadata)
+		if err != nil {
+			return 0, err
+		}
+		amigaName := sourceName
+		if entryInfo.HasMetadata {
+			amigaName = entryInfo.AmigaName
+		}
 		target := destination
 		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
-			mappedName, changed, _ := mapLocalNameForUae(filepath.Base(source), opts.uaeMetadata, destination)
+			mappedName, changed, _ := mapLocalNameForUae(amigaName, opts.uaeMetadata, destination)
 			target = filepath.Join(destination, mappedName)
-			if changed {
-				if err := writeUaeMetadataForEntry(destination, filepath.Base(source), mappedName, "file", opts.uaeMetadata); err != nil {
+			if changed || entryInfo.HasMetadata {
+				if err := writeUaeMetadataForEntry(destination, amigaName, mappedName, "file", opts.uaeMetadata, entryInfo.ProtectionBits, entryInfo.Comment); err != nil {
 					return 0, err
 				}
 			}
 		}
-		_, err := copyFile(source, target, 0)
+		_, err = copyFile(source, target, 0)
 		return 1, err
 	}
 	if !opts.recursive {
@@ -4044,17 +4060,37 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 	if err != nil {
 		return 0, err
 	}
+	sourceNodes, err := readUaeMetadataNodesByNormalName(source, opts.uaeMetadata)
+	if err != nil {
+		return 0, err
+	}
 	count := 0
 	for _, entry := range entries {
+		if shouldSkipUaeMetadataFile(entry.Name(), opts.uaeMetadata) {
+			continue
+		}
 		srcPath := filepath.Join(source, entry.Name())
-		mappedName, changed, _ := mapLocalNameForUae(entry.Name(), opts.uaeMetadata, destination)
+		entryInfo := sourceUaeEntryInfo{
+			AmigaName:   entry.Name(),
+			HasMetadata: false,
+		}
+		if node, ok := sourceNodes[strings.ToLower(entry.Name())]; ok {
+			entryInfo = sourceUaeEntryInfo{
+				AmigaName:      node.AmigaName,
+				ProtectionBits: node.ProtectionBits,
+				Comment:        node.Comment,
+				HasMetadata:    true,
+			}
+		}
+
+		mappedName, changed, _ := mapLocalNameForUae(entryInfo.AmigaName, opts.uaeMetadata, destination)
 		dstPath := filepath.Join(destination, mappedName)
-		if changed {
+		if changed || entryInfo.HasMetadata {
 			entryType := "file"
 			if entry.IsDir() {
 				entryType = "dir"
 			}
-			if err := writeUaeMetadataForEntry(destination, entry.Name(), mappedName, entryType, opts.uaeMetadata); err != nil {
+			if err := writeUaeMetadataForEntry(destination, entryInfo.AmigaName, mappedName, entryType, opts.uaeMetadata, entryInfo.ProtectionBits, entryInfo.Comment); err != nil {
 				return count, err
 			}
 		}
@@ -4076,6 +4112,24 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 		count++
 	}
 	return count, nil
+}
+
+func resolveSourceUaeEntryInfo(sourceDir, sourceName, uaeMode string) (sourceUaeEntryInfo, error) {
+	info := sourceUaeEntryInfo{
+		AmigaName:   sourceName,
+		HasMetadata: false,
+	}
+	nodes, err := readUaeMetadataNodesByNormalName(sourceDir, uaeMode)
+	if err != nil {
+		return info, err
+	}
+	if node, ok := nodes[strings.ToLower(sourceName)]; ok {
+		info.AmigaName = node.AmigaName
+		info.ProtectionBits = node.ProtectionBits
+		info.Comment = node.Comment
+		info.HasMetadata = true
+	}
+	return info, nil
 }
 
 func mapLocalNameForUae(name, mode, dirPath string) (mapped string, changed bool, metaName string) {
@@ -4317,13 +4371,13 @@ func parseAmigaProtectionBitsText(text string) int {
 	return bits
 }
 
-func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string) error {
+func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string, protectionBits *int, comment string) error {
 	switch mode {
 	case "uaefsdb":
-		return writeUaeFsDb(dirPath, amigaName, mappedName, nil, "")
+		return writeUaeFsDb(dirPath, amigaName, mappedName, protectionBits, comment)
 	case "uaemetafile":
 		_ = entryType
-		return writeUaeMetafile(dirPath, mappedName, nil, time.Now(), "")
+		return writeUaeMetafile(dirPath, mappedName, protectionBits, time.Now(), comment)
 	default:
 		return nil
 	}
