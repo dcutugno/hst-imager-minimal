@@ -3,12 +3,15 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -938,9 +941,6 @@ func TestFsCopyWithUaeFsDbMetadata(t *testing.T) {
 	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "uaefsdb"}, &out); err != nil {
 		t.Fatalf("fs copy with uaefsdb failed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dst, "__uae___AUX")); err != nil {
-		t.Fatalf("expected __uae___AUX: %v", err)
-	}
 	if _, err := os.Stat(filepath.Join(dst, "__uae___file1_")); err != nil {
 		t.Fatalf("expected __uae___file1_: %v", err)
 	}
@@ -952,8 +952,19 @@ func TestFsCopyWithUaeFsDbMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected _UAEFSDB.___: %v", err)
 	}
-	if !strings.Contains(string(b), "\"amigaName\": \"AUX\"") || !strings.Contains(string(b), "\"amigaName\": \"file1*\"") {
-		t.Fatalf("unexpected uaefsdb content: %s", string(b))
+	if len(b) == 0 || len(b)%uaeFsDbNodeV1Size != 0 {
+		t.Fatalf("unexpected uaefsdb size %d", len(b))
+	}
+	found := map[string]bool{}
+	for off := 0; off+uaeFsDbNodeV1Size <= len(b); off += uaeFsDbNodeV1Size {
+		record := readUaeFsDbRecord(b[off : off+uaeFsDbNodeV1Size])
+		if record.Valid != 1 {
+			t.Fatalf("expected valid record at offset %d, got %d", off, record.Valid)
+		}
+		found[record.AmigaName] = true
+	}
+	if !found["file1*"] || !found["dir1*"] {
+		t.Fatalf("uaefsdb missing expected amiga names, got: %+v", found)
 	}
 }
 
@@ -964,7 +975,7 @@ func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "AUX.info"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(src, "file1*"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -972,7 +983,7 @@ func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
 	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "uaemetafile"}, &out); err != nil {
 		t.Fatalf("fs copy with uaemetafile failed: %v", err)
 	}
-	encoded := "%41%55%58%2e%69%6e%66%6f"
+	encoded := "file1%2a"
 	if _, err := os.Stat(filepath.Join(dst, encoded)); err != nil {
 		t.Fatalf("expected encoded file %s: %v", encoded, err)
 	}
@@ -981,8 +992,132 @@ func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected uaem sidecar: %v", err)
 	}
-	if !strings.Contains(string(b), "amiga_name=AUX.info") {
-		t.Fatalf("unexpected uaem content: %s", string(b))
+	uaemPattern := regexp.MustCompile(`^----rwed \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{2} \n$`)
+	if !uaemPattern.Match(b) {
+		t.Fatalf("unexpected uaem content: %q", string(b))
+	}
+}
+
+func TestUaeFsDbNameMappingParitySamples(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "__uae___file1_"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !hasSpecialFilenameCharsUaeFsDb("dir1ß") {
+		t.Fatal("expected dir1ß to require uaefsdb metadata")
+	}
+	if safe := makeSafeFilenameForUaeFsDb("dir1ß"); safe != "dir1_" {
+		t.Fatalf("unexpected safe filename: %q", safe)
+	}
+	if safe := makeSafeFilenameForUaeFsDb(".. "); safe != "___" {
+		t.Fatalf("unexpected safe filename for '.. ': %q", safe)
+	}
+	if safe := makeSafeFilenameForUaeFsDb("a  b"); safe != "a  b" {
+		t.Fatalf("unexpected safe filename for 'a  b': %q", safe)
+	}
+
+	mapped, changed, _ := mapLocalNameForUae("file1*", "uaefsdb", tmp)
+	if !changed {
+		t.Fatal("expected mapped name for file1*")
+	}
+	if !regexp.MustCompile(`^__uae___file1_[_a-zA-Z0-9]{8}$`).MatchString(mapped) {
+		t.Fatalf("unexpected mapped collision filename: %q", mapped)
+	}
+}
+
+func TestUaeMetafileEncodingParitySamples(t *testing.T) {
+	cases := []struct {
+		name    string
+		hasSpec bool
+		encoded string
+	}{
+		{name: "a b", hasSpec: false, encoded: "a b"},
+		{name: "a ", hasSpec: true, encoded: "a%20"},
+		{name: "a  ", hasSpec: true, encoded: "a %20"},
+		{name: ".", hasSpec: true, encoded: "%2e"},
+		{name: "..", hasSpec: true, encoded: ".%2e"},
+		{name: "...", hasSpec: true, encoded: "..%2e"},
+		{name: ".dot", hasSpec: false, encoded: ".dot"},
+		{name: "aßb", hasSpec: true, encoded: "a%dfb"},
+	}
+	for _, tc := range cases {
+		if got := hasSpecialFilenameCharsUaeMetafile(tc.name); got != tc.hasSpec {
+			t.Fatalf("hasSpecial(%q): expected %v, got %v", tc.name, tc.hasSpec, got)
+		}
+		if got := encodeFilenameSpecialCharsForUaeMetafile(tc.name); got != tc.encoded {
+			t.Fatalf("encodeSpecial(%q): expected %q, got %q", tc.name, tc.encoded, got)
+		}
+	}
+	if got := encodeFilenameForUaeMetafile("AUX.info"); got != "%41%55%58%2e%69%6e%66%6f" {
+		t.Fatalf("unexpected full encoding for AUX.info: %q", got)
+	}
+}
+
+func TestWriteUaeFsDbBinaryLayout(t *testing.T) {
+	tmp := t.TempDir()
+	if err := writeUaeFsDb(tmp, "AUX", "__uae___AUX", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(tmp, "_UAEFSDB.___"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != uaeFsDbNodeV1Size {
+		t.Fatalf("expected %d bytes, got %d", uaeFsDbNodeV1Size, len(b))
+	}
+	if b[0] != 1 {
+		t.Fatalf("expected valid=1, got %d", b[0])
+	}
+	if mode := binary.BigEndian.Uint32(b[1:5]); mode != 0 {
+		t.Fatalf("expected mode=0, got %d", mode)
+	}
+	record := readUaeFsDbRecord(b)
+	if record.AmigaName != "AUX" || record.NormalName != "__uae___AUX" {
+		t.Fatalf("unexpected uaefsdb record %+v", record)
+	}
+
+	pb := 123
+	if err := writeUaeFsDb(tmp, "AUX", "__uae___AUX", &pb, "note"); err != nil {
+		t.Fatal(err)
+	}
+	b, err = os.ReadFile(filepath.Join(tmp, "_UAEFSDB.___"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := binary.BigEndian.Uint32(b[1:5]); mode != 123 {
+		t.Fatalf("expected mode=123, got %d", mode)
+	}
+	record = readUaeFsDbRecord(b)
+	if record.Comment != "note" {
+		t.Fatalf("expected comment note, got %q", record.Comment)
+	}
+}
+
+func TestWriteUaeMetafileFormat(t *testing.T) {
+	tmp := t.TempDir()
+	date := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
+	if err := writeUaeMetafile(tmp, "AUX", nil, date, ""); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(tmp, "AUX.uaem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != "----rwed 2024-01-02 03:04:05.00 \n" {
+		t.Fatalf("unexpected default uaem content %q", got)
+	}
+
+	pb := 123
+	if err := writeUaeMetafile(tmp, "AUX2", &pb, date, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	b, err = os.ReadFile(filepath.Join(tmp, "AUX2.uaem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != "-spa-w-- 2024-01-02 03:04:05.00 hello\n" {
+		t.Fatalf("unexpected explicit uaem content %q", got)
 	}
 }
 

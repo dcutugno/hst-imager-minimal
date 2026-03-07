@@ -57,6 +57,13 @@ Behavior:
 
 When enabled and available, commands are executed by the .NET backend for byte-identical legacy semantics (including UAE metadata behavior and deep filesystem/archive handling).
 
+Pure-Go parity progress:
+- `fs copy`/`fs extract` now write real UAE metadata file formats in Go:
+  - `_UAEFSDB.___` as UAEFSDB v1 binary nodes (600-byte records with big-endian mode and fixed C-string fields).
+  - `.uaem` files using the legacy text wire format (`<8 flags> <yyyy-MM-dd HH:mm:ss.ff> <comment>`).
+- UAE filename mapping now follows legacy helper semantics for special characters and mode-specific naming (`uaefsdb` vs `uaemetafile`).
+- Added parity-focused tests for binary layout, protection-bit formatting, and filename encoding edge cases.
+
 Example using your published artifacts:
 
 ```bash

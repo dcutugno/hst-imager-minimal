@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf16"
 )
 
@@ -3773,11 +3774,23 @@ type fsPathOptions struct {
 	uaeMetadata string
 }
 
-type uaeFsDbNode struct {
-	AmigaName  string `json:"amigaName"`
-	NormalName string `json:"normalName"`
-	Type       string `json:"type"`
+type uaeFsDbRecord struct {
+	Valid      byte
+	Mode       uint32
+	AmigaName  string
+	NormalName string
+	Comment    string
 }
+
+const (
+	uaeFsDbNodeV1Size       = 600
+	uaeFsDbAmigaNameOffset  = 5
+	uaeFsDbAmigaNameSize    = 257
+	uaeFsDbNormalNameOffset = 262
+	uaeFsDbNormalNameSize   = 257
+	uaeFsDbCommentOffset    = 519
+	uaeFsDbCommentSize      = 81
+)
 
 func parseFsOptions(args []string) (fsPathOptions, error) {
 	opts := fsPathOptions{
@@ -3815,10 +3828,12 @@ func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, e
 	if !info.IsDir() {
 		target := destination
 		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
-			mappedName, _, _ := mapLocalNameForUae(filepath.Base(source), opts.uaeMetadata)
+			mappedName, changed, _ := mapLocalNameForUae(filepath.Base(source), opts.uaeMetadata, destination)
 			target = filepath.Join(destination, mappedName)
-			if err := writeUaeMetadataForEntry(destination, filepath.Base(source), mappedName, "file", opts.uaeMetadata); err != nil {
-				return 0, err
+			if changed {
+				if err := writeUaeMetadataForEntry(destination, filepath.Base(source), mappedName, "file", opts.uaeMetadata); err != nil {
+					return 0, err
+				}
 			}
 		}
 		_, err := copyFile(source, target, 0)
@@ -3841,7 +3856,7 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 	count := 0
 	for _, entry := range entries {
 		srcPath := filepath.Join(source, entry.Name())
-		mappedName, changed, _ := mapLocalNameForUae(entry.Name(), opts.uaeMetadata)
+		mappedName, changed, _ := mapLocalNameForUae(entry.Name(), opts.uaeMetadata, destination)
 		dstPath := filepath.Join(destination, mappedName)
 		if changed {
 			entryType := "file"
@@ -3872,71 +3887,175 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 	return count, nil
 }
 
-func mapLocalNameForUae(name, mode string) (mapped string, changed bool, metaName string) {
+func mapLocalNameForUae(name, mode, dirPath string) (mapped string, changed bool, metaName string) {
 	if mode == "none" {
 		return name, false, name
 	}
-	if !isUnsafeWindowsName(name) {
+	if !requiresUaeMetadataFileName(mode, name) {
 		return name, false, name
 	}
 	switch mode {
 	case "uaefsdb":
-		return "__uae___" + sanitizeUnsafeName(name), true, name
+		safe := makeSafeFilenameForUaeFsDb(name)
+		return createUniqueUaeFsDbNormalName(dirPath, safe), true, name
 	case "uaemetafile":
-		return percentEncodeName(name), true, name
+		if runtime.GOOS == "windows" && hasWindowsReservedName(name) {
+			return encodeFilenameForUaeMetafile(name), true, name
+		}
+		return encodeFilenameSpecialCharsForUaeMetafile(name), true, name
 	default:
 		return name, false, name
 	}
 }
 
-func isUnsafeWindowsName(name string) bool {
+func requiresUaeMetadataFileName(mode, name string) bool {
 	if name == "" {
 		return false
 	}
-	base := name
-	if dot := strings.Index(base, "."); dot >= 0 {
-		base = base[:dot]
+	if runtime.GOOS == "windows" && hasWindowsReservedName(name) {
+		return true
 	}
-	baseUpper := strings.ToUpper(strings.TrimSpace(base))
+	switch mode {
+	case "uaefsdb":
+		return hasSpecialFilenameCharsUaeFsDb(name)
+	case "uaemetafile":
+		return hasSpecialFilenameCharsUaeMetafile(name)
+	default:
+		return false
+	}
+}
+
+func hasWindowsReservedName(name string) bool {
+	base := name
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	nameUpper := strings.ToUpper(name)
+	baseUpper := strings.ToUpper(base)
 	reserved := map[string]bool{
 		"CON": true, "PRN": true, "AUX": true, "NUL": true,
 		"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
 		"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
 	}
-	if reserved[baseUpper] {
+	return reserved[nameUpper] || reserved[baseUpper]
+}
+
+func hasSpecialFilenameCharsUaeFsDb(name string) bool {
+	if strings.HasPrefix(name, " ") || strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
 		return true
 	}
-	for _, c := range name {
-		switch c {
-		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
+	for _, r := range name {
+		if isUaeSpecialFilenameChar(r) || !isUaePrintableChar(r) {
 			return true
 		}
 	}
-	return strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ")
+	return false
 }
 
-func sanitizeUnsafeName(name string) string {
-	runes := []rune(name)
-	for i, c := range runes {
-		switch c {
-		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
-			runes[i] = '_'
+func hasSpecialFilenameCharsUaeMetafile(name string) bool {
+	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
+		return true
+	}
+	for _, r := range name {
+		if isUaeSpecialFilenameChar(r) || !isUaePrintableChar(r) {
+			return true
 		}
 	}
-	for i := len(runes) - 1; i >= 0; i-- {
-		if runes[i] == '.' || runes[i] == ' ' {
-			runes[i] = '_'
+	return false
+}
+
+func isUaeSpecialFilenameChar(r rune) bool {
+	switch r {
+	case '\\', '/', ':', '*', '?', '"', '<', '>', '|', '#':
+		return true
+	default:
+		return false
+	}
+}
+
+func isUaePrintableChar(r rune) bool {
+	return r >= 32 && r <= 127
+}
+
+func makeSafeFilenameForUaeFsDb(name string) string {
+	runes := []rune(name)
+	leadingSpaces := 0
+	for leadingSpaces < len(runes) && runes[leadingSpaces] == ' ' {
+		leadingSpaces++
+	}
+	trailingStart := len(runes)
+	for trailingStart > 0 {
+		c := runes[trailingStart-1]
+		if c == '.' || c == ' ' {
+			trailingStart--
 			continue
 		}
 		break
 	}
+	for i, c := range runes {
+		switch {
+		case isUaeSpecialFilenameChar(c) || !isUaePrintableChar(c):
+			runes[i] = '_'
+		case i < leadingSpaces && c == ' ':
+			runes[i] = '_'
+		case i >= trailingStart && (c == '.' || c == ' '):
+			runes[i] = '_'
+		}
+	}
 	return string(runes)
 }
 
-func percentEncodeName(name string) string {
+func createUniqueUaeFsDbNormalName(dirPath, safeName string) string {
+	const prefix = "__uae___"
+	candidate := prefix + safeName
+	if !fileOrDirExists(filepath.Join(dirPath, candidate)) {
+		return candidate
+	}
+	base := strings.TrimRight(safeName, "_")
+	if base == "" {
+		base = safeName
+	}
+	for {
+		candidate = fmt.Sprintf("%s%s_%s", prefix, base, createRandomUaeFsDbName())
+		if !fileOrDirExists(filepath.Join(dirPath, candidate)) {
+			return candidate
+		}
+	}
+}
+
+func createRandomUaeFsDbName() string {
+	const chars = "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const length = 8
+	b := make([]byte, length)
+	rnd := make([]byte, length)
+	if _, err := rand.Read(rnd); err != nil {
+		return "00000000"
+	}
+	for i := 0; i < length; i++ {
+		b[i] = chars[int(rnd[i])%len(chars)]
+	}
+	return string(b)
+}
+
+func encodeFilenameForUaeMetafile(name string) string {
 	var b strings.Builder
-	for _, ch := range []byte(name) {
-		b.WriteString(fmt.Sprintf("%%%02x", ch))
+	for _, by := range latin1Bytes(name) {
+		b.WriteString(fmt.Sprintf("%%%02x", by))
+	}
+	return b.String()
+}
+
+func encodeFilenameSpecialCharsForUaeMetafile(name string) string {
+	runes := []rune(name)
+	var b strings.Builder
+	for i, r := range runes {
+		if isUaeSpecialFilenameChar(r) || !isUaePrintableChar(r) || (i == len(runes)-1 && (r == '.' || r == ' ')) {
+			for _, by := range latin1Bytes(string(r)) {
+				b.WriteString(fmt.Sprintf("%%%02x", by))
+			}
+			continue
+		}
+		b.WriteRune(r)
 	}
 	return b.String()
 }
@@ -3944,35 +4063,212 @@ func percentEncodeName(name string) string {
 func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string) error {
 	switch mode {
 	case "uaefsdb":
-		uaeFsDbPath := filepath.Join(dirPath, "_UAEFSDB.___")
-		nodes := make([]uaeFsDbNode, 0)
-		existing, err := os.ReadFile(uaeFsDbPath)
-		if err == nil && len(existing) > 0 {
-			_ = json.Unmarshal(existing, &nodes)
-		}
-		replaced := false
-		for i := range nodes {
-			if nodes[i].AmigaName == amigaName {
-				nodes[i] = uaeFsDbNode{AmigaName: amigaName, NormalName: mappedName, Type: entryType}
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			nodes = append(nodes, uaeFsDbNode{AmigaName: amigaName, NormalName: mappedName, Type: entryType})
-		}
-		payload, err := json.MarshalIndent(nodes, "", "  ")
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(uaeFsDbPath, payload, 0o644)
+		return writeUaeFsDb(dirPath, amigaName, mappedName, nil, "")
 	case "uaemetafile":
-		uaemPath := filepath.Join(dirPath, mappedName+".uaem")
-		content := fmt.Sprintf("amiga_name=%s\nnormal_name=%s\ntype=%s\n", amigaName, mappedName, entryType)
-		return os.WriteFile(uaemPath, []byte(content), 0o644)
+		_ = entryType
+		return writeUaeMetafile(dirPath, mappedName, nil, time.Now(), "")
 	default:
 		return nil
 	}
+}
+
+func writeUaeFsDb(dirPath, amigaName, normalName string, protectionBits *int, comment string) error {
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		return err
+	}
+	uaeFsDbPath := filepath.Join(dirPath, "_UAEFSDB.___")
+	stream, err := os.OpenFile(uaeFsDbPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	hasNode := false
+	var node uaeFsDbRecord
+	var nodePosition int64
+
+	for streamPos := int64(0); ; streamPos += uaeFsDbNodeV1Size {
+		nodeBytes := make([]byte, uaeFsDbNodeV1Size)
+		_, readErr := io.ReadFull(stream, nodeBytes)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+				break
+			}
+			return readErr
+		}
+
+		record := readUaeFsDbRecord(nodeBytes)
+		if record.AmigaName != amigaName {
+			continue
+		}
+
+		hasNode = true
+		node = record
+		nodePosition = streamPos
+		break
+	}
+
+	normalizedComment := comment
+	if strings.TrimSpace(normalizedComment) == "" {
+		normalizedComment = ""
+	}
+
+	nodeUpdated := false
+	if !hasNode {
+		node = uaeFsDbRecord{
+			Valid:      1,
+			Mode:       0,
+			AmigaName:  amigaName,
+			NormalName: normalName,
+			Comment:    normalizedComment,
+		}
+		if protectionBits != nil {
+			node.Mode = uint32(*protectionBits)
+		}
+		nodeUpdated = true
+	}
+
+	if protectionBits != nil && node.Mode != uint32(*protectionBits) {
+		node.Mode = uint32(*protectionBits)
+		nodeUpdated = true
+	}
+
+	if node.Comment != normalizedComment {
+		node.Comment = normalizedComment
+		nodeUpdated = true
+	}
+
+	if !nodeUpdated {
+		return nil
+	}
+
+	nodeBytes := buildUaeFsDbNode(node)
+	if hasNode {
+		if _, err := stream.Seek(nodePosition, io.SeekStart); err != nil {
+			return err
+		}
+	} else {
+		if _, err := stream.Seek(0, io.SeekEnd); err != nil {
+			return err
+		}
+	}
+	_, err = stream.Write(nodeBytes)
+	return err
+}
+
+func readUaeFsDbRecord(nodeBytes []byte) uaeFsDbRecord {
+	record := uaeFsDbRecord{}
+	if len(nodeBytes) < uaeFsDbNodeV1Size {
+		return record
+	}
+	record.Valid = nodeBytes[0]
+	record.Mode = binary.BigEndian.Uint32(nodeBytes[1:5])
+	record.AmigaName = decodeLatin1CString(nodeBytes[uaeFsDbAmigaNameOffset : uaeFsDbAmigaNameOffset+uaeFsDbAmigaNameSize])
+	record.NormalName = decodeLatin1CString(nodeBytes[uaeFsDbNormalNameOffset : uaeFsDbNormalNameOffset+uaeFsDbNormalNameSize])
+	record.Comment = decodeLatin1CString(nodeBytes[uaeFsDbCommentOffset : uaeFsDbCommentOffset+uaeFsDbCommentSize])
+	return record
+}
+
+func buildUaeFsDbNode(record uaeFsDbRecord) []byte {
+	nodeBytes := make([]byte, uaeFsDbNodeV1Size)
+	nodeBytes[0] = record.Valid
+	binary.BigEndian.PutUint32(nodeBytes[1:5], record.Mode)
+	writeLatin1CString(nodeBytes[uaeFsDbAmigaNameOffset:uaeFsDbAmigaNameOffset+uaeFsDbAmigaNameSize], record.AmigaName)
+	writeLatin1CString(nodeBytes[uaeFsDbNormalNameOffset:uaeFsDbNormalNameOffset+uaeFsDbNormalNameSize], record.NormalName)
+	writeLatin1CString(nodeBytes[uaeFsDbCommentOffset:uaeFsDbCommentOffset+uaeFsDbCommentSize], record.Comment)
+	return nodeBytes
+}
+
+func writeLatin1CString(dst []byte, text string) {
+	for i := range dst {
+		dst[i] = 0
+	}
+	src := latin1Bytes(text)
+	maxLen := len(dst) - 1
+	if maxLen < 0 {
+		maxLen = 0
+	}
+	if len(src) < maxLen {
+		maxLen = len(src)
+	}
+	copy(dst[:maxLen], src[:maxLen])
+}
+
+func decodeLatin1CString(data []byte) string {
+	end := bytes.IndexByte(data, 0)
+	if end < 0 {
+		end = len(data)
+	}
+	var b strings.Builder
+	b.Grow(end)
+	for _, by := range data[:end] {
+		b.WriteRune(rune(by))
+	}
+	return b.String()
+}
+
+func latin1Bytes(text string) []byte {
+	out := make([]byte, 0, len(text))
+	for _, r := range text {
+		if r > 255 {
+			out = append(out, '?')
+			continue
+		}
+		out = append(out, byte(r))
+	}
+	return out
+}
+
+func writeUaeMetafile(dirPath, normalName string, protectionBits *int, date time.Time, comment string) error {
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		return err
+	}
+	protectionValue := 0
+	if protectionBits != nil {
+		protectionValue = *protectionBits
+	}
+	protection := strings.ToLower(formatAmigaProtectionBits(protectionValue ^ 0xf))
+	commentBytes := latin1Bytes(comment)
+	if len(commentBytes) > 80 {
+		commentBytes = commentBytes[:80]
+	}
+	line := fmt.Sprintf("%s %s %s\n", protection, date.Format("2006-01-02 15:04:05.00"), string(commentBytes))
+	uaeMetafilePath := filepath.Join(dirPath, normalName+".uaem")
+	return os.WriteFile(uaeMetafilePath, latin1Bytes(line), 0o644)
+}
+
+func formatAmigaProtectionBits(bits int) string {
+	flags := []struct {
+		bit int
+		ch  rune
+	}{
+		{128, 'H'},
+		{64, 'S'},
+		{32, 'P'},
+		{16, 'A'},
+		{8, 'R'},
+		{4, 'W'},
+		{2, 'E'},
+		{1, 'D'},
+	}
+	var b strings.Builder
+	b.Grow(8)
+	for _, flag := range flags {
+		if bits&flag.bit != 0 {
+			b.WriteRune(flag.ch)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	return b.String()
+}
+
+func fileOrDirExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func createBlankFile(path string, size int64) error {
