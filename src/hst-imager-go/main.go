@@ -5552,17 +5552,6 @@ func extractLhaArchive(archivePath, innerPath, destination string) error {
 }
 
 func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
-	var raw []byte
-	storedEntries := make(map[string]lhaEntry)
-	if b, err := os.ReadFile(archivePath); err == nil {
-		raw = b
-		if entries, parseErr := parseLhaEntries(b); parseErr == nil {
-			for _, e := range entries {
-				storedEntries[strings.ToLower(normalizeArchivePath(e.Name))] = e
-			}
-		}
-	}
-
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -5616,24 +5605,10 @@ func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
 			continue
 		}
 		_ = os.Remove(target)
-
-		if !errors.Is(decodeErr, errUnsupportedLhaFeature) {
-			return decodeErr
+		if closeErr != nil {
+			return closeErr
 		}
-		if !strings.EqualFold(h.Method, "-lh0-") {
-			return errUnsupportedLhaFeature
-		}
-		e, ok := storedEntries[strings.ToLower(normalizeArchivePath(entryName))]
-		if !ok || len(raw) == 0 {
-			return errUnsupportedLhaFeature
-		}
-		payload, err := lhaEntryPayload(raw, e)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(target, payload, 0o644); err != nil {
-			return err
-		}
+		return decodeErr
 	}
 	return nil
 }
@@ -5715,7 +5690,9 @@ func isLhaUnsupportedFeatureError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unsupported method") ||
-		strings.Contains(msg, "unknown header level")
+		strings.Contains(msg, "unknown header level") ||
+		strings.Contains(msg, "unsupported header level") ||
+		strings.Contains(msg, "invalid nil header")
 }
 
 func lhaHeaderEntryName(h *lhago.Header) string {

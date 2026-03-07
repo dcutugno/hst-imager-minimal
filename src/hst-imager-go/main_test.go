@@ -228,6 +228,18 @@ func TestArchiveListLhaNativeStored(t *testing.T) {
 	}
 }
 
+func TestArchiveListLhaStoredWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "dirs-files.lha")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", lhaPath}, &out); err != nil {
+		t.Fatalf("archive list lha without bsdtar failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "dir1/file1.txt") {
+		t.Fatalf("unexpected lha list output: %q", out.String())
+	}
+}
+
 func TestArchiveListLhaNativeCompressed(t *testing.T) {
 	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "amiga.lha")
 	var out bytes.Buffer
@@ -260,6 +272,20 @@ func TestFsExtractLhaStoredNative(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "dir2")); err != nil {
 		t.Fatalf("expected extracted directory dir2: %v", err)
+	}
+}
+
+func TestFsExtractLhaStoredWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "dirs-files.lha")
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", lhaPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract lha without bsdtar failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "dir1", "file1.txt")); err != nil {
+		t.Fatalf("expected extracted file dir1/file1.txt: %v", err)
 	}
 }
 
