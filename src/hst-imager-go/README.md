@@ -66,8 +66,10 @@ Pure-Go parity progress:
 - `fs copy`/`fs extract` now read source UAE metadata in pure Go and propagate metadata properties (protection bits/comments) to destination metadata files, including entries where names do not require remapping.
 - `fs dir`/`fs copy`/`fs extract` now resolve Amiga-style source path components via UAE metadata mappings (e.g. `file1*` -> `__uae___file1_` or `file1%2a`) in pure-Go mode.
 - archive handling now supports native non-zip tar-family formats in Go (`.tar`, `.tgz`, `.tar.gz`) for both `archive list` and `fs extract`.
-- LHA now has native parsing for `archive list` and native extraction for stored (`-lh0-`) entries; compressed/advanced LHA features still fall back to `bsdtar`.
-- `bsdtar` fallback remains for legacy formats not yet implemented natively (e.g. `lzx`, `rar`) and unsupported advanced LHA variants.
+- `fs extract` archive-root behavior now matches legacy semantics: when inner path is empty, extraction is recursive even without `--recursive`.
+- archive path extraction now handles exact single-file inner paths and case-insensitive matching (`archive\Dir\File`).
+- LHA now has native `archive list` and native `fs extract` for mixed archives, including compressed `-lh4-/-lh5-/-lh6-/-lh7-` plus stored `-lh0-` fallback from raw entries.
+- `bsdtar` fallback remains for legacy formats not yet implemented natively (currently `lzx`, `rar`) and unsupported/unknown LHA header variants.
 - Added parity-focused tests for binary layout, protection-bit formatting, and filename encoding edge cases.
 
 Example using your published artifacts:

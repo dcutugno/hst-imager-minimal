@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -23,6 +24,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+
+	lhago "github.com/dictav/go-lha"
 )
 
 type GlobalOptions struct {
@@ -1840,8 +1843,9 @@ func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error 
 		return err
 	}
 	if archivePath, innerPath, ok := splitArchivePath(args[0]); ok {
+		// Match legacy behavior: extracting archive root implies recursive extraction.
 		if !fsOpts.recursive && innerPath == "" {
-			return errors.New("fs extract archive requires --recursive or specific inner path")
+			fsOpts.recursive = true
 		}
 		tmpDir, err := os.MkdirTemp("", "hst-imager-go-extract-*")
 		if err != nil {
@@ -1851,7 +1855,18 @@ func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error 
 		if err := extractArchive(archivePath, innerPath, tmpDir); err != nil {
 			return err
 		}
-		if _, err := copyPathWithOptions(tmpDir, args[1], fsOpts); err != nil {
+		sourcePath := tmpDir
+		destinationPath := args[1]
+		if !fsOpts.recursive && innerPath != "" {
+			if singleFilePath, ok := singleExtractedFilePath(tmpDir); ok {
+				sourcePath = singleFilePath
+				if err := os.MkdirAll(args[1], 0o755); err != nil {
+					return err
+				}
+				destinationPath = filepath.Join(args[1], filepath.Base(sourcePath))
+			}
+		}
+		if _, err := copyPathWithOptions(sourcePath, destinationPath, fsOpts); err != nil {
 			return err
 		}
 		if opts.Format == "json" {
@@ -5244,6 +5259,57 @@ func normalizeArchivePath(path string) string {
 	return strings.Trim(strings.ReplaceAll(path, "\\", "/"), "/")
 }
 
+func resolveArchiveEntryRelativePath(entryName, innerPath string) (string, bool) {
+	name := normalizeArchivePath(entryName)
+	if name == "" {
+		return "", false
+	}
+	target := normalizeArchivePath(innerPath)
+	if target == "" {
+		return name, true
+	}
+
+	nameLower := strings.ToLower(name)
+	targetLower := strings.ToLower(target)
+	switch {
+	case nameLower == targetLower:
+		if strings.HasSuffix(name, "/") {
+			return "", false
+		}
+		return path.Base(name), true
+	case strings.HasPrefix(nameLower, targetLower+"/"):
+		rel := name[len(target)+1:]
+		rel = strings.TrimPrefix(rel, "/")
+		return rel, rel != ""
+	default:
+		return "", false
+	}
+}
+
+func safeArchiveTargetPath(destination, relPath, sourceName string) (string, error) {
+	base := filepath.Clean(destination)
+	target := filepath.Clean(filepath.Join(destination, filepath.FromSlash(relPath)))
+	if target == base {
+		return target, nil
+	}
+	if strings.HasPrefix(target, base+string(filepath.Separator)) {
+		return target, nil
+	}
+	return "", fmt.Errorf("archive entry escapes destination: %s", sourceName)
+}
+
+func singleExtractedFilePath(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		return "", false
+	}
+	entry := entries[0]
+	if entry.IsDir() {
+		return "", false
+	}
+	return filepath.Join(dir, entry.Name()), true
+}
+
 func extractArchive(archivePath, innerPath, destination string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return err
@@ -5354,11 +5420,6 @@ func extractTarArchive(archivePath, innerPath, destination string, gzipped bool)
 	}
 	defer closeFn()
 
-	prefix := normalizeArchivePath(innerPath)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-
 	tr := tar.NewReader(reader)
 	for {
 		hdr, err := tr.Next()
@@ -5372,21 +5433,14 @@ func extractTarArchive(archivePath, innerPath, destination string, gzipped bool)
 			continue
 		}
 
-		name := normalizeArchivePath(hdr.Name)
-		if prefix != "" {
-			if !strings.HasPrefix(name, prefix) {
-				continue
-			}
-			name = strings.TrimPrefix(name, prefix)
-			name = strings.TrimPrefix(name, "/")
-		}
-		if name == "" {
+		relPath, ok := resolveArchiveEntryRelativePath(hdr.Name, innerPath)
+		if !ok || relPath == "" {
 			continue
 		}
 
-		target := filepath.Join(destination, filepath.FromSlash(name))
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(destination)+string(filepath.Separator)) && filepath.Clean(target) != filepath.Clean(destination) {
-			return fmt.Errorf("tar entry escapes destination: %s", hdr.Name)
+		target, err := safeArchiveTargetPath(destination, relPath, hdr.Name)
+		if err != nil {
+			return err
 		}
 
 		switch hdr.Typeflag {
@@ -5422,6 +5476,7 @@ func extractTarArchive(archivePath, innerPath, destination string, gzipped bool)
 
 type lhaEntry struct {
 	Name           string
+	Comment        string
 	Method         string
 	CompressedSize uint32
 	OriginalSize   uint32
@@ -5430,6 +5485,14 @@ type lhaEntry struct {
 }
 
 func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
+	items, err := listLhaArchiveEntriesNative(path)
+	if err == nil {
+		return items, nil
+	}
+	if !errors.Is(err, errUnsupportedLhaFeature) {
+		return nil, err
+	}
+
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -5438,7 +5501,7 @@ func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	items := make([]archiveEntry, 0, len(entries))
+	items = make([]archiveEntry, 0, len(entries))
 	for _, e := range entries {
 		items = append(items, archiveEntry{
 			Name: e.Name,
@@ -5448,7 +5511,134 @@ func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
 	return items, nil
 }
 
+func listLhaArchiveEntriesNative(path string) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := lhago.NewReader(f)
+	items := make([]archiveEntry, 0)
+	for {
+		h, err := lhaNextHeaderSafe(r)
+		if err != nil {
+			return nil, err
+		}
+		if h == nil {
+			break
+		}
+		entryName := lhaHeaderEntryName(h)
+		if entryName == "" {
+			continue
+		}
+		items = append(items, archiveEntry{
+			Name: entryName,
+			Size: int64(h.OriginalSize),
+		})
+	}
+	return items, nil
+}
+
 func extractLhaArchive(archivePath, innerPath, destination string) error {
+	err := extractLhaArchiveNative(archivePath, innerPath, destination)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errUnsupportedLhaFeature) {
+		return err
+	}
+	return extractLhaArchiveStoredOnly(archivePath, innerPath, destination)
+}
+
+func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
+	var raw []byte
+	storedEntries := make(map[string]lhaEntry)
+	if b, err := os.ReadFile(archivePath); err == nil {
+		raw = b
+		if entries, parseErr := parseLhaEntries(b); parseErr == nil {
+			for _, e := range entries {
+				storedEntries[strings.ToLower(normalizeArchivePath(e.Name))] = e
+			}
+		}
+	}
+
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := lhago.NewReader(f)
+	for {
+		h, err := lhaNextHeaderSafe(r)
+		if err != nil {
+			return err
+		}
+		if h == nil {
+			break
+		}
+
+		entryName := lhaHeaderEntryName(h)
+		if entryName == "" {
+			continue
+		}
+		isDir := strings.EqualFold(h.Method, "-lhd-") || strings.HasSuffix(entryName, "/")
+		relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
+		if !ok || relPath == "" {
+			continue
+		}
+
+		target, err := safeArchiveTargetPath(destination, relPath, entryName)
+		if err != nil {
+			return err
+		}
+		if isDir {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+
+		out, err := os.Create(target)
+		if err != nil {
+			return err
+		}
+		_, decodeErr := lhaDecodeSafe(r, out)
+		closeErr := out.Close()
+		if decodeErr == nil {
+			if closeErr != nil {
+				return closeErr
+			}
+			continue
+		}
+		_ = os.Remove(target)
+
+		if !errors.Is(decodeErr, errUnsupportedLhaFeature) {
+			return decodeErr
+		}
+		if !strings.EqualFold(h.Method, "-lh0-") {
+			return errUnsupportedLhaFeature
+		}
+		e, ok := storedEntries[strings.ToLower(normalizeArchivePath(entryName))]
+		if !ok || len(raw) == 0 {
+			return errUnsupportedLhaFeature
+		}
+		payload, err := lhaEntryPayload(raw, e)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, payload, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) error {
 	b, err := os.ReadFile(archivePath)
 	if err != nil {
 		return err
@@ -5457,34 +5647,19 @@ func extractLhaArchive(archivePath, innerPath, destination string) error {
 	if err != nil {
 		return err
 	}
-
-	prefix := normalizeArchivePath(innerPath)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-
-	base := filepath.Clean(destination)
 	for _, e := range entries {
-		name := normalizeArchivePath(e.Name)
-		if prefix != "" {
-			if !strings.HasPrefix(name, prefix) {
-				continue
-			}
-			name = strings.TrimPrefix(name, prefix)
-			name = strings.TrimPrefix(name, "/")
-		}
-		if name == "" {
+		relPath, ok := resolveArchiveEntryRelativePath(e.Name, innerPath)
+		if !ok || relPath == "" {
 			continue
 		}
 
-		target := filepath.Join(destination, filepath.FromSlash(name))
-		cleanTarget := filepath.Clean(target)
-		if !strings.HasPrefix(cleanTarget, base+string(filepath.Separator)) && cleanTarget != base {
-			return fmt.Errorf("lha entry escapes destination: %s", e.Name)
+		target, err := safeArchiveTargetPath(destination, relPath, e.Name)
+		if err != nil {
+			return err
 		}
 
 		if e.IsDir || strings.EqualFold(e.Method, "-lhd-") {
-			if err := os.MkdirAll(cleanTarget, 0o755); err != nil {
+			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
 			continue
@@ -5492,23 +5667,109 @@ func extractLhaArchive(archivePath, innerPath, destination string) error {
 		if !strings.EqualFold(e.Method, "-lh0-") {
 			return errUnsupportedLhaFeature
 		}
-		if err := os.MkdirAll(filepath.Dir(cleanTarget), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		start := e.DataOffset
-		end := start + int(e.CompressedSize)
-		if start < 0 || end < start || end > len(b) {
-			return fmt.Errorf("invalid lha data range for '%s'", e.Name)
+		payload, err := lhaEntryPayload(b, e)
+		if err != nil {
+			return err
 		}
-		payload := b[start:end]
-		if e.OriginalSize < uint32(len(payload)) {
-			payload = payload[:e.OriginalSize]
-		}
-		if err := os.WriteFile(cleanTarget, payload, 0o644); err != nil {
+		if err := os.WriteFile(target, payload, 0o644); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func lhaNextHeaderSafe(r *lhago.Reader) (h *lhago.Header, err error) {
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			h = nil
+			err = errUnsupportedLhaFeature
+		}
+	}()
+	h, err = r.NextHeader()
+	if err != nil && isLhaUnsupportedFeatureError(err) {
+		return nil, errUnsupportedLhaFeature
+	}
+	return h, err
+}
+
+func lhaDecodeSafe(r *lhago.Reader, w io.Writer) (n int, err error) {
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			n = 0
+			err = errUnsupportedLhaFeature
+		}
+	}()
+	n, err = r.Decode(w)
+	if err != nil && isLhaUnsupportedFeatureError(err) {
+		return n, errUnsupportedLhaFeature
+	}
+	return n, err
+}
+
+func isLhaUnsupportedFeatureError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported method") ||
+		strings.Contains(msg, "unknown header level")
+}
+
+func lhaHeaderEntryName(h *lhago.Header) string {
+	dir := strings.ReplaceAll(h.Dir, string(os.PathSeparator), "/")
+	dir = strings.ReplaceAll(dir, "\\", "/")
+	namePart, _ := splitLhaNameAndComment(h.Name)
+	namePart = strings.ReplaceAll(namePart, "\\", "/")
+
+	fullName := strings.TrimLeft(dir, "/")
+	if fullName != "" && !strings.HasSuffix(fullName, "/") {
+		fullName += "/"
+	}
+	fullName += strings.TrimLeft(namePart, "/")
+
+	isDir := strings.EqualFold(h.Method, "-lhd-") || strings.HasSuffix(fullName, "/")
+	return normalizeLhaEntryName(fullName, isDir)
+}
+
+func splitLhaNameAndComment(rawName string) (string, string) {
+	idx := strings.IndexByte(rawName, 0)
+	if idx < 0 {
+		return rawName, ""
+	}
+	comment := ""
+	if idx < len(rawName)-1 {
+		comment = rawName[idx+1:]
+	}
+	return rawName[:idx], comment
+}
+
+func normalizeLhaEntryName(name string, isDir bool) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = strings.TrimLeft(name, "/")
+	if isDir {
+		name = strings.TrimSuffix(name, "/")
+		if name == "" {
+			return ""
+		}
+		return name + "/"
+	}
+	return strings.TrimSuffix(name, "/")
+}
+
+func lhaEntryPayload(data []byte, entry lhaEntry) ([]byte, error) {
+	start := entry.DataOffset
+	end := start + int(entry.CompressedSize)
+	if start < 0 || end < start || end > len(data) {
+		return nil, fmt.Errorf("invalid lha data range for '%s'", entry.Name)
+	}
+	payload := data[start:end]
+	if entry.OriginalSize < uint32(len(payload)) {
+		payload = payload[:entry.OriginalSize]
+	}
+	return payload, nil
 }
 
 func parseLhaEntries(data []byte) ([]lhaEntry, error) {
@@ -5547,14 +5808,9 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 		}
 
 		rawName := latin1Decode(data[nameStart:nameEnd])
-		isDir := strings.HasSuffix(rawName, "\\") || strings.HasSuffix(rawName, "/")
-		name := strings.ReplaceAll(rawName, "\\", "/")
-		name = strings.TrimLeft(name, "/")
-		if isDir {
-			name = strings.TrimSuffix(name, "/") + "/"
-		} else {
-			name = strings.TrimSuffix(name, "/")
-		}
+		namePart, comment := splitLhaNameAndComment(rawName)
+		isDir := strings.HasSuffix(namePart, "\\") || strings.HasSuffix(namePart, "/")
+		name := normalizeLhaEntryName(namePart, isDir)
 		dataOffset := headerEnd
 		nextOffset := dataOffset + int(compressedSize)
 		if nextOffset > len(data) {
@@ -5563,6 +5819,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 
 		entries = append(entries, lhaEntry{
 			Name:           name,
+			Comment:        comment,
 			Method:         method,
 			CompressedSize: compressedSize,
 			OriginalSize:   originalSize,
@@ -5581,23 +5838,15 @@ func extractZip(archivePath, innerPath, destination string) error {
 		return err
 	}
 	defer zr.Close()
-	prefix := normalizeArchivePath(innerPath)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
 	for _, f := range zr.File {
-		name := normalizeArchivePath(f.Name)
-		if prefix != "" {
-			if !strings.HasPrefix(name, prefix) {
-				continue
-			}
-			name = strings.TrimPrefix(name, prefix)
-			name = strings.TrimPrefix(name, "/")
-		}
-		if name == "" {
+		relPath, ok := resolveArchiveEntryRelativePath(f.Name, innerPath)
+		if !ok || relPath == "" {
 			continue
 		}
-		target := filepath.Join(destination, filepath.FromSlash(name))
+		target, err := safeArchiveTargetPath(destination, relPath, f.Name)
+		if err != nil {
+			return err
+		}
 		if f.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
