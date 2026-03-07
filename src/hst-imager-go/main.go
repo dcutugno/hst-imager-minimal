@@ -633,8 +633,14 @@ func listWindowsDrives() ([]DriveInfo, error) {
 
 func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	path := "."
-	if len(args) > 0 {
+	fsArgOffset := 0
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		path = args[0]
+		fsArgOffset = 1
+	}
+	fsOpts, err := parseFsOptions(args[fsArgOffset:])
+	if err != nil {
+		return err
 	}
 	if archivePath, innerPath, ok := splitArchivePath(path); ok {
 		return handleFsDirArchive(archivePath, innerPath, stdout, opts)
@@ -642,21 +648,9 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if basePath, table, ok := parsePartitionContainerPath(path); ok {
 		return handleFsDirPartitionContainer(basePath, table, stdout, opts)
 	}
-	entries, err := os.ReadDir(path)
+	items, err := listLocalFsDir(path, fsOpts)
 	if err != nil {
 		return err
-	}
-	type item struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-	}
-	items := make([]item, 0, len(entries))
-	for _, e := range entries {
-		t := "file"
-		if e.IsDir() {
-			t = "dir"
-		}
-		items = append(items, item{Name: e.Name(), Type: t})
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{"path": path, "entries": items})
@@ -665,6 +659,203 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
 	}
 	return nil
+}
+
+type fsDirItem struct {
+	Name           string `json:"name"`
+	Type           string `json:"type"`
+	ProtectionBits *int   `json:"protectionBits,omitempty"`
+	Comment        string `json:"comment,omitempty"`
+}
+
+type uaeMetadataNodeInfo struct {
+	AmigaName      string
+	NormalName     string
+	ProtectionBits *int
+	Comment        string
+}
+
+func listLocalFsDir(path string, opts fsPathOptions) ([]fsDirItem, error) {
+	if !opts.recursive {
+		items, err := listLocalFsDirLevel(path, "", opts.uaeMetadata)
+		if err != nil {
+			return nil, err
+		}
+		sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+		return items, nil
+	}
+
+	items := make([]fsDirItem, 0)
+	err := filepath.WalkDir(path, func(current string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		prefix, err := resolveUaeDisplayPath(path, current, opts.uaeMetadata)
+		if err != nil {
+			return err
+		}
+		levelItems, err := listLocalFsDirLevel(current, prefix, opts.uaeMetadata)
+		if err != nil {
+			return err
+		}
+		items = append(items, levelItems...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+	return items, nil
+}
+
+func resolveUaeDisplayPath(rootPath, currentPath, uaeMode string) (string, error) {
+	rel, err := filepath.Rel(rootPath, currentPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." {
+		return "", nil
+	}
+
+	parts := strings.Split(rel, string(filepath.Separator))
+	displayParts := make([]string, 0, len(parts))
+	parent := rootPath
+	for _, part := range parts {
+		nodesByNormal, err := readUaeMetadataNodesByNormalName(parent, uaeMode)
+		if err != nil {
+			return "", err
+		}
+		displayPart := part
+		if node, ok := nodesByNormal[strings.ToLower(part)]; ok {
+			displayPart = node.AmigaName
+		}
+		displayParts = append(displayParts, displayPart)
+		parent = filepath.Join(parent, part)
+	}
+	return strings.Join(displayParts, "/"), nil
+}
+
+func listLocalFsDirLevel(dirPath, prefix, uaeMode string) ([]fsDirItem, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	nodesByNormal, err := readUaeMetadataNodesByNormalName(dirPath, uaeMode)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]fsDirItem, 0, len(entries))
+	for _, e := range entries {
+		if shouldSkipUaeMetadataFile(e.Name(), uaeMode) {
+			continue
+		}
+
+		displayName := e.Name()
+		var protectionBits *int
+		comment := ""
+		if node, ok := nodesByNormal[strings.ToLower(e.Name())]; ok {
+			displayName = node.AmigaName
+			protectionBits = node.ProtectionBits
+			comment = node.Comment
+		}
+
+		if prefix != "" {
+			displayName = prefix + "/" + displayName
+		}
+
+		itemType := "file"
+		if e.IsDir() {
+			itemType = "dir"
+		}
+		items = append(items, fsDirItem{
+			Name:           displayName,
+			Type:           itemType,
+			ProtectionBits: protectionBits,
+			Comment:        comment,
+		})
+	}
+	return items, nil
+}
+
+func readUaeMetadataNodesByNormalName(dirPath, uaeMode string) (map[string]uaeMetadataNodeInfo, error) {
+	nodes := make(map[string]uaeMetadataNodeInfo)
+	switch uaeMode {
+	case "uaefsdb":
+		fsDbPath := filepath.Join(dirPath, "_UAEFSDB.___")
+		records, err := readUaeFsDbRecords(fsDbPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range records {
+			mode := int(r.Mode)
+			nodes[strings.ToLower(r.NormalName)] = uaeMetadataNodeInfo{
+				AmigaName:      r.AmigaName,
+				NormalName:     r.NormalName,
+				ProtectionBits: &mode,
+				Comment:        r.Comment,
+			}
+		}
+	case "uaemetafile":
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if !strings.EqualFold(filepath.Ext(e.Name()), ".uaem") {
+				continue
+			}
+			normalName := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			amigaName := decodeFilenameForUaeMetafile(normalName)
+			protectionBits, comment, err := readUaeMetafile(filepath.Join(dirPath, e.Name()))
+			if err != nil {
+				return nil, err
+			}
+			nodes[strings.ToLower(normalName)] = uaeMetadataNodeInfo{
+				AmigaName:      amigaName,
+				NormalName:     normalName,
+				ProtectionBits: protectionBits,
+				Comment:        comment,
+			}
+		}
+	}
+	return nodes, nil
+}
+
+func shouldSkipUaeMetadataFile(name, uaeMode string) bool {
+	if uaeMode == "none" {
+		return false
+	}
+	if strings.EqualFold(name, "_UAEFSDB.___") {
+		return true
+	}
+	return strings.EqualFold(filepath.Ext(name), ".uaem")
+}
+
+func readUaeFsDbRecords(path string) ([]uaeFsDbRecord, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	records := make([]uaeFsDbRecord, 0, len(b)/uaeFsDbNodeV1Size)
+	for off := 0; off+uaeFsDbNodeV1Size <= len(b); off += uaeFsDbNodeV1Size {
+		record := readUaeFsDbRecord(b[off : off+uaeFsDbNodeV1Size])
+		if record.Valid == 0 {
+			continue
+		}
+		records = append(records, record)
+	}
+	return records, nil
 }
 
 func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts GlobalOptions) error {
@@ -4060,6 +4251,72 @@ func encodeFilenameSpecialCharsForUaeMetafile(name string) string {
 	return b.String()
 }
 
+func decodeFilenameForUaeMetafile(name string) string {
+	var out []byte
+	for i := 0; i < len(name); i++ {
+		if name[i] == '%' && i+2 < len(name) {
+			if n, err := strconv.ParseUint(name[i+1:i+3], 16, 8); err == nil {
+				out = append(out, byte(n))
+				i += 2
+				continue
+			}
+		}
+		out = append(out, name[i])
+	}
+	return latin1Decode(out)
+}
+
+func readUaeMetafile(path string) (*int, string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(b) == 0 {
+		return nil, "", nil
+	}
+	text := strings.TrimRight(latin1Decode(b), "\r\n")
+	if len(text) < 8 {
+		return nil, "", nil
+	}
+	protectionText := text[:8]
+	comment := ""
+	if len(text) >= 32 {
+		comment = text[32:]
+	}
+
+	protectionParsed := parseAmigaProtectionBitsText(protectionText)
+	value := protectionParsed ^ 0xf
+	return &value, comment, nil
+}
+
+func parseAmigaProtectionBitsText(text string) int {
+	bits := 0
+	fields := []struct {
+		pos int
+		bit int
+	}{
+		{0, 128},
+		{1, 64},
+		{2, 32},
+		{3, 16},
+		{4, 8},
+		{5, 4},
+		{6, 2},
+		{7, 1},
+	}
+	upper := strings.ToUpper(text)
+	for _, f := range fields {
+		if f.pos >= len(upper) {
+			continue
+		}
+		if upper[f.pos] == '-' {
+			continue
+		}
+		bits |= f.bit
+	}
+	return bits
+}
+
 func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string) error {
 	switch mode {
 	case "uaefsdb":
@@ -4217,6 +4474,15 @@ func latin1Bytes(text string) []byte {
 		out = append(out, byte(r))
 	}
 	return out
+}
+
+func latin1Decode(data []byte) string {
+	var b strings.Builder
+	b.Grow(len(data))
+	for _, by := range data {
+		b.WriteRune(rune(by))
+	}
+	return b.String()
 }
 
 func writeUaeMetafile(dirPath, normalName string, protectionBits *int, date time.Time, comment string) error {

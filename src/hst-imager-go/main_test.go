@@ -1121,6 +1121,129 @@ func TestWriteUaeMetafileFormat(t *testing.T) {
 	}
 }
 
+func TestFsDirReadsUaeFsDbMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "__uae___file1_"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "plain.txt"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pb := 116
+	if err := writeUaeFsDb(tmp, "file1*", "__uae___file1_", &pb, "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", tmp, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs dir with uaefsdb failed: %v", err)
+	}
+	var result struct {
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]fsDirItem{}
+	for _, e := range result.Entries {
+		names[e.Name] = e
+	}
+	if _, ok := names["_UAEFSDB.___"]; ok {
+		t.Fatal("metadata file should be hidden in fs dir")
+	}
+	entry, ok := names["file1*"]
+	if !ok {
+		t.Fatalf("expected mapped amiga name file1*, got %#v", names)
+	}
+	if entry.ProtectionBits == nil || *entry.ProtectionBits != pb {
+		t.Fatalf("expected protection bits %d, got %#v", pb, entry.ProtectionBits)
+	}
+	if entry.Comment != "hello" {
+		t.Fatalf("expected comment hello, got %q", entry.Comment)
+	}
+	if _, ok := names["plain.txt"]; !ok {
+		t.Fatalf("expected plain.txt entry, got %#v", names)
+	}
+}
+
+func TestFsDirReadsUaeMetafileMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "file1%2a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pb := 123
+	date := time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local)
+	if err := writeUaeMetafile(tmp, "file1%2a", &pb, date, "note"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", tmp, "--uaemetadata", "uaemetafile"}, &out); err != nil {
+		t.Fatalf("fs dir with uaemetafile failed: %v", err)
+	}
+	var result struct {
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]fsDirItem{}
+	for _, e := range result.Entries {
+		names[e.Name] = e
+	}
+	if _, ok := names["file1%2a.uaem"]; ok {
+		t.Fatal("uaem sidecar should be hidden in fs dir")
+	}
+	entry, ok := names["file1*"]
+	if !ok {
+		t.Fatalf("expected decoded amiga name file1*, got %#v", names)
+	}
+	if entry.ProtectionBits == nil || *entry.ProtectionBits != pb {
+		t.Fatalf("expected protection bits %d, got %#v", pb, entry.ProtectionBits)
+	}
+	if entry.Comment != "note" {
+		t.Fatalf("expected note comment, got %q", entry.Comment)
+	}
+}
+
+func TestFsDirRecursiveUsesUaeMetadataPathMapping(t *testing.T) {
+	tmp := t.TempDir()
+	rootDir := filepath.Join(tmp, "__uae___dir1_")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "__uae___file2_"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUaeFsDb(tmp, "dir1*", "__uae___dir1_", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUaeFsDb(rootDir, "file2*", "__uae___file2_", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", tmp, "--recursive", "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs dir recursive with uaefsdb failed: %v", err)
+	}
+	var result struct {
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range result.Entries {
+		if e.Name == "dir1*/file2*" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected recursive mapped path dir1*/file2*, got %#v", result.Entries)
+	}
+}
+
 func TestFsCopyLegacyBridgePassthrough(t *testing.T) {
 	tmp := t.TempDir()
 	source := filepath.Join(tmp, "source")
