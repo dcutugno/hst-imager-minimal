@@ -1,11 +1,14 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -90,6 +93,21 @@ func TestFsDirAndArchiveListAndScript(t *testing.T) {
 		t.Fatalf("unexpected archive list output: %q", out.String())
 	}
 
+	tarGzPath := filepath.Join(tmp, "test.tar.gz")
+	if err := writeTarGzArchive(tarGzPath, map[string]string{
+		"nested/hello.txt": "hello",
+		"root.txt":         "root",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"archive", "list", tarGzPath}, &out); err != nil {
+		t.Fatalf("archive list tar.gz failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "nested/hello.txt") || !strings.Contains(out.String(), "root.txt") {
+		t.Fatalf("unexpected tar.gz archive list output: %q", out.String())
+	}
+
 	scriptPath := filepath.Join(tmp, "run.txt")
 	script := "blank " + filepath.Join(tmp, "s.img") + " 1KB\ninfo " + filepath.Join(tmp, "s.img") + "\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
@@ -102,6 +120,55 @@ func TestFsDirAndArchiveListAndScript(t *testing.T) {
 	if !strings.Contains(out.String(), "Created blank image") || !strings.Contains(out.String(), "Path:") {
 		t.Fatalf("unexpected script output: %q", out.String())
 	}
+}
+
+func TestFsExtractTarGzNative(t *testing.T) {
+	tmp := t.TempDir()
+	tarGzPath := filepath.Join(tmp, "sample.tar.gz")
+	if err := writeTarGzArchive(tarGzPath, map[string]string{
+		"dir/a.txt": "aaa",
+		"dir/b.txt": "bbb",
+		"c.txt":     "ccc",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", tarGzPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract tar.gz failed: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dest, "dir", "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "aaa" {
+		t.Fatalf("unexpected extracted content: %q", string(b))
+	}
+}
+
+func writeTarGzArchive(path string, files map[string]string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+	for name, content := range files {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, strings.NewReader(content)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func TestBlankInfoTransferCompareFlow(t *testing.T) {
@@ -1323,6 +1390,98 @@ func TestFsDirRecursiveUsesUaeMetadataPathMapping(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected recursive mapped path dir1*/file2*, got %#v", result.Entries)
+	}
+}
+
+func TestFsDirResolvesUaeMetadataPathComponent(t *testing.T) {
+	tmp := t.TempDir()
+	dirPath := filepath.Join(tmp, "__uae___dir1_")
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirPath, "file.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUaeFsDb(tmp, "dir1*", "__uae___dir1_", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	amigaPath := filepath.Join(tmp, "dir1*")
+	if err := run([]string{"fs", "dir", amigaPath, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs dir by amiga path failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "file.txt") {
+		t.Fatalf("expected file.txt in output, got %q", out.String())
+	}
+}
+
+func TestFsCopyResolvesUaeFsDbSourcePath(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "__uae___file1_"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUaeFsDb(src, "file1*", "__uae___file1_", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", filepath.Join(src, "file1*"), dst, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs copy by amiga source path failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "__uae___file1_")); err != nil {
+		t.Fatalf("expected copied normalized file: %v", err)
+	}
+	records, err := readUaeFsDbRecords(filepath.Join(dst, "_UAEFSDB.___"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range records {
+		if r.AmigaName == "file1*" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected destination metadata for file1*, got %+v", records)
+	}
+}
+
+func TestFsCopyResolvesUaeMetafileSourcePath(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "file1%2a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUaeMetafile(src, "file1%2a", nil, time.Date(2024, 1, 2, 3, 4, 5, 0, time.Local), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", filepath.Join(src, "file1*"), dst, "--uaemetadata", "uaemetafile"}, &out); err != nil {
+		t.Fatalf("fs copy by amiga source path failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "file1%2a")); err != nil {
+		t.Fatalf("expected copied encoded file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "file1%2a.uaem")); err != nil {
+		t.Fatalf("expected copied/generated uaem sidecar: %v", err)
 	}
 }
 

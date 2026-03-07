@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
@@ -648,6 +649,11 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if basePath, table, ok := parsePartitionContainerPath(path); ok {
 		return handleFsDirPartitionContainer(basePath, table, stdout, opts)
 	}
+	if fsOpts.uaeMetadata != "none" {
+		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(path, fsOpts.uaeMetadata); resolveErr == nil {
+			path = resolvedPath
+		}
+	}
 	items, err := listLocalFsDir(path, fsOpts)
 	if err != nil {
 		return err
@@ -827,6 +833,110 @@ func readUaeMetadataNodesByNormalName(dirPath, uaeMode string) (map[string]uaeMe
 		}
 	}
 	return nodes, nil
+}
+
+func readUaeMetadataNodesByAmigaName(dirPath, uaeMode string) (map[string]uaeMetadataNodeInfo, error) {
+	nodesByNormal, err := readUaeMetadataNodesByNormalName(dirPath, uaeMode)
+	if err != nil {
+		return nil, err
+	}
+	nodesByAmiga := make(map[string]uaeMetadataNodeInfo, len(nodesByNormal))
+	for _, node := range nodesByNormal {
+		nodesByAmiga[strings.ToLower(node.AmigaName)] = node
+	}
+	return nodesByAmiga, nil
+}
+
+func resolveLocalPathWithUaeMetadata(path, uaeMode string) (string, error) {
+	if uaeMode == "none" || path == "" {
+		return path, nil
+	}
+	if fileOrDirExists(path) {
+		return path, nil
+	}
+
+	cleaned := filepath.Clean(path)
+	volume := filepath.VolumeName(cleaned)
+	absolute := filepath.IsAbs(cleaned)
+	rest := cleaned
+	if volume != "" {
+		rest = strings.TrimPrefix(rest, volume)
+	}
+	rest = strings.TrimPrefix(rest, string(filepath.Separator))
+
+	parts := make([]string, 0)
+	if rest != "" && rest != "." {
+		parts = strings.Split(rest, string(filepath.Separator))
+	}
+
+	current := "."
+	if absolute {
+		if volume != "" {
+			current = filepath.Clean(volume + string(filepath.Separator))
+		} else {
+			current = string(filepath.Separator)
+		}
+	} else if volume != "" {
+		current = volume
+	}
+
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		candidate := filepath.Join(current, part)
+		if fileOrDirExists(candidate) {
+			current = candidate
+			continue
+		}
+		if ciName, ok := findCaseInsensitiveEntryName(current, part); ok {
+			current = filepath.Join(current, ciName)
+			continue
+		}
+		resolvedPart, err := resolveUaePathComponent(current, part, uaeMode)
+		if err != nil {
+			return path, err
+		}
+		current = filepath.Join(current, resolvedPart)
+	}
+	return current, nil
+}
+
+func resolveUaePathComponent(parentPath, amigaPart, uaeMode string) (string, error) {
+	nodesByAmiga, err := readUaeMetadataNodesByAmigaName(parentPath, uaeMode)
+	if err != nil {
+		return "", err
+	}
+	if node, ok := nodesByAmiga[strings.ToLower(amigaPart)]; ok {
+		return node.NormalName, nil
+	}
+
+	switch uaeMode {
+	case "uaefsdb":
+		candidate := "__uae___" + makeSafeFilenameForUaeFsDb(amigaPart)
+		if fileOrDirExists(filepath.Join(parentPath, candidate)) {
+			return candidate, nil
+		}
+	case "uaemetafile":
+		candidate := encodeFilenameSpecialCharsForUaeMetafile(amigaPart)
+		if fileOrDirExists(filepath.Join(parentPath, candidate)) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("path component '%s' not found under '%s'", amigaPart, parentPath)
+}
+
+func findCaseInsensitiveEntryName(parentPath, name string) (string, bool) {
+	entries, err := os.ReadDir(parentPath)
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), name) {
+			return entry.Name(), true
+		}
+	}
+	return "", false
 }
 
 func shouldSkipUaeMetadataFile(name, uaeMode string) bool {
@@ -1698,7 +1808,14 @@ func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if err != nil {
 		return err
 	}
-	count, err := copyPathWithOptions(args[0], args[1], fsOpts)
+	sourcePath := args[0]
+	if fsOpts.uaeMetadata != "none" {
+		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(args[0], fsOpts.uaeMetadata); resolveErr == nil {
+			sourcePath = resolvedPath
+		}
+	}
+
+	count, err := copyPathWithOptions(sourcePath, args[1], fsOpts)
 	if err != nil {
 		return err
 	}
@@ -1748,7 +1865,13 @@ func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error 
 		fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
 		return nil
 	}
-	if _, err := copyPathWithOptions(args[0], args[1], fsOpts); err != nil {
+	sourcePath := args[0]
+	if fsOpts.uaeMetadata != "none" {
+		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(args[0], fsOpts.uaeMetadata); resolveErr == nil {
+			sourcePath = resolvedPath
+		}
+	}
+	if _, err := copyPathWithOptions(sourcePath, args[1], fsOpts); err != nil {
 		return err
 	}
 	if opts.Format == "json" {
@@ -4769,6 +4892,15 @@ type archiveEntry struct {
 	Size int64  `json:"size"`
 }
 
+type archiveFormat string
+
+const (
+	archiveFormatZip    archiveFormat = "zip"
+	archiveFormatTar    archiveFormat = "tar"
+	archiveFormatTarGz  archiveFormat = "targz"
+	archiveFormatLegacy archiveFormat = "legacy"
+)
+
 func openSourceReader(path string) (io.ReadCloser, error) {
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
 		return nil, err
@@ -5040,8 +5172,9 @@ func findGptPart(parts []gptPartitionEntry, index int) (gptPartitionEntry, error
 }
 
 func listArchiveEntries(path string) ([]archiveEntry, error) {
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".zip" {
+	format := detectArchiveFormat(path)
+	switch format {
+	case archiveFormatZip:
 		zr, err := zip.OpenReader(path)
 		if err != nil {
 			return nil, err
@@ -5052,7 +5185,12 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 			items = append(items, archiveEntry{Name: f.Name, Size: int64(f.UncompressedSize64)})
 		}
 		return items, nil
+	case archiveFormatTar:
+		return listTarArchiveEntries(path, false)
+	case archiveFormatTarGz:
+		return listTarArchiveEntries(path, true)
 	}
+	ext := strings.ToLower(filepath.Ext(path))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
 		return nil, fmt.Errorf("archive format '%s' requires bsdtar: %w", ext, err)
 	}
@@ -5074,7 +5212,7 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 
 func splitArchivePath(path string) (archivePath string, innerPath string, ok bool) {
 	lower := strings.ToLower(path)
-	for _, ext := range []string{".zip", ".lha", ".lzx", ".tar", ".gz", ".xz", ".bz2", ".rar", ".z"} {
+	for _, ext := range []string{".tar.gz", ".tgz", ".zip", ".lha", ".lzx", ".tar", ".gz", ".xz", ".bz2", ".rar", ".z"} {
 		pos := strings.Index(lower, ext)
 		if pos < 0 {
 			continue
@@ -5099,10 +5237,16 @@ func extractArchive(archivePath, innerPath, destination string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return err
 	}
-	ext := strings.ToLower(filepath.Ext(archivePath))
-	if ext == ".zip" {
+	format := detectArchiveFormat(archivePath)
+	switch format {
+	case archiveFormatZip:
 		return extractZip(archivePath, innerPath, destination)
+	case archiveFormatTar:
+		return extractTarArchive(archivePath, innerPath, destination, false)
+	case archiveFormatTarGz:
+		return extractTarArchive(archivePath, innerPath, destination, true)
 	}
+	ext := strings.ToLower(filepath.Ext(archivePath))
 	if _, err := exec.LookPath("bsdtar"); err != nil {
 		return fmt.Errorf("archive extract for '%s' requires bsdtar: %w", ext, err)
 	}
@@ -5114,6 +5258,145 @@ func extractArchive(archivePath, innerPath, destination string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("archive extract failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func detectArchiveFormat(path string) archiveFormat {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.HasSuffix(lower, ".zip"):
+		return archiveFormatZip
+	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
+		return archiveFormatTarGz
+	case strings.HasSuffix(lower, ".tar"):
+		return archiveFormatTar
+	default:
+		return archiveFormatLegacy
+	}
+}
+
+func listTarArchiveEntries(path string, gzipped bool) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var reader io.Reader = f
+	var closeFn func() error = func() error { return nil }
+	if gzipped {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, err
+		}
+		reader = gr
+		closeFn = gr.Close
+	}
+	defer closeFn()
+
+	tr := tar.NewReader(reader)
+	items := make([]archiveEntry, 0)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		if hdr == nil {
+			continue
+		}
+		items = append(items, archiveEntry{
+			Name: hdr.Name,
+			Size: hdr.Size,
+		})
+	}
+	return items, nil
+}
+
+func extractTarArchive(archivePath, innerPath, destination string, gzipped bool) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var reader io.Reader = f
+	var closeFn func() error = func() error { return nil }
+	if gzipped {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return err
+		}
+		reader = gr
+		closeFn = gr.Close
+	}
+	defer closeFn()
+
+	prefix := normalizeArchivePath(innerPath)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	tr := tar.NewReader(reader)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		if hdr == nil {
+			continue
+		}
+
+		name := normalizeArchivePath(hdr.Name)
+		if prefix != "" {
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			name = strings.TrimPrefix(name, prefix)
+			name = strings.TrimPrefix(name, "/")
+		}
+		if name == "" {
+			continue
+		}
+
+		target := filepath.Join(destination, filepath.FromSlash(name))
+		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(destination)+string(filepath.Separator)) && filepath.Clean(target) != filepath.Clean(destination) {
+			return fmt.Errorf("tar entry escapes destination: %s", hdr.Name)
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.Create(target)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(out, tr)
+			closeErr := out.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		case tar.TypeSymlink, tar.TypeLink:
+			// Keep extraction deterministic and safe without recreating links.
+			continue
+		default:
+			continue
+		}
 	}
 	return nil
 }
