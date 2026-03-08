@@ -35,6 +35,8 @@ DATA_ROOT="$ROOT_DIR/../Hst.Imager.Core.Tests/TestData"
 LHA_AMIGA="$DATA_ROOT/Lha/amiga.lha"
 LZX_AMIGA="$DATA_ROOT/Lzx/amiga.lzx"
 RAR_IMG="$DATA_ROOT/compressed-images/1gb.img.rar"
+GZ_IMG="$DATA_ROOT/compressed-images/1gb.img.gz"
+XZ_IMG="$DATA_ROOT/compressed-images/1gb.img.xz"
 XZ_SMALL="$DATA_ROOT/Xz/test.txt.xz"
 
 normalize_text() {
@@ -215,6 +217,7 @@ compare_extract_case() {
 compare_write_case() {
   local name="$1"
   local source="$2"
+  local write_size="${3:-}"
   local off_file="$TMP_DIR/${name}.off.bin"
   local force_file="$TMP_DIR/${name}.force.bin"
 
@@ -232,8 +235,17 @@ compare_write_case() {
     return
   fi
 
-  run_mode off "$off_out" "$off_err" "$off_rc" write "$source" "$off_file"
-  run_mode force "$force_out" "$force_err" "$force_rc" write "$source" "$force_file"
+  local write_args=(write "$source" "$off_file")
+  if [[ -n "$write_size" ]]; then
+    write_args+=(--size "$write_size")
+  fi
+  run_mode off "$off_out" "$off_err" "$off_rc" "${write_args[@]}"
+
+  write_args=(write "$source" "$force_file")
+  if [[ -n "$write_size" ]]; then
+    write_args+=(--size "$write_size")
+  fi
+  run_mode force "$force_out" "$force_err" "$force_rc" "${write_args[@]}"
 
   if ! diff -u "$off_rc" "$force_rc" >"$TMP_DIR/${name}.rc.diff"; then
     fail_case "$name" "exit code mismatch (see $TMP_DIR/${name}.rc.diff)"
@@ -258,10 +270,45 @@ compare_write_case() {
   pass_case "$name"
 }
 
+compare_compare_case() {
+  local name="$1"
+  local expected_rc="$2"
+  local source_file="$3"
+  local destination_file="$4"
+  local compare_size="${5:-}"
+
+  local off_out="$TMP_DIR/${name}.off.out"
+  local off_err="$TMP_DIR/${name}.off.err"
+  local off_rc="$TMP_DIR/${name}.off.rc"
+  local force_out="$TMP_DIR/${name}.force.out"
+  local force_err="$TMP_DIR/${name}.force.err"
+  local force_rc="$TMP_DIR/${name}.force.rc"
+
+  local compare_args=(compare "$source_file" "$destination_file")
+  if [[ -n "$compare_size" ]]; then
+    compare_args+=(--size "$compare_size")
+  fi
+  run_mode off "$off_out" "$off_err" "$off_rc" "${compare_args[@]}"
+  run_mode force "$force_out" "$force_err" "$force_rc" "${compare_args[@]}"
+
+  if ! diff -u "$off_rc" "$force_rc" >"$TMP_DIR/${name}.rc.diff"; then
+    fail_case "$name" "exit code mismatch (see $TMP_DIR/${name}.rc.diff)"
+    return
+  fi
+  if [[ "$(cat "$off_rc")" != "$expected_rc" ]]; then
+    fail_case "$name" "unexpected exit code from go mode: got $(cat "$off_rc"), expected $expected_rc"
+    return
+  fi
+
+  pass_case "$name"
+}
+
 echo "Running output parity checks"
 compare_fs_dir_json_case "fs-dir-json-lha-amiga" "$LHA_AMIGA"
 compare_fs_dir_json_case "fs-dir-json-lzx-amiga" "$LZX_AMIGA"
 compare_fs_dir_json_case "fs-dir-json-rar-img" "$RAR_IMG"
+compare_fs_dir_json_case "fs-dir-json-gz-img" "$GZ_IMG"
+compare_fs_dir_json_case "fs-dir-json-xz-img" "$XZ_IMG"
 compare_fs_dir_json_case "fs-dir-json-xz-text" "$XZ_SMALL"
 
 echo "Running extraction parity checks"
@@ -270,9 +317,17 @@ compare_extract_case "extract-lzx-amiga" "$LZX_AMIGA"
 
 echo "Running write parity checks"
 compare_write_case "write-xz-small" "$XZ_SMALL"
+compare_write_case "write-xz-small-size5" "$XZ_SMALL" "5"
 if [[ "$HEAVY" == "1" ]]; then
   compare_write_case "write-rar-img-heavy" "$RAR_IMG"
 fi
+
+echo "Running compare parity checks"
+printf 'abcde12345' >"$TMP_DIR/compare-a.bin"
+printf 'abcde12345' >"$TMP_DIR/compare-b-equal.bin"
+printf 'abcXY12345' >"$TMP_DIR/compare-b-diff.bin"
+compare_compare_case "compare-size5-identical" "0" "$TMP_DIR/compare-a.bin" "$TMP_DIR/compare-b-equal.bin" "5"
+compare_compare_case "compare-size5-mismatch" "1" "$TMP_DIR/compare-a.bin" "$TMP_DIR/compare-b-diff.bin" "5"
 
 echo "Summary: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 if [[ "$FAIL" -ne 0 ]]; then
