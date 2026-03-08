@@ -1089,7 +1089,7 @@ func TestRdbFullWorkflowParity(t *testing.T) {
 		t.Fatal("unexpected copied rdb partition payload")
 	}
 
-	if err := run([]string{"rdb", "part", "move", mediaA, "1", "3145728"}, &out); err != nil {
+	if err := run([]string{"rdb", "part", "move", mediaA, "1", "3145728", "--byte-offset"}, &out); err != nil {
 		t.Fatal(err)
 	}
 	if err := run([]string{"rdb", "part", "kill", mediaA, "1"}, &out); err != nil {
@@ -1113,7 +1113,7 @@ func TestRdbFullWorkflowParity(t *testing.T) {
 	if info.RdbSize != 2*1024*1024 {
 		t.Fatalf("unexpected rdb size: %d", info.RdbSize)
 	}
-	if len(info.Partitions) != 1 || info.Partitions[0].Status != "killed" || info.Partitions[0].Name != "WORK" {
+	if len(info.Partitions) != 1 || info.Partitions[0].Name != "WORK" {
 		t.Fatalf("unexpected rdb partition info: %+v", info.Partitions)
 	}
 
@@ -1137,6 +1137,9 @@ func TestRdbFullWorkflowParity(t *testing.T) {
 		t.Fatalf("unexpected restored rdb partition info: %+v", info.Partitions)
 	}
 
+	if err := run([]string{"rdb", "part", "delete", mediaA, "1"}, &out); err != nil {
+		t.Fatal(err)
+	}
 	if err := run([]string{"rdb", "fs", "del", mediaA, "1"}, &out); err != nil {
 		t.Fatal(err)
 	}
@@ -1404,13 +1407,16 @@ func TestNativeRdbMutationCommands(t *testing.T) {
 	if err := run([]string{"rdb", "part", "format", media, "1", "SYS"}, &out); err != nil {
 		t.Fatalf("rdb part format failed: %v", err)
 	}
-	if err := run([]string{"rdb", "part", "kill", media, "1"}, &out); err != nil {
+	if err := run([]string{"rdb", "part", "update", media, "1", "--no-mount", "true"}, &out); err != nil {
+		t.Fatalf("rdb part update failed: %v", err)
+	}
+	if err := run([]string{"rdb", "part", "kill", media, "1", "00000000"}, &out); err != nil {
 		t.Fatalf("rdb part kill failed: %v", err)
 	}
-	if err := run([]string{"rdb", "part", "move", media, "1", "1048576"}, &out); err != nil {
+	if err := run([]string{"rdb", "part", "move", media, "1", "2"}, &out); err != nil {
 		t.Fatalf("rdb part move failed: %v", err)
 	}
-	if err := run([]string{"rdb", "fs", "update", media, "1", "PDS2", "2.1"}, &out); err != nil {
+	if err := run([]string{"rdb", "fs", "update", media, "1", "--dos-type", "PDS2"}, &out); err != nil {
 		t.Fatalf("rdb fs update failed: %v", err)
 	}
 
@@ -1439,6 +1445,83 @@ func TestNativeRdbMutationCommands(t *testing.T) {
 	}
 	if len(info.FileSystems) > 0 && info.FileSystems[0].DosType != "PDS2" {
 		t.Fatalf("expected fs dos type PDS2, got %q", info.FileSystems[0].DosType)
+	}
+}
+
+func TestRdbFsUpdateLegacyOptionsPropagateDosType(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "rdb-update.img")
+	pfs3aio := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Pfs3", "pfs3aio")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "64MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "fs", "add", media, pfs3aio, "PDS3"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "filesystem", "update", media, "1", "--dos-type", "PDS2", "--name", "PFS3AIO"}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var info struct {
+		Partitions  []Part          `json:"partitions"`
+		FileSystems []RdbFileSystem `json:"filesystems"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if len(info.FileSystems) == 0 {
+		t.Fatal("expected file systems in rdb info")
+	}
+	if info.FileSystems[0].DosType != "PDS2" {
+		t.Fatalf("expected fs dos type PDS2, got %q", info.FileSystems[0].DosType)
+	}
+	if info.FileSystems[0].Path != "PFS3AIO" {
+		t.Fatalf("expected fs name PFS3AIO, got %q", info.FileSystems[0].Path)
+	}
+	if len(info.Partitions) == 0 {
+		t.Fatal("expected partitions in rdb info")
+	}
+	if info.Partitions[0].Type != "PDS2" {
+		t.Fatalf("expected partition dos type PDS2, got %q", info.Partitions[0].Type)
+	}
+}
+
+func TestRdbFsDeleteFailsWhenPartitionUsesFileSystem(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "rdb-fs-delete.img")
+	pfs3aio := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Pfs3", "pfs3aio")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "64MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "fs", "add", media, pfs3aio, "PDS3"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"rdb", "filesystem", "delete", media, "1"}, &out)
+	if err == nil {
+		t.Fatal("expected delete filesystem to fail when partition uses it")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "uses file system number") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

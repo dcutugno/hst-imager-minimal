@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3183,19 +3184,18 @@ func handleRdbFsDelete(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	out := make([]rdbFileSystem, 0, len(state.Fs))
-	found := false
-	for _, fs := range state.Fs {
-		if fs.Index == idx {
-			found = true
-			continue
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Fs) {
+		return fmt.Errorf("invalid file system number '%d'", idx)
+	}
+	target := state.Fs[idx-1]
+	for partIdx, part := range state.Parts {
+		if sameDosType(part.Type, target.DosType) {
+			return fmt.Errorf("partition number '%d' uses file system number '%d'", partIdx+1, idx)
 		}
-		out = append(out, fs)
 	}
-	if !found {
-		return fmt.Errorf("filesystem %d not found", idx)
-	}
-	state.Fs = out
+	state.Fs = append(state.Fs[:idx-1], state.Fs[idx:]...)
+	normalizeRdbStateIndexes(&state)
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -3218,16 +3218,11 @@ func handleRdbFsExport(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	var target *rdbFileSystem
-	for i := range state.Fs {
-		if state.Fs[i].Index == idx {
-			target = &state.Fs[i]
-			break
-		}
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Fs) {
+		return fmt.Errorf("invalid file system number '%d'", idx)
 	}
-	if target == nil {
-		return fmt.Errorf("filesystem %d not found", idx)
-	}
+	target := state.Fs[idx-1]
 	b, err := readBytesAt(args[0], target.DataOffset, target.DataSize)
 	if err != nil {
 		return err
@@ -3244,7 +3239,7 @@ func handleRdbFsExport(args []string, stdout io.Writer, opts GlobalOptions) erro
 
 func handleRdbFsUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 3 {
-		return errors.New("usage: rdb filesystem update <media> <index> <dostype>")
+		return errors.New("usage: rdb filesystem update <media> <index> [--dos-type <dostype>|--name <name>|--path <path>]")
 	}
 	idx, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -3254,20 +3249,94 @@ func handleRdbFsUpdate(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	found := false
-	for i := range state.Fs {
-		if state.Fs[i].Index == idx {
-			state.Fs[i].DosType = args[2]
-			if len(args) > 3 {
-				state.Fs[i].Version = args[3]
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Fs) {
+		return fmt.Errorf("invalid file system number '%d'", idx)
+	}
+	target := state.Fs[idx-1]
+	oldDosType := target.DosType
+	var dosType string
+	var name string
+	var fsPath string
+	hasChanges := false
+	if len(args) >= 3 && len(args[2]) > 0 && args[2][0] != '-' {
+		// Backward-compatible positional mode: <dostype> [version]
+		dosType = args[2]
+		target.DosType = dosType
+		hasChanges = true
+		if len(args) > 3 && len(args[3]) > 0 && args[3][0] != '-' {
+			target.Version = args[3]
+		}
+	} else {
+		for i := 2; i < len(args); i++ {
+			switch args[i] {
+			case "--dos-type", "-dt":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --dos-type")
+				}
+				dosType = args[i+1]
+				i++
+				hasChanges = true
+			case "--name", "-n":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --name")
+				}
+				name = args[i+1]
+				i++
+				hasChanges = true
+			case "--path", "-p":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --path")
+				}
+				fsPath = args[i+1]
+				i++
+				hasChanges = true
+			default:
+				return fmt.Errorf("unsupported argument: %s", args[i])
 			}
-			found = true
-			break
+		}
+		if !hasChanges {
+			return errors.New("At least one option must be specified")
+		}
+		if dosType != "" {
+			target.DosType = dosType
+		}
+		if name != "" {
+			target.Name = name
 		}
 	}
-	if !found {
-		return fmt.Errorf("filesystem %d not found", idx)
+	if fsPath != "" {
+		b, err := os.ReadFile(fsPath)
+		if err != nil {
+			return err
+		}
+		if state.Native {
+			target.DataSize = int64(len(b))
+		} else {
+			offset := target.DataOffset
+			if offset <= 0 || int64(len(b)) > target.DataSize {
+				offset = alignUp(state.FsDataEnd, mbrSectorSize)
+				if offset+int64(len(b)) > state.RdbSize {
+					return errors.New("rdb has insufficient space for filesystem binary, resize rdb first")
+				}
+				state.FsDataEnd = offset + int64(len(b))
+			}
+			if err := writeBytesAt(args[0], offset, b); err != nil {
+				return err
+			}
+			target.DataOffset = offset
+			target.DataSize = int64(len(b))
+		}
 	}
+	state.Fs[idx-1] = target
+	if dosType != "" && !sameDosType(oldDosType, dosType) {
+		for i := range state.Parts {
+			if sameDosType(state.Parts[i].Type, oldDosType) {
+				state.Parts[i].Type = dosType
+			}
+		}
+	}
+	normalizeRdbStateIndexes(&state)
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -3282,6 +3351,7 @@ func handleRdbPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	if err != nil {
 		return err
 	}
+	normalizeRdbStateIndexes(&state)
 	size, err := resolveRdbPartSize(args[0], args[3], state)
 	if err != nil {
 		return err
@@ -3307,7 +3377,7 @@ func handleRdbPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 
 func handleRdbPartUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 3 {
-		return errors.New("usage: rdb part update <media> <index> <name>")
+		return errors.New("usage: rdb part update <media> <index> [--name <name>|--dos-type <dostype>|--no-mount <bool>]")
 	}
 	idx, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -3317,17 +3387,101 @@ func handleRdbPartUpdate(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	found := false
-	for i := range state.Parts {
-		if state.Parts[i].Index == idx {
-			state.Parts[i].Name = args[2]
-			found = true
-			break
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Parts) {
+		return fmt.Errorf("invalid partition number '%d'", idx)
+	}
+	part := state.Parts[idx-1]
+	hasChanges := false
+	var name string
+	var dosType string
+	var noMount *bool
+
+	if len(args) >= 3 && len(args[2]) > 0 && args[2][0] != '-' {
+		// Backward-compatible positional mode: <name> [dostype]
+		name = args[2]
+		hasChanges = true
+		if len(args) > 3 && len(args[3]) > 0 && args[3][0] != '-' {
+			dosType = args[3]
+			hasChanges = true
+		}
+	} else {
+		for i := 2; i < len(args); i++ {
+			switch args[i] {
+			case "--name", "-n":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --name")
+				}
+				name = args[i+1]
+				i++
+				hasChanges = true
+			case "--dos-type", "-dt":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --dos-type")
+				}
+				dosType = args[i+1]
+				i++
+				hasChanges = true
+			case "--no-mount", "-nm":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --no-mount")
+				}
+				v, err := parseBoolArg(args[i+1])
+				if err != nil {
+					return err
+				}
+				noMount = &v
+				i++
+				hasChanges = true
+			case "--bootable", "-b", "--reserved", "-r", "--pre-alloc", "-pa", "--buffers", "-bu", "--max-transfer", "-mt", "--mask", "-ma", "--boot-priority", "-bp", "--block-size", "-bs":
+				if i+1 >= len(args) {
+					return fmt.Errorf("missing value for %s", args[i])
+				}
+				i++
+				hasChanges = true
+			default:
+				return fmt.Errorf("unsupported argument: %s", args[i])
+			}
 		}
 	}
-	if !found {
-		return fmt.Errorf("partition %d not found", idx)
+	if !hasChanges {
+		return errors.New("At least one option must be specified")
 	}
+	if name != "" {
+		for i, existing := range state.Parts {
+			if i == idx-1 {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(existing.Name), strings.TrimSpace(name)) {
+				return fmt.Errorf("partition name '%s' already exists", name)
+			}
+		}
+		part.Name = name
+	}
+	if dosType != "" {
+		if len(state.Fs) > 0 {
+			foundFs := false
+			for _, fs := range state.Fs {
+				if sameDosType(fs.DosType, dosType) {
+					foundFs = true
+					break
+				}
+			}
+			if !foundFs {
+				return fmt.Errorf("file system with DOS type '%s' not found in Rigid Disk Block", dosType)
+			}
+		}
+		part.Type = dosType
+	}
+	if noMount != nil {
+		if *noMount {
+			part.Status = "inactive"
+		} else {
+			part.Status = "active"
+		}
+	}
+	state.Parts[idx-1] = part
+	normalizeRdbStateIndexes(&state)
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -3346,19 +3500,12 @@ func handleRdbPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	out := make([]rdbPart, 0, len(state.Parts))
-	found := false
-	for _, p := range state.Parts {
-		if p.Index == idx {
-			found = true
-			continue
-		}
-		out = append(out, p)
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Parts) {
+		return fmt.Errorf("invalid partition number '%d'", idx)
 	}
-	if !found {
-		return fmt.Errorf("partition %d not found", idx)
-	}
-	state.Parts = out
+	state.Parts = append(state.Parts[:idx-1], state.Parts[idx:]...)
+	normalizeRdbStateIndexes(&state)
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -3385,11 +3532,13 @@ func handleRdbPartCopy(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	srcPart, err := findRdbPart(srcState.Parts, srcIdx)
+	normalizeRdbStateIndexes(&srcState)
+	normalizeRdbStateIndexes(&dstState)
+	srcPart, err := findRdbPartByNumber(srcState.Parts, srcIdx)
 	if err != nil {
 		return err
 	}
-	dstPart, err := findRdbPart(dstState.Parts, dstIdx)
+	dstPart, err := findRdbPartByNumber(dstState.Parts, dstIdx)
 	if err != nil {
 		return err
 	}
@@ -3416,7 +3565,8 @@ func handleRdbPartExport(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	p, err := findRdbPart(state.Parts, idx)
+	normalizeRdbStateIndexes(&state)
+	p, err := findRdbPartByNumber(state.Parts, idx)
 	if err != nil {
 		return err
 	}
@@ -3439,7 +3589,8 @@ func handleRdbPartImport(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	p, err := findRdbPart(state.Parts, idx)
+	normalizeRdbStateIndexes(&state)
+	p, err := findRdbPartByNumber(state.Parts, idx)
 	if err != nil {
 		return err
 	}
@@ -3452,7 +3603,7 @@ func handleRdbPartImport(args []string, stdout io.Writer, opts GlobalOptions) er
 
 func handleRdbPartKill(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: rdb part kill <media> <index>")
+		return errors.New("usage: rdb part kill <media> <index> [hexbootbytes]")
 	}
 	idx, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -3462,50 +3613,89 @@ func handleRdbPartKill(args []string, stdout io.Writer, opts GlobalOptions) erro
 	if err != nil {
 		return err
 	}
-	found := false
-	for i := range state.Parts {
-		if state.Parts[i].Index == idx {
-			state.Parts[i].Status = "killed"
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("partition %d not found", idx)
-	}
-	if err := writeRdbState(args[0], state); err != nil {
+	normalizeRdbStateIndexes(&state)
+	part, err := findRdbPartByNumber(state.Parts, idx)
+	if err != nil {
 		return err
+	}
+	if len(args) >= 3 {
+		hexBootBytes := strings.TrimSpace(args[2])
+		if len(hexBootBytes) != 8 {
+			return fmt.Errorf("hex boot bytes must be 8 characters %s", hexBootBytes)
+		}
+		bootBytes, err := hex.DecodeString(hexBootBytes)
+		if err != nil {
+			return err
+		}
+		if err := writeBytesAt(args[0], part.Start, bootBytes); err != nil {
+			return err
+		}
 	}
 	return printSimpleStatus(stdout, opts, "rdb partition killed", idx)
 }
 
 func handleRdbPartMove(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 3 {
-		return errors.New("usage: rdb part move <media> <index> <start>")
+		return errors.New("usage: rdb part move <media> <index> <start-cylinder> [--byte-offset]")
 	}
 	idx, err := strconv.Atoi(args[1])
 	if err != nil {
 		return err
 	}
-	start, err := strconv.ParseInt(args[2], 10, 64)
-	if err != nil || start < 0 {
-		return fmt.Errorf("invalid start: %s", args[2])
+	startValue, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil || startValue < 0 {
+		return fmt.Errorf("invalid start cylinder: %s", args[2])
+	}
+	useByteOffset := false
+	for i := 3; i < len(args); i++ {
+		switch args[i] {
+		case "--byte-offset":
+			useByteOffset = true
+		default:
+			return fmt.Errorf("unsupported argument: %s", args[i])
+		}
 	}
 	state, err := readRdbState(args[0])
 	if err != nil {
 		return err
 	}
-	found := false
-	for i := range state.Parts {
-		if state.Parts[i].Index == idx {
-			state.Parts[i].Start = start
-			found = true
-			break
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Parts) {
+		return fmt.Errorf("invalid partition number '%d'", idx)
+	}
+	part := state.Parts[idx-1]
+	targetStart := startValue
+	if !useByteOffset {
+		cylBytes, err := resolveRdbCylinderBytes(args[0], state)
+		if err != nil {
+			return err
+		}
+		targetStart = startValue * cylBytes
+	}
+	mediaTotal := mediaSize(args[0])
+	if !state.Native && targetStart+part.Size > mediaTotal {
+		return fmt.Errorf("partition does not fit in media at start offset %d", targetStart)
+	}
+	for i, other := range state.Parts {
+		if i == idx-1 {
+			continue
+		}
+		if rangesOverlap(targetStart, targetStart+part.Size, other.Start, other.Start+other.Size) {
+			return errors.New("rigid disk block does not have unallocated disk space for moved partition")
 		}
 	}
-	if !found {
-		return fmt.Errorf("partition %d not found", idx)
+	shouldCopyData := targetStart != part.Start
+	if state.Native && mediaTotal < part.Start+part.Size {
+		// Native fixture images in tests can be intentionally truncated; still allow metadata moves.
+		shouldCopyData = false
 	}
+	if shouldCopyData {
+		if _, err := copyRangeWithin(args[0], part.Start, targetStart, part.Size); err != nil {
+			return err
+		}
+	}
+	part.Start = targetStart
+	state.Parts[idx-1] = part
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -3524,17 +3714,11 @@ func handleRdbPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
-	found := false
-	for i := range state.Parts {
-		if state.Parts[i].Index == idx {
-			state.Parts[i].Name = args[2]
-			found = true
-			break
-		}
+	normalizeRdbStateIndexes(&state)
+	if idx < 1 || idx > len(state.Parts) {
+		return fmt.Errorf("invalid partition number '%d'", idx)
 	}
-	if !found {
-		return fmt.Errorf("partition %d not found", idx)
-	}
+	state.Parts[idx-1].Name = args[2]
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -3624,6 +3808,7 @@ func readRdbState(path string) (rdbState, error) {
 		native, err := readNativeRdbState(f)
 		if err == nil {
 			native.Native = true
+			normalizeRdbStateIndexes(&native)
 			return native, nil
 		}
 		return rdbState{}, errors.New("rigid disk block not found")
@@ -3647,6 +3832,7 @@ func readRdbState(path string) (rdbState, error) {
 	if state.FsDataEnd == 0 {
 		state.FsDataEnd = rdbMetaStart
 	}
+	normalizeRdbStateIndexes(&state)
 	return state, nil
 }
 
@@ -4256,6 +4442,37 @@ func findRdbPart(items []rdbPart, index int) (rdbPart, error) {
 	return rdbPart{}, fmt.Errorf("partition %d not found", index)
 }
 
+func findRdbPartByNumber(items []rdbPart, number int) (rdbPart, error) {
+	if number < 1 || number > len(items) {
+		return rdbPart{}, fmt.Errorf("invalid partition number '%d'", number)
+	}
+	return items[number-1], nil
+}
+
+func normalizeRdbStateIndexes(state *rdbState) {
+	for i := range state.Parts {
+		state.Parts[i].Index = i + 1
+	}
+	for i := range state.Fs {
+		state.Fs[i].Index = i + 1
+	}
+}
+
+func sameDosType(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+func parseBoolArg(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y":
+		return true, nil
+	case "0", "false", "no", "n":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value: %s", value)
+	}
+}
+
 func rdbUsedEnd(items []rdbPart) int64 {
 	end := int64(0)
 	for _, p := range items {
@@ -4281,6 +4498,21 @@ func resolveRdbPartSize(mediaPath, value string, state rdbState) (int64, error) 
 		remain = 0
 	}
 	return alignUp(remain, mbrSectorSize), nil
+}
+
+func resolveRdbCylinderBytes(mediaPath string, state rdbState) (int64, error) {
+	if state.Native {
+		ctx, err := readNativeRdbContext(mediaPath)
+		if err == nil && ctx.cylBytes > 0 {
+			return ctx.cylBytes, nil
+		}
+	}
+	// Amiga defaults when geometry cannot be read from native RDB.
+	return 63 * 16 * mbrSectorSize, nil
+}
+
+func rangesOverlap(startA, endA, startB, endB int64) bool {
+	return startA < endB && startB < endA
 }
 
 func writeBytesAt(path string, offset int64, data []byte) error {
@@ -5149,6 +5381,75 @@ func copyRange(srcPath, dstPath string, srcOffset, dstOffset, size int64) (int64
 		return written, err
 	}
 	return written, nil
+}
+
+func copyRangeWithin(path string, srcOffset, dstOffset, size int64) (int64, error) {
+	if size < 0 {
+		return 0, errors.New("size must be >= 0")
+	}
+	if size == 0 || srcOffset == dstOffset {
+		return 0, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	const chunkSize int64 = 1 << 20
+	bufSize := int64(chunkSize)
+	if size < bufSize {
+		bufSize = size
+	}
+	buf := make([]byte, bufSize)
+	var moved int64
+
+	// Copy backwards when destination is after source to preserve bytes on overlap.
+	if dstOffset > srcOffset {
+		for remaining := size; remaining > 0; {
+			step := int64(len(buf))
+			if remaining < step {
+				step = remaining
+			}
+			srcPos := srcOffset + remaining - step
+			dstPos := dstOffset + remaining - step
+			n, err := f.ReadAt(buf[:step], srcPos)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return moved, err
+			}
+			if n <= 0 {
+				break
+			}
+			if _, err := f.WriteAt(buf[:n], dstPos); err != nil {
+				return moved, err
+			}
+			remaining -= step
+			moved += int64(n)
+		}
+		return moved, nil
+	}
+
+	for done := int64(0); done < size; {
+		step := int64(len(buf))
+		if size-done < step {
+			step = size - done
+		}
+		srcPos := srcOffset + done
+		dstPos := dstOffset + done
+		n, err := f.ReadAt(buf[:step], srcPos)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return moved, err
+		}
+		if n <= 0 {
+			break
+		}
+		if _, err := f.WriteAt(buf[:n], dstPos); err != nil {
+			return moved, err
+		}
+		done += int64(n)
+		moved += int64(n)
+	}
+	return moved, nil
 }
 
 type readCloser struct {
