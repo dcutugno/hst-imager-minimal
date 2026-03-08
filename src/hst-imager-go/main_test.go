@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -343,8 +344,45 @@ func TestFsExtractXzInnerPathCaseInsensitiveWorksWithoutBsdtar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected extracted file test.txt: %v", err)
 	}
-	if !bytes.Equal(got, want) {
+	if !bytes.Equal(normalizeLineEndings(got), normalizeLineEndings(want)) {
 		t.Fatal("extracted xz file content mismatch")
+	}
+}
+
+func TestArchiveListLzwWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	lzwPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt.Z")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", lzwPath}, &out); err != nil {
+		t.Fatalf("archive list lzw without bsdtar failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "test.txt") {
+		t.Fatalf("unexpected lzw list output: %q", out.String())
+	}
+}
+
+func TestFsExtractLzwInnerPathCaseInsensitiveWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	lzwPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt.Z")
+	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt")
+	want, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out")
+	source := lzwPath + string(os.PathSeparator) + "TEST.TXT"
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", source, dest}, &out); err != nil {
+		t.Fatalf("fs extract lzw without bsdtar failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "test.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file test.txt: %v", err)
+	}
+	if !bytes.Equal(normalizeLineEndings(got), normalizeLineEndings(want)) {
+		t.Fatal("extracted lzw file content mismatch")
 	}
 }
 
@@ -655,6 +693,23 @@ func TestFsDirJsonSingleStreamXzReturnsEmptyEntries(t *testing.T) {
 	}
 }
 
+func TestFsDirJsonSingleStreamLzwReturnsEmptyEntries(t *testing.T) {
+	lzwPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt.Z")
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", lzwPath}, &out); err != nil {
+		t.Fatalf("fs dir json lzw failed: %v", err)
+	}
+	var payload struct {
+		Entries []json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json output: %v", err)
+	}
+	if len(payload.Entries) != 0 {
+		t.Fatalf("expected no entries for lzw single-stream source, got %d", len(payload.Entries))
+	}
+}
+
 func TestWriteFromXzCompressedSource(t *testing.T) {
 	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
 	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")
@@ -676,8 +731,34 @@ func TestWriteFromXzCompressedSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, want) {
+	if !bytes.Equal(normalizeLineEndings(got), normalizeLineEndings(want)) {
 		t.Fatal("written data does not match uncompressed xz content")
+	}
+}
+
+func TestWriteFromLzwCompressedSource(t *testing.T) {
+	lzwPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt.Z")
+	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt")
+	dest := filepath.Join(t.TempDir(), "out.txt")
+	want, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, make([]byte, len(want)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"write", lzwPath, dest}, &out); err != nil {
+		t.Fatalf("write from lzw source failed: %v", err)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(normalizeLineEndings(got), normalizeLineEndings(want)) {
+		t.Fatal("written data does not match uncompressed lzw content")
 	}
 }
 
@@ -810,6 +891,36 @@ func writeBzip2FileWithSystemTool(t *testing.T, path string, payload []byte) err
 		return err
 	}
 	return os.WriteFile(path, out, 0o644)
+}
+
+func normalizeLineEndings(data []byte) []byte {
+	return bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+}
+
+func writeLegacyBridgeStub(t *testing.T, dir, argsFile, marker string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "legacy.cmd")
+		script := strings.Join([]string{
+			"@echo off",
+			"setlocal EnableExtensions",
+			fmt.Sprintf("if exist \"%s\" del \"%s\"", argsFile, argsFile),
+			fmt.Sprintf("for %%%%A in (%%*) do >> \"%s\" echo %%%%~A", argsFile),
+			fmt.Sprintf("echo %s", marker),
+			"",
+		}, "\r\n")
+		if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	path := filepath.Join(dir, "legacy.sh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho %s\n", argsFile, marker)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestBlankInfoTransferCompareFlow(t *testing.T) {
@@ -2017,6 +2128,9 @@ func TestParseNativeVersionFromPfs3Binary(t *testing.T) {
 }
 
 func TestFsCopyWithUaeFsDbMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows does not allow '*' in local filenames")
+	}
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src")
 	dst := filepath.Join(tmp, "dst")
@@ -2068,6 +2182,9 @@ func TestFsCopyWithUaeFsDbMetadata(t *testing.T) {
 }
 
 func TestFsCopyWithUaeMetafileMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows does not allow '*' in local filenames")
+	}
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src")
 	dst := filepath.Join(tmp, "dst")
@@ -2522,11 +2639,7 @@ func TestFsCopyLegacyBridgePassthrough(t *testing.T) {
 	source := filepath.Join(tmp, "source")
 	destination := filepath.Join(tmp, "destination")
 	argsFile := filepath.Join(tmp, "args.txt")
-	legacyScript := filepath.Join(tmp, "legacy.sh")
-	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho legacy-ok\n", argsFile)
-	if err := os.WriteFile(legacyScript, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-ok")
 
 	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
 	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
@@ -2554,11 +2667,7 @@ func TestFsDirLegacyBridgeAddsJsonFormat(t *testing.T) {
 	tmp := t.TempDir()
 	diskPath := filepath.Join(tmp, "disk")
 	argsFile := filepath.Join(tmp, "args.txt")
-	legacyScript := filepath.Join(tmp, "legacy.sh")
-	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho legacy-dir\n", argsFile)
-	if err := os.WriteFile(legacyScript, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-dir")
 
 	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
 	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
@@ -2585,11 +2694,7 @@ func TestFsDirLegacyBridgeAddsJsonFormat(t *testing.T) {
 func TestLegacyBridgeForceRoutesSettingsCommand(t *testing.T) {
 	tmp := t.TempDir()
 	argsFile := filepath.Join(tmp, "args.txt")
-	legacyScript := filepath.Join(tmp, "legacy.sh")
-	script := fmt.Sprintf("#!/bin/sh\nprintf \"%%s\\n\" \"$@\" > %q\necho settings-legacy\n", argsFile)
-	if err := os.WriteFile(legacyScript, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "settings-legacy")
 
 	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
 	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)

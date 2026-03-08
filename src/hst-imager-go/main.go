@@ -630,11 +630,11 @@ func listWindowsDrives() ([]DriveInfo, error) {
 		return nil, err
 	}
 	type disk struct {
-		DeviceID      string `json:"DeviceID"`
-		Model         string `json:"Model"`
-		Size          string `json:"Size"`
-		MediaType     string `json:"MediaType"`
-		InterfaceType string `json:"InterfaceType"`
+		DeviceID      string          `json:"DeviceID"`
+		Model         string          `json:"Model"`
+		Size          json.RawMessage `json:"Size"`
+		MediaType     string          `json:"MediaType"`
+		InterfaceType string          `json:"InterfaceType"`
 	}
 	var many []disk
 	if err := json.Unmarshal(out, &many); err != nil {
@@ -650,10 +650,25 @@ func listWindowsDrives() ([]DriveInfo, error) {
 		if !isRemovable {
 			continue
 		}
-		sz, _ := strconv.ParseUint(strings.TrimSpace(d.Size), 10, 64)
+		sz, _ := parseWindowsDiskSize(d.Size)
 		drives = append(drives, DriveInfo{Path: d.DeviceID, Model: strings.TrimSpace(d.Model), Size: sz, Removable: true})
 	}
 	return drives, nil
+}
+
+func parseWindowsDiskSize(raw json.RawMessage) (uint64, error) {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return 0, nil
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return strconv.ParseUint(strings.TrimSpace(asString), 10, 64)
+	}
+	var asNumber json.Number
+	if err := json.Unmarshal(raw, &asNumber); err == nil {
+		return strconv.ParseUint(strings.TrimSpace(asNumber.String()), 10, 64)
+	}
+	return 0, fmt.Errorf("invalid windows disk size value: %s", string(raw))
 }
 
 func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -1126,7 +1141,7 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 func tryFsDirCompressedMediaEntries(path string) ([]fsDirLegacyStyleItem, bool, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
-	case ".rar", ".gz", ".xz", ".bz2":
+	case ".rar", ".gz", ".xz", ".bz2", ".z":
 	default:
 		return nil, false, nil
 	}
@@ -1178,7 +1193,7 @@ func tryFsDirCompressedMediaEntries(path string) ([]fsDirLegacyStyleItem, bool, 
 
 func isSingleStreamCompressedPath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".gz", ".xz", ".bz2":
+	case ".gz", ".xz", ".bz2", ".z":
 		return true
 	default:
 		return false
@@ -1707,7 +1722,7 @@ func resolveDestinationCapacity(path string) (int64, bool, error) {
 	}
 
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".gz", ".xz", ".bz2", ".zip":
+	case ".gz", ".xz", ".bz2", ".z", ".zip":
 		return 0, false, nil
 	default:
 		info, err := os.Stat(path)
@@ -1726,7 +1741,7 @@ func resolveSourceStreamSize(path string) (int64, bool, error) {
 	}
 
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".gz", ".xz", ".bz2":
+	case ".gz", ".xz", ".bz2", ".z":
 		return 0, false, nil
 	case ".zip":
 		zr, err := zip.OpenReader(path)
@@ -6490,6 +6505,7 @@ const (
 	archiveFormatGzip   archiveFormat = "gz"
 	archiveFormatXz     archiveFormat = "xz"
 	archiveFormatBzip2  archiveFormat = "bz2"
+	archiveFormatLzw    archiveFormat = "z"
 	archiveFormatLha    archiveFormat = "lha"
 	archiveFormatLzx    archiveFormat = "lzx"
 	archiveFormatRar    archiveFormat = "rar"
@@ -6558,6 +6574,12 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 			reader: bzip2.NewReader(f),
 			closer: f,
 		}, nil
+	case ".z":
+		data, err := decodeLzwFile(path)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
 	case ".zip":
 		zr, err := zip.OpenReader(path)
 		if err != nil {
@@ -6916,6 +6938,8 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		return listXzArchiveEntries(path)
 	case archiveFormatBzip2:
 		return listBzip2ArchiveEntries(path)
+	case archiveFormatLzw:
+		return listLzwArchiveEntries(path)
 	case archiveFormatLha:
 		items, err := listLhaArchiveEntries(path)
 		if err == nil {
@@ -7067,6 +7091,8 @@ func extractArchive(archivePath, innerPath, destination string) error {
 		return extractXzArchive(archivePath, innerPath, destination)
 	case archiveFormatBzip2:
 		return extractBzip2Archive(archivePath, innerPath, destination)
+	case archiveFormatLzw:
+		return extractLzwArchive(archivePath, innerPath, destination)
 	case archiveFormatLha:
 		if err := extractLhaArchive(archivePath, innerPath, destination); err == nil {
 			return nil
@@ -7164,6 +7190,8 @@ func detectArchiveFormat(path string) archiveFormat {
 		return archiveFormatXz
 	case strings.HasSuffix(lower, ".bz2"):
 		return archiveFormatBzip2
+	case strings.HasSuffix(lower, ".z"):
+		return archiveFormatLzw
 	case strings.HasSuffix(lower, ".lha"), strings.HasSuffix(lower, ".lzh"):
 		return archiveFormatLha
 	case strings.HasSuffix(lower, ".lzx"):
@@ -7324,6 +7352,153 @@ func listBzip2ArchiveEntries(path string) ([]archiveEntry, error) {
 	}}, nil
 }
 
+func listLzwArchiveEntries(path string) ([]archiveEntry, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return []archiveEntry{{
+		Name:  defaultSingleStreamArchiveEntryName(path, ".z"),
+		Size:  info.Size(),
+		IsDir: false,
+	}}, nil
+}
+
+func decodeLzwFile(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return decodeLzwData(b)
+}
+
+type lzwCodeReader struct {
+	data      []byte
+	bitOffset uint64
+	width     int
+}
+
+func (r *lzwCodeReader) readCode() (int, error) {
+	if r.width <= 0 {
+		return 0, io.EOF
+	}
+	totalBits := uint64(len(r.data)) * 8
+	if r.bitOffset+uint64(r.width) > totalBits {
+		return 0, io.EOF
+	}
+	code := 0
+	for i := 0; i < r.width; i++ {
+		bitPos := r.bitOffset + uint64(i)
+		if r.data[bitPos/8]&(1<<(bitPos%8)) != 0 {
+			code |= 1 << i
+		}
+	}
+	r.bitOffset += uint64(r.width)
+	return code, nil
+}
+
+func decodeLzwData(data []byte) ([]byte, error) {
+	if len(data) < 3 {
+		return nil, fmt.Errorf("invalid lzw stream size %d", len(data))
+	}
+	if data[0] != 0x1f || data[1] != 0x9d {
+		return nil, errors.New("invalid lzw header")
+	}
+
+	flags := data[2]
+	maxBits := int(flags & 0x1f)
+	if maxBits < 9 || maxBits > 16 {
+		return nil, fmt.Errorf("unsupported lzw maxbits %d", maxBits)
+	}
+	blockMode := flags&0x80 != 0
+
+	dict := make([][]byte, 1<<maxBits)
+	resetDict := func() {
+		for i := range dict {
+			dict[i] = nil
+		}
+		for i := 0; i < 256; i++ {
+			dict[i] = []byte{byte(i)}
+		}
+	}
+	resetDict()
+
+	nextCode := 256
+	clearCode := -1
+	if blockMode {
+		clearCode = 256
+		nextCode = 257
+	}
+
+	codeWidth := 9
+	reader := &lzwCodeReader{
+		data:  data[3:],
+		width: codeWidth,
+	}
+
+	out := make([]byte, 0, len(data)*2)
+	oldCode := -1
+	var finByte byte
+
+	for {
+		code, err := reader.readCode()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		if code < 0 || code >= len(dict) {
+			return nil, fmt.Errorf("invalid lzw code %d", code)
+		}
+
+		if blockMode && code == clearCode {
+			resetDict()
+			nextCode = 257
+			codeWidth = 9
+			reader.width = codeWidth
+			oldCode = -1
+			continue
+		}
+
+		var entry []byte
+		switch {
+		case code < nextCode && dict[code] != nil:
+			entry = dict[code]
+		case code == nextCode && oldCode >= 0 && oldCode < len(dict) && dict[oldCode] != nil:
+			prev := dict[oldCode]
+			entry = make([]byte, len(prev)+1)
+			copy(entry, prev)
+			entry[len(prev)] = finByte
+		default:
+			return nil, fmt.Errorf("invalid lzw code sequence: code=%d next=%d", code, nextCode)
+		}
+
+		out = append(out, entry...)
+		finByte = entry[0]
+
+		if oldCode != -1 && nextCode < len(dict) {
+			prev := dict[oldCode]
+			if prev == nil {
+				return nil, fmt.Errorf("invalid lzw dictionary reference %d", oldCode)
+			}
+			newEntry := make([]byte, len(prev)+1)
+			copy(newEntry, prev)
+			newEntry[len(prev)] = finByte
+			dict[nextCode] = newEntry
+			nextCode++
+			if nextCode >= (1<<codeWidth) && codeWidth < maxBits {
+				codeWidth++
+				reader.width = codeWidth
+			}
+		}
+
+		oldCode = code
+	}
+
+	return out, nil
+}
+
 func extractSingleStreamArchive(reader io.Reader, entryName, innerPath, destination string) error {
 	relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
 	if !ok || relPath == "" {
@@ -7396,6 +7571,19 @@ func extractBzip2Archive(archivePath, innerPath, destination string) error {
 	return extractSingleStreamArchive(
 		bzip2.NewReader(f),
 		defaultSingleStreamArchiveEntryName(archivePath, ".bz2"),
+		innerPath,
+		destination,
+	)
+}
+
+func extractLzwArchive(archivePath, innerPath, destination string) error {
+	data, err := decodeLzwFile(archivePath)
+	if err != nil {
+		return err
+	}
+	return extractSingleStreamArchive(
+		bytes.NewReader(data),
+		defaultSingleStreamArchiveEntryName(archivePath, ".z"),
 		innerPath,
 		destination,
 	)
