@@ -303,6 +303,118 @@ compare_compare_case() {
   pass_case "$name"
 }
 
+run_step_pair() {
+  local case_name="$1"
+  local step_name="$2"
+  local off_media="$3"
+  local force_media="$4"
+  shift 4
+
+  local off_args=()
+  local force_args=()
+  for arg in "$@"; do
+    if [[ "$arg" == "__MEDIA__" ]]; then
+      off_args+=("$off_media")
+      force_args+=("$force_media")
+    else
+      off_args+=("$arg")
+      force_args+=("$arg")
+    fi
+  done
+
+  local off_out="$TMP_DIR/${case_name}.${step_name}.off.out"
+  local off_err="$TMP_DIR/${case_name}.${step_name}.off.err"
+  local off_rc="$TMP_DIR/${case_name}.${step_name}.off.rc"
+  local force_out="$TMP_DIR/${case_name}.${step_name}.force.out"
+  local force_err="$TMP_DIR/${case_name}.${step_name}.force.err"
+  local force_rc="$TMP_DIR/${case_name}.${step_name}.force.rc"
+
+  run_mode off "$off_out" "$off_err" "$off_rc" "${off_args[@]}"
+  run_mode force "$force_out" "$force_err" "$force_rc" "${force_args[@]}"
+
+  if [[ "$(cat "$force_rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$force_out" "$force_err"; then
+    skip_case "$case_name" "legacy backend does not expose step '$step_name' in the published baseline"
+    return 2
+  fi
+  if ! diff -u "$off_rc" "$force_rc" >"$TMP_DIR/${case_name}.${step_name}.rc.diff"; then
+    fail_case "$case_name" "exit code mismatch at step '$step_name' (see $TMP_DIR/${case_name}.${step_name}.rc.diff)"
+    return 1
+  fi
+  return 0
+}
+
+compare_info_semantic_case() {
+  local name="$1"
+  local off_media="$2"
+  local force_media="$3"
+  local off_out="$TMP_DIR/${name}.off.info.out"
+  local off_err="$TMP_DIR/${name}.off.info.err"
+  local off_rc="$TMP_DIR/${name}.off.info.rc"
+  local force_out="$TMP_DIR/${name}.force.info.out"
+  local force_err="$TMP_DIR/${name}.force.info.err"
+  local force_rc="$TMP_DIR/${name}.force.info.rc"
+
+  run_mode off "$off_out" "$off_err" "$off_rc" --format json info "$off_media"
+  run_mode off "$force_out" "$force_err" "$force_rc" --format json info "$force_media"
+  if ! diff -u "$off_rc" "$force_rc" >"$TMP_DIR/${name}.info.rc.diff"; then
+    fail_case "$name" "info exit code mismatch (see $TMP_DIR/${name}.info.rc.diff)"
+    return
+  fi
+
+  if ! jq -S '{partitionTables:(.partitionTables // [] | sort), mbrParts:(if ((.partitionTables // []) | index("GPT")) != null then [] else (.mbr.parts // [] | map({index:(.index // 0), type:(.type // ""), start:(.start // 0), size:(.size // 0), name:(.name // ""), status:(.status // "")}) | sort_by(.index,.start,.size,.type,.name)) end), gptParts:(.gpt.parts // [] | map({index:(.index // 0), type:(.type // ""), start:(.start // 0), size:(.size // 0), name:(.name // ""), status:(.status // "")}) | sort_by(.index,.start,.size,.type,.name)), rdbParts:(.rdb.parts // [] | map({index:(.index // 0), type:(.type // ""), start:(.start // 0), size:(.size // 0), name:(.name // ""), status:(.status // "")}) | sort_by(.index,.start,.size,.type,.name))}' "$off_out" >"$off_out.norm"; then
+    fail_case "$name" "go info output is not valid json"
+    return
+  fi
+  if ! jq -S '{partitionTables:(.partitionTables // [] | sort), mbrParts:(if ((.partitionTables // []) | index("GPT")) != null then [] else (.mbr.parts // [] | map({index:(.index // 0), type:(.type // ""), start:(.start // 0), size:(.size // 0), name:(.name // ""), status:(.status // "")}) | sort_by(.index,.start,.size,.type,.name)) end), gptParts:(.gpt.parts // [] | map({index:(.index // 0), type:(.type // ""), start:(.start // 0), size:(.size // 0), name:(.name // ""), status:(.status // "")}) | sort_by(.index,.start,.size,.type,.name)), rdbParts:(.rdb.parts // [] | map({index:(.index // 0), type:(.type // ""), start:(.start // 0), size:(.size // 0), name:(.name // ""), status:(.status // "")}) | sort_by(.index,.start,.size,.type,.name))}' "$force_out" >"$force_out.norm"; then
+    fail_case "$name" "force image info output is not valid json"
+    return
+  fi
+  if ! diff -u "$off_out.norm" "$force_out.norm" >"$TMP_DIR/${name}.info.json.diff"; then
+    fail_case "$name" "info semantic mismatch (see $TMP_DIR/${name}.info.json.diff)"
+    return
+  fi
+
+  pass_case "$name"
+}
+
+run_partition_workflow_cases() {
+  local name
+  local off_media
+  local force_media
+  local rc
+
+  name="partition-mbr-basic"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 32MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "initialize" "$off_media" "$force_media" mbr initialize "__MEDIA__"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" mbr part add "__MEDIA__" fat32 4MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+
+  name="partition-gpt-basic"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 32MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "initialize" "$off_media" "$force_media" gpt initialize "__MEDIA__"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" gpt part add "__MEDIA__" ntfs DATA 4MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+
+  name="partition-rdb-init"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 64MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "initialize" "$off_media" "$force_media" rdb initialize "__MEDIA__"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+}
+
 echo "Running output parity checks"
 compare_fs_dir_json_case "fs-dir-json-lha-amiga" "$LHA_AMIGA"
 compare_fs_dir_json_case "fs-dir-json-lzx-amiga" "$LZX_AMIGA"
@@ -328,6 +440,9 @@ printf 'abcde12345' >"$TMP_DIR/compare-b-equal.bin"
 printf 'abcXY12345' >"$TMP_DIR/compare-b-diff.bin"
 compare_compare_case "compare-size5-identical" "0" "$TMP_DIR/compare-a.bin" "$TMP_DIR/compare-b-equal.bin" "5"
 compare_compare_case "compare-size5-mismatch" "1" "$TMP_DIR/compare-a.bin" "$TMP_DIR/compare-b-diff.bin" "5"
+
+echo "Running partition workflow parity checks"
+run_partition_workflow_cases
 
 echo "Summary: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 if [[ "$FAIL" -ne 0 ]]; then

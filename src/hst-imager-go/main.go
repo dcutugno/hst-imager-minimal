@@ -2553,7 +2553,10 @@ func handleGptInitialize(args []string, stdout io.Writer, opts GlobalOptions) er
 
 func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 3 {
-		return errors.New("usage: gpt part add <media> <type> <size|*>")
+		return errors.New("usage: gpt part add <media> <type> <size|*> OR gpt part add <media> <type> <name> <size|*>")
+	}
+	if len(args) > 4 {
+		return errors.New("usage: gpt part add <media> <type> <size|*> OR gpt part add <media> <type> <name> <size|*>")
 	}
 	header, parts, err := readGpt(args[0])
 	if err != nil {
@@ -2563,7 +2566,14 @@ func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	if err != nil {
 		return err
 	}
-	sizeBytes, err := resolveGptPartSize(args[0], args[2], header, parts)
+	partName := args[1]
+	sizeArg := args[2]
+	if len(args) == 4 {
+		// Compatibility with legacy backend argument order: <type> <name> <size>.
+		partName = args[2]
+		sizeArg = args[3]
+	}
+	sizeBytes, err := resolveGptPartSize(args[0], sizeArg, header, parts)
 	if err != nil {
 		return err
 	}
@@ -2595,7 +2605,7 @@ func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 		UniqueGUID: unique,
 		FirstLBA:   startLBA,
 		LastLBA:    endLBA,
-		Name:       args[1],
+		Name:       partName,
 	}
 	parts = append(parts, entry)
 	if err := writeGpt(args[0], header, parts); err != nil {

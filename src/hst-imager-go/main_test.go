@@ -712,6 +712,32 @@ func TestFsBlockOptimizeAndAdfCommands(t *testing.T) {
 	}
 }
 
+func TestGptPartAddSupportsLegacyNameArgumentOrder(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "gpt-legacy-args.img")
+
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "16MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"gpt", "initialize", media}, &out); err != nil {
+		t.Fatalf("gpt initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"gpt", "part", "add", media, "linux", "DATA", "1MB"}, &out); err != nil {
+		t.Fatalf("gpt part add legacy syntax failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatalf("gpt info failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "\"name\": \"DATA\"") {
+		t.Fatalf("expected GPT partition name DATA in info output, got: %q", out.String())
+	}
+}
+
 func TestMbrLowLevelBinaryParity(t *testing.T) {
 	tmp := t.TempDir()
 	mediaA := filepath.Join(tmp, "disk-a.img")
