@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -344,6 +345,49 @@ func TestFsExtractXzInnerPathCaseInsensitiveWorksWithoutBsdtar(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("extracted xz file content mismatch")
+	}
+}
+
+func TestArchiveListBzip2WorksWithoutBsdtar(t *testing.T) {
+	tmp := t.TempDir()
+	bz2Path := filepath.Join(tmp, "sample.bin.bz2")
+	payload := []byte("hello bzip2")
+	if err := writeBzip2FileWithSystemTool(t, bz2Path, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", "")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", bz2Path}, &out); err != nil {
+		t.Fatalf("archive list bzip2 without bsdtar failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "sample.bin") {
+		t.Fatalf("unexpected bzip2 list output: %q", out.String())
+	}
+}
+
+func TestFsExtractBzip2InnerPathCaseInsensitiveWorksWithoutBsdtar(t *testing.T) {
+	tmp := t.TempDir()
+	bz2Path := filepath.Join(tmp, "sample.bin.bz2")
+	payload := []byte("hello bzip2")
+	if err := writeBzip2FileWithSystemTool(t, bz2Path, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", "")
+	dest := filepath.Join(tmp, "out")
+	source := bz2Path + string(os.PathSeparator) + "SAMPLE.BIN"
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", source, dest}, &out); err != nil {
+		t.Fatalf("fs extract bzip2 without bsdtar failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "sample.bin"))
+	if err != nil {
+		t.Fatalf("expected extracted file sample.bin: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("unexpected extracted content: %q", string(got))
 	}
 }
 
@@ -752,6 +796,20 @@ func writeGzipFileWithName(path, name string, payload []byte) error {
 		return err
 	}
 	return gw.Close()
+}
+
+func writeBzip2FileWithSystemTool(t *testing.T, path string, payload []byte) error {
+	t.Helper()
+	if _, err := exec.LookPath("bzip2"); err != nil {
+		t.Skipf("bzip2 tool not available: %v", err)
+	}
+	cmd := exec.Command("bzip2", "-c")
+	cmd.Stdin = bytes.NewReader(payload)
+	out, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
 }
 
 func TestBlankInfoTransferCompareFlow(t *testing.T) {

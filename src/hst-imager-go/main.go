@@ -1126,7 +1126,7 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 func tryFsDirCompressedMediaEntries(path string) ([]fsDirLegacyStyleItem, bool, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
-	case ".rar", ".gz", ".xz":
+	case ".rar", ".gz", ".xz", ".bz2":
 	default:
 		return nil, false, nil
 	}
@@ -1178,7 +1178,7 @@ func tryFsDirCompressedMediaEntries(path string) ([]fsDirLegacyStyleItem, bool, 
 
 func isSingleStreamCompressedPath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".gz", ".xz":
+	case ".gz", ".xz", ".bz2":
 		return true
 	default:
 		return false
@@ -1707,7 +1707,7 @@ func resolveDestinationCapacity(path string) (int64, bool, error) {
 	}
 
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".gz", ".xz", ".zip":
+	case ".gz", ".xz", ".bz2", ".zip":
 		return 0, false, nil
 	default:
 		info, err := os.Stat(path)
@@ -1726,7 +1726,7 @@ func resolveSourceStreamSize(path string) (int64, bool, error) {
 	}
 
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".gz", ".xz":
+	case ".gz", ".xz", ".bz2":
 		return 0, false, nil
 	case ".zip":
 		zr, err := zip.OpenReader(path)
@@ -6489,6 +6489,7 @@ const (
 	archiveFormatTarBz2 archiveFormat = "tarbz2"
 	archiveFormatGzip   archiveFormat = "gz"
 	archiveFormatXz     archiveFormat = "xz"
+	archiveFormatBzip2  archiveFormat = "bz2"
 	archiveFormatLha    archiveFormat = "lha"
 	archiveFormatLzx    archiveFormat = "lzx"
 	archiveFormatRar    archiveFormat = "rar"
@@ -6546,6 +6547,15 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 		}
 		return &readCloser{
 			reader: xzr,
+			closer: f,
+		}, nil
+	case ".bz2":
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		return &readCloser{
+			reader: bzip2.NewReader(f),
 			closer: f,
 		}, nil
 	case ".zip":
@@ -6904,6 +6914,8 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		return listGzipArchiveEntries(path)
 	case archiveFormatXz:
 		return listXzArchiveEntries(path)
+	case archiveFormatBzip2:
+		return listBzip2ArchiveEntries(path)
 	case archiveFormatLha:
 		items, err := listLhaArchiveEntries(path)
 		if err == nil {
@@ -7053,6 +7065,8 @@ func extractArchive(archivePath, innerPath, destination string) error {
 		return extractGzipArchive(archivePath, innerPath, destination)
 	case archiveFormatXz:
 		return extractXzArchive(archivePath, innerPath, destination)
+	case archiveFormatBzip2:
+		return extractBzip2Archive(archivePath, innerPath, destination)
 	case archiveFormatLha:
 		if err := extractLhaArchive(archivePath, innerPath, destination); err == nil {
 			return nil
@@ -7148,6 +7162,8 @@ func detectArchiveFormat(path string) archiveFormat {
 		return archiveFormatGzip
 	case strings.HasSuffix(lower, ".xz"):
 		return archiveFormatXz
+	case strings.HasSuffix(lower, ".bz2"):
+		return archiveFormatBzip2
 	case strings.HasSuffix(lower, ".lha"), strings.HasSuffix(lower, ".lzh"):
 		return archiveFormatLha
 	case strings.HasSuffix(lower, ".lzx"):
@@ -7290,6 +7306,24 @@ func listXzArchiveEntries(path string) ([]archiveEntry, error) {
 	}}, nil
 }
 
+func listBzip2ArchiveEntries(path string) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	size, err := io.Copy(io.Discard, bzip2.NewReader(f))
+	if err != nil {
+		return nil, err
+	}
+	return []archiveEntry{{
+		Name:  defaultSingleStreamArchiveEntryName(path, ".bz2"),
+		Size:  size,
+		IsDir: false,
+	}}, nil
+}
+
 func extractSingleStreamArchive(reader io.Reader, entryName, innerPath, destination string) error {
 	relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
 	if !ok || relPath == "" {
@@ -7350,6 +7384,21 @@ func extractXzArchive(archivePath, innerPath, destination string) error {
 
 	entryName := defaultSingleStreamArchiveEntryName(archivePath, ".xz")
 	return extractSingleStreamArchive(xzr, entryName, innerPath, destination)
+}
+
+func extractBzip2Archive(archivePath, innerPath, destination string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return extractSingleStreamArchive(
+		bzip2.NewReader(f),
+		defaultSingleStreamArchiveEntryName(archivePath, ".bz2"),
+		innerPath,
+		destination,
+	)
 }
 
 func extractTarArchive(archivePath, innerPath, destination string, gzipped bool) error {
