@@ -435,6 +435,23 @@ func TestOpenSourceReaderRarMatchesZipPrefix(t *testing.T) {
 	}
 }
 
+func TestFsDirJsonSingleStreamXzReturnsEmptyEntries(t *testing.T) {
+	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", xzPath}, &out); err != nil {
+		t.Fatalf("fs dir json xz failed: %v", err)
+	}
+	var payload struct {
+		Entries []json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json output: %v", err)
+	}
+	if len(payload.Entries) != 0 {
+		t.Fatalf("expected no entries for xz single-stream source, got %d", len(payload.Entries))
+	}
+}
+
 func TestWriteFromXzCompressedSource(t *testing.T) {
 	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
 	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")

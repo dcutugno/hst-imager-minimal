@@ -262,6 +262,7 @@ echo "Running output parity checks"
 compare_fs_dir_json_case "fs-dir-json-lha-amiga" "$LHA_AMIGA"
 compare_fs_dir_json_case "fs-dir-json-lzx-amiga" "$LZX_AMIGA"
 compare_fs_dir_json_case "fs-dir-json-rar-img" "$RAR_IMG"
+compare_fs_dir_json_case "fs-dir-json-xz-text" "$XZ_SMALL"
 
 echo "Running extraction parity checks"
 compare_extract_case "extract-lha-amiga" "$LHA_AMIGA"

@@ -663,6 +663,13 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 				}
 				return nil
 			}
+			if isSingleStreamCompressedPath(archivePath) {
+				if opts.Format == "json" {
+					return writeJSON(stdout, map[string]any{"path": archivePath, "entries": []fsDirLegacyStyleItem{}})
+				}
+				fmt.Fprintln(stdout, "No entries.")
+				return nil
+			}
 		}
 		return handleFsDirArchive(archivePath, innerPath, stdout, opts)
 	}
@@ -1122,6 +1129,15 @@ func tryFsDirCompressedMediaEntries(path string) ([]fsDirLegacyStyleItem, bool, 
 			Size: size,
 		},
 	}, true, nil
+}
+
+func isSingleStreamCompressedPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".gz", ".xz":
+		return true
+	default:
+		return false
+	}
 }
 
 func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opts GlobalOptions) error {
