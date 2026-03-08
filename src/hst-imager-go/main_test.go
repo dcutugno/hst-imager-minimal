@@ -589,7 +589,7 @@ func TestAdvancedCommandFamilies(t *testing.T) {
 	if err := run([]string{"mbr", "init", media}, &out); err != nil {
 		t.Fatalf("mbr init failed: %v", err)
 	}
-	if err := run([]string{"mbr", "part", "add", media, "FAT32", "1KB"}, &out); err != nil {
+	if err := run([]string{"mbr", "part", "add", media, "NTFS", "1KB"}, &out); err != nil {
 		t.Fatalf("mbr part add failed: %v", err)
 	}
 	if err := run([]string{"mbr", "part", "format", media, "1", "PC"}, &out); err != nil {
@@ -735,6 +735,65 @@ func TestGptPartAddSupportsLegacyNameArgumentOrder(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "\"name\": \"DATA\"") {
 		t.Fatalf("expected GPT partition name DATA in info output, got: %q", out.String())
+	}
+}
+
+func TestMbrPartFormatFat32RequiresMinimumSectors(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "mbr-fat32-min.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "32MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "4MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"mbr", "part", "format", media, "1", "PC"}, &out)
+	if err == nil {
+		t.Fatal("expected mbr part format to fail for too-small FAT32 partition")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "fat32 requires a minimum") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGptPartFormatSupportsLegacyTypeAndName(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "gpt-format-legacy.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "64MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "initialize", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "part", "add", media, "ntfs", "DATA", "32MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "part", "format", media, "1", "ntfs", "VOL"}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Parts []Part `json:"parts"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Parts) != 1 {
+		t.Fatalf("expected one GPT partition, got %d", len(payload.Parts))
+	}
+	if payload.Parts[0].Name != "DATA" {
+		t.Fatalf("expected GPT partition name to remain DATA, got %q", payload.Parts[0].Name)
 	}
 }
 

@@ -2193,6 +2193,10 @@ func handleMbrPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
+	// Align with legacy formatter constraints for FAT32 partitions.
+	if (p.TypeCode == 0x0b || p.TypeCode == 0x0c) && p.SectorCount < 65536 {
+		return fmt.Errorf("partition has %d sectors and FAT32 requires a minimum of 65536 sectors", p.SectorCount)
+	}
 	part := mbrPartitionToPart(p)
 	part.Name = args[2]
 	return printSimpleStatus(stdout, opts, "mbr partition format requested", part)
@@ -2652,7 +2656,10 @@ func handleGptPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 
 func handleGptPartFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 3 {
-		return errors.New("usage: gpt part format <media> <index> <label>")
+		return errors.New("usage: gpt part format <media> <index> <label> OR gpt part format <media> <index> <exfat|fat32|ntfs> <label>")
+	}
+	if len(args) > 4 {
+		return errors.New("usage: gpt part format <media> <index> <label> OR gpt part format <media> <index> <exfat|fat32|ntfs> <label>")
 	}
 	idx, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -2662,10 +2669,29 @@ func handleGptPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if err != nil {
 		return err
 	}
+	label := args[2]
+	var partTypeGUID [16]byte
+	updateType := false
+	updateName := true
+	if len(args) == 4 {
+		partTypeGUID, err = parseGptPartFormatType(args[2])
+		if err != nil {
+			return err
+		}
+		label = args[3]
+		updateType = true
+		// Legacy formatter treats <name> as filesystem volume label, not GPT partition name.
+		updateName = false
+	}
 	found := false
 	for i := range parts {
 		if parts[i].Index == idx {
-			parts[i].Name = args[2]
+			if updateType {
+				parts[i].TypeGUID = partTypeGUID
+			}
+			if updateName {
+				parts[i].Name = label
+			}
 			found = true
 			break
 		}
@@ -2677,6 +2703,15 @@ func handleGptPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "gpt partition formatted", idx)
+}
+
+func parseGptPartFormatType(value string) ([16]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "exfat", "fat32", "ntfs":
+		return parseGptTypeGUID("ntfs")
+	default:
+		return [16]byte{}, fmt.Errorf("unsupported GPT format type '%s' (supported: exfat, fat32, ntfs)", value)
+	}
 }
 
 func initializeGpt(path string) error {

@@ -409,6 +409,19 @@ run_partition_workflow_cases() {
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
 
+  name="partition-mbr-format-fat32-small"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 32MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "initialize" "$off_media" "$force_media" mbr initialize "__MEDIA__"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" mbr part add "__MEDIA__" fat32 4MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-format" "$off_media" "$force_media" mbr part format "__MEDIA__" 1 PC; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+
   name="partition-gpt-basic"
   off_media="$TMP_DIR/${name}.off.img"
   force_media="$TMP_DIR/${name}.force.img"
@@ -432,6 +445,19 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "part-add-2" "$off_media" "$force_media" gpt part add "__MEDIA__" ntfs DATA2 4MB; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   run_step_pair "$name" "part-delete-1" "$off_media" "$force_media" gpt part delete "__MEDIA__" 1; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+
+  name="partition-gpt-format-ntfs"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 64MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "initialize" "$off_media" "$force_media" gpt initialize "__MEDIA__"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" gpt part add "__MEDIA__" ntfs DATA 32MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-format" "$off_media" "$force_media" gpt part format "__MEDIA__" 1 ntfs VOL; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
 
