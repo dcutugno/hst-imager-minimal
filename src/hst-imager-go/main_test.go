@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -1522,6 +1523,37 @@ func TestRdbFsDeleteFailsWhenPartitionUsesFileSystem(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "uses file system number") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNativeRdbFsUpdatePathMutatesImage(t *testing.T) {
+	src := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "rigid-disk-block.img")
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "native-rdb-fs-update.img")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(media, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := sha256.Sum256(b)
+
+	fsPayload := filepath.Join(tmp, "newfs.bin")
+	if err := os.WriteFile(fsPayload, []byte("ABCDEF1234567890"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run([]string{"rdb", "filesystem", "update", media, "1", "--path", fsPayload}, &out); err != nil {
+		t.Fatalf("rdb filesystem update --path failed: %v", err)
+	}
+	afterBytes, err := os.ReadFile(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := sha256.Sum256(afterBytes)
+	if before == after {
+		t.Fatal("expected native rdb image to change after filesystem update --path")
 	}
 }
 

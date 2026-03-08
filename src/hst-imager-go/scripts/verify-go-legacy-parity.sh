@@ -532,6 +532,29 @@ run_partition_workflow_cases() {
   compare_info_semantic_case "$name" "$off_media" "$force_media"
   compare_media_hash_case "$name" "$off_media" "$force_media"
 
+  name="partition-rdb-fsupdate-path"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  seed_media="$TMP_DIR/${name}.seed.img"
+  fs_payload="$TMP_DIR/${name}.payload.bin"
+  printf 'ABCDEF1234567890' >"$fs_payload"
+  run_mode force "$TMP_DIR/${name}.seed.blank.out" "$TMP_DIR/${name}.seed.blank.err" "$TMP_DIR/${name}.seed.blank.rc" blank "$seed_media" 64MB
+  run_mode force "$TMP_DIR/${name}.seed.init.out" "$TMP_DIR/${name}.seed.init.err" "$TMP_DIR/${name}.seed.init.rc" rdb initialize "$seed_media"
+  if [[ "$(cat "$TMP_DIR/${name}.seed.init.rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$TMP_DIR/${name}.seed.init.out" "$TMP_DIR/${name}.seed.init.err"; then
+    skip_case "$name" "legacy backend does not expose rdb initialize in the published baseline"
+    return
+  fi
+  cp "$seed_media" "$off_media"
+  cp "$seed_media" "$force_media"
+  run_step_pair "$name" "fs-add" "$off_media" "$force_media" rdb filesystem add "__MEDIA__" "$PFS3_AIO" PDS3; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" rdb part add "__MEDIA__" DH0 PDS3 8MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "fs-update-path" "$off_media" "$force_media" rdb filesystem update "__MEDIA__" 1 --path "$fs_payload"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
+
   name="partition-rdb-partupdate-move"
   off_media="$TMP_DIR/${name}.off.img"
   force_media="$TMP_DIR/${name}.force.img"
@@ -551,6 +574,27 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "part-update" "$off_media" "$force_media" rdb part update "__MEDIA__" 1 --name SYS --no-mount true; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   run_step_pair "$name" "part-move" "$off_media" "$force_media" rdb part move "__MEDIA__" 1 2; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
+
+  name="partition-rdb-part-kill"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  seed_media="$TMP_DIR/${name}.seed.img"
+  run_mode force "$TMP_DIR/${name}.seed.blank.out" "$TMP_DIR/${name}.seed.blank.err" "$TMP_DIR/${name}.seed.blank.rc" blank "$seed_media" 64MB
+  run_mode force "$TMP_DIR/${name}.seed.init.out" "$TMP_DIR/${name}.seed.init.err" "$TMP_DIR/${name}.seed.init.rc" rdb initialize "$seed_media"
+  if [[ "$(cat "$TMP_DIR/${name}.seed.init.rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$TMP_DIR/${name}.seed.init.out" "$TMP_DIR/${name}.seed.init.err"; then
+    skip_case "$name" "legacy backend does not expose rdb initialize in the published baseline"
+    return
+  fi
+  cp "$seed_media" "$off_media"
+  cp "$seed_media" "$force_media"
+  run_step_pair "$name" "fs-add" "$off_media" "$force_media" rdb filesystem add "__MEDIA__" "$PFS3_AIO" PDS3; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" rdb part add "__MEDIA__" DH0 PDS3 8MB; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-kill" "$off_media" "$force_media" rdb part kill "__MEDIA__" 1 00000000; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
   compare_media_hash_case "$name" "$off_media" "$force_media"

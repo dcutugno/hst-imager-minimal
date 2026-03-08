@@ -3306,27 +3306,29 @@ func handleRdbFsUpdate(args []string, stdout io.Writer, opts GlobalOptions) erro
 		}
 	}
 	if fsPath != "" {
+		if state.Native {
+			if err := updateNativeFileSystem(args[0], idx, dosType, name, fsPath); err != nil {
+				return err
+			}
+			return printSimpleStatus(stdout, opts, "rdb filesystem updated", idx)
+		}
 		b, err := os.ReadFile(fsPath)
 		if err != nil {
 			return err
 		}
-		if state.Native {
-			target.DataSize = int64(len(b))
-		} else {
-			offset := target.DataOffset
-			if offset <= 0 || int64(len(b)) > target.DataSize {
-				offset = alignUp(state.FsDataEnd, mbrSectorSize)
-				if offset+int64(len(b)) > state.RdbSize {
-					return errors.New("rdb has insufficient space for filesystem binary, resize rdb first")
-				}
-				state.FsDataEnd = offset + int64(len(b))
+		offset := target.DataOffset
+		if offset <= 0 || int64(len(b)) > target.DataSize {
+			offset = alignUp(state.FsDataEnd, mbrSectorSize)
+			if offset+int64(len(b)) > state.RdbSize {
+				return errors.New("rdb has insufficient space for filesystem binary, resize rdb first")
 			}
-			if err := writeBytesAt(args[0], offset, b); err != nil {
-				return err
-			}
-			target.DataOffset = offset
-			target.DataSize = int64(len(b))
+			state.FsDataEnd = offset + int64(len(b))
 		}
+		if err := writeBytesAt(args[0], offset, b); err != nil {
+			return err
+		}
+		target.DataOffset = offset
+		target.DataSize = int64(len(b))
 	}
 	state.Fs[idx-1] = target
 	if dosType != "" && !sameDosType(oldDosType, dosType) {
@@ -3915,12 +3917,11 @@ func addNativeFileSystem(mediaPath, fileSystemPath, dosType string) (rdbFileSyst
 	if err != nil {
 		return rdbFileSystem{}, err
 	}
-
-	maxIdx, err := maxNativeBlockIndexIncludingLoadSeg(f, ctx)
+	loadSegChains, err := readNativeLoadSegChainsFromContext(f, ctx)
 	if err != nil {
 		return rdbFileSystem{}, err
 	}
-	fsBlockIdx := maxIdx + 1
+
 	major, minor := parseNativeVersion(payload)
 	fsName := filepath.Base(fileSystemPath)
 	if dosType == "" {
@@ -3933,38 +3934,20 @@ func addNativeFileSystem(mediaPath, fileSystemPath, dosType string) (rdbFileSyst
 	writeBeU16(fsBlock, 0x26, uint16(minor))
 	writeBeU32(fsBlock, 0x28, 0x180)
 	writeAsciiCString(fsBlock, 0xac, fsName)
-
-	loadSegBlocks, err := buildNativeLoadSegBlocks(ctx.blockSize, payload, fsBlockIdx+1)
+	loadSegBlocks, err := buildNativeLoadSegBlocks(ctx.blockSize, payload, 0)
 	if err != nil {
 		return rdbFileSystem{}, err
 	}
-	firstLoadSeg := int32(-1)
-	if len(loadSegBlocks) > 0 {
-		firstLoadSeg = loadSegBlocks[0].blockIndex
-	}
-	writeBeU32(fsBlock, 0x48, uint32(firstLoadSeg))
+	writeBeU32(fsBlock, 0x48, ^uint32(0))
 	writeBeU32(fsBlock, 0x4c, ^uint32(0))
 	updateAmigaBlockChecksum(fsBlock)
 
-	ctx.fsBlocks = append(ctx.fsBlocks, nativeRdbChainBlock{blockIndex: fsBlockIdx, block: fsBlock})
-	for i := 0; i < len(ctx.fsBlocks); i++ {
-		next := int32(-1)
-		if i+1 < len(ctx.fsBlocks) {
-			next = ctx.fsBlocks[i+1].blockIndex
-		}
-		writeBeU32(ctx.fsBlocks[i].block, 0x10, uint32(next))
-		updateAmigaBlockChecksum(ctx.fsBlocks[i].block)
-	}
-
-	for _, loadSeg := range loadSegBlocks {
-		updateAmigaBlockChecksum(loadSeg.block)
-		if _, err := f.WriteAt(loadSeg.block, int64(loadSeg.blockIndex)*ctx.blockSize); err != nil {
-			return rdbFileSystem{}, err
-		}
-	}
-	if err := writeNativeRdbContextCompactToFile(f, ctx); err != nil {
+	ctx.fsBlocks = append(ctx.fsBlocks, nativeRdbChainBlock{block: fsBlock})
+	loadSegChains = append(loadSegChains, loadSegBlocks)
+	if err := writeNativeRdbContextCompactWithLoadSegChains(f, ctx, loadSegChains); err != nil {
 		return rdbFileSystem{}, err
 	}
+
 	state, err := readRdbState(mediaPath)
 	if err != nil {
 		return rdbFileSystem{}, err
@@ -3986,29 +3969,57 @@ func addNativeFileSystem(mediaPath, fileSystemPath, dosType string) (rdbFileSyst
 	}, nil
 }
 
-func maxNativeBlockIndexIncludingLoadSeg(f *os.File, ctx nativeRdbContext) (int32, error) {
-	maxIdx := maxNativeBlockIndex(&ctx)
-	visited := map[int32]bool{}
-	for _, fs := range ctx.fsBlocks {
-		for ptr := int32(readBeU32(fs.block, 0x48)); ptr >= 0; {
-			if visited[ptr] {
-				break
+func updateNativeFileSystem(mediaPath string, fsNumber int, dosType, name, fsPath string) error {
+	f, err := os.OpenFile(mediaPath, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	ctx, err := readNativeRdbContextFromFile(f)
+	if err != nil {
+		return err
+	}
+	if fsNumber < 1 || fsNumber > len(ctx.fsBlocks) {
+		return fmt.Errorf("invalid file system number '%d'", fsNumber)
+	}
+	loadSegChains, err := readNativeLoadSegChainsFromContext(f, ctx)
+	if err != nil {
+		return err
+	}
+
+	fsBlock := ctx.fsBlocks[fsNumber-1].block
+	oldDosType := formatDosTypeField(fsBlock[0x20:0x24])
+	if dosType != "" {
+		writeDosTypeField(fsBlock, 0x20, dosType)
+	}
+	if name != "" {
+		writeAsciiCString(fsBlock, 0xac, name)
+	}
+	if fsPath != "" {
+		payload, err := os.ReadFile(fsPath)
+		if err != nil {
+			return err
+		}
+		blocks, err := buildNativeLoadSegBlocks(ctx.blockSize, payload, 0)
+		if err != nil {
+			return err
+		}
+		loadSegChains[fsNumber-1] = blocks
+	}
+	updateAmigaBlockChecksum(fsBlock)
+
+	if dosType != "" && !sameDosType(oldDosType, dosType) {
+		for i := range ctx.partBlocks {
+			part := ctx.partBlocks[i].block
+			if sameDosType(formatDosTypeField(part[0xc0:0xc4]), oldDosType) {
+				writeDosTypeField(part, 0xc0, dosType)
+				updateAmigaBlockChecksum(part)
 			}
-			visited[ptr] = true
-			if ptr > maxIdx {
-				maxIdx = ptr
-			}
-			block, err := readBlockAt(f, int64(ptr)*ctx.blockSize, int(ctx.blockSize))
-			if err != nil {
-				return maxIdx, err
-			}
-			if string(block[:4]) != "LSEG" {
-				break
-			}
-			ptr = int32(readBeU32(block, 0x10))
 		}
 	}
-	return maxIdx, nil
+
+	return writeNativeRdbContextCompactWithLoadSegChains(f, ctx, loadSegChains)
 }
 
 func buildNativeLoadSegBlocks(blockSize int64, payload []byte, startIndex int32) ([]nativeRdbChainBlock, error) {
@@ -4359,7 +4370,14 @@ func applyNativeFsState(ctx *nativeRdbContext, state rdbState) error {
 }
 
 func writeNativeRdbContextCompactToFile(f *os.File, ctx nativeRdbContext) error {
-	// Read current LSEG chains referenced by current FSHD blocks.
+	loadSegChains, err := readNativeLoadSegChainsFromContext(f, ctx)
+	if err != nil {
+		return err
+	}
+	return writeNativeRdbContextCompactWithLoadSegChains(f, ctx, loadSegChains)
+}
+
+func readNativeLoadSegChainsFromContext(f *os.File, ctx nativeRdbContext) ([][]nativeRdbChainBlock, error) {
 	loadSegChains := make([][]nativeRdbChainBlock, len(ctx.fsBlocks))
 	for i, fs := range ctx.fsBlocks {
 		start := int32(readBeU32(fs.block, 0x48))
@@ -4368,11 +4386,20 @@ func writeNativeRdbContextCompactToFile(f *os.File, ctx nativeRdbContext) error 
 		}
 		blocks, err := readNativeChainBlocks(f, ctx.blockSize, start, "LSEG")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		loadSegChains[i] = blocks
 	}
+	return loadSegChains, nil
+}
 
+func writeNativeRdbContextCompactWithLoadSegChains(f *os.File, ctx nativeRdbContext, loadSegChains [][]nativeRdbChainBlock) error {
+	if len(loadSegChains) < len(ctx.fsBlocks) {
+		padding := make([][]nativeRdbChainBlock, len(ctx.fsBlocks)-len(loadSegChains))
+		loadSegChains = append(loadSegChains, padding...)
+	} else if len(loadSegChains) > len(ctx.fsBlocks) {
+		loadSegChains = loadSegChains[:len(ctx.fsBlocks)]
+	}
 	// Reassign contiguous metadata block indexes in legacy order: PART, FSHD, LSEG...
 	nextIndex := int32(1)
 	for i := range ctx.partBlocks {
