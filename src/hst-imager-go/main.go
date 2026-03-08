@@ -4032,27 +4032,6 @@ func initializeRdb(path string) error {
 	if total <= 0 {
 		return errors.New("media too small for rdb")
 	}
-	// Keep legacy custom-state behavior for small images used by compatibility tests.
-	// Native RDSK init is required for byte-level legacy parity on normal-sized media.
-	if total < 64*1024*1024 {
-		rdbSize := int64(1 * 1024 * 1024)
-		if rdbSize > total/4 {
-			rdbSize = alignUp(total/4, mbrSectorSize)
-		}
-		if rdbSize < rdbMetaStart {
-			rdbSize = alignUp(rdbMetaStart, mbrSectorSize)
-		}
-		if rdbSize >= total {
-			rdbSize = alignUp(total/2, mbrSectorSize)
-		}
-		state := rdbState{
-			RdbSize:   rdbSize,
-			FsDataEnd: rdbMetaStart,
-			Fs:        []rdbFileSystem{},
-			Parts:     []rdbPart{},
-		}
-		return writeRdbState(path, state)
-	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return err
@@ -4170,6 +4149,14 @@ func writeNativeRdbState(path string, state rdbState) error {
 	}
 	if err := applyNativeFsState(&ctx, state); err != nil {
 		return err
+	}
+	if state.RdbSize > 0 {
+		blocks := ceilDivInt64(state.RdbSize, ctx.blockSize)
+		if blocks <= 0 {
+			blocks = 1
+		}
+		ctx.rdbBlockLo = 0
+		ctx.rdbBlockHi = blocks - 1
 	}
 	return writeNativeRdbContextCompactToFile(f, ctx)
 }
@@ -4785,6 +4772,19 @@ func writeNativeRdbContextCompactWithLoadSegChains(f *os.File, ctx nativeRdbCont
 	if nextIndex > 1 {
 		hiRdbBlock = uint32(nextIndex - 1)
 	}
+	rdbBlockLo := uint32(0)
+	if ctx.rdbBlockLo > 0 {
+		rdbBlockLo = uint32(ctx.rdbBlockLo)
+	}
+	rdbBlockHi := hiRdbBlock
+	if ctx.rdbBlockHi >= ctx.rdbBlockLo {
+		desiredHi := uint32(ctx.rdbBlockHi)
+		if desiredHi > rdbBlockHi {
+			rdbBlockHi = desiredHi
+		}
+	}
+	writeBeU32(ctx.rdskBlock, 0x80, rdbBlockLo)
+	writeBeU32(ctx.rdskBlock, 0x84, rdbBlockHi)
 	writeBeU32(ctx.rdskBlock, 0x98, hiRdbBlock)
 	writeBeU32(ctx.rdskBlock, 0x1c, uint32(partPtr))
 	writeBeU32(ctx.rdskBlock, 0x20, uint32(fsPtr))
