@@ -1525,6 +1525,18 @@ func TestRdbFsDeleteFailsWhenPartitionUsesFileSystem(t *testing.T) {
 	}
 }
 
+func TestParseNativeVersionFromPfs3Binary(t *testing.T) {
+	pfs3aio := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Pfs3", "pfs3aio")
+	b, err := os.ReadFile(pfs3aio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, minor := parseNativeVersion(b)
+	if major != 19 || minor != 2 {
+		t.Fatalf("expected 19.2 from native version parse, got %d.%d", major, minor)
+	}
+}
+
 func TestFsCopyWithUaeFsDbMetadata(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src")

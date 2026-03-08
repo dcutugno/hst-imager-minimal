@@ -378,6 +378,26 @@ compare_info_semantic_case() {
   pass_case "$name"
 }
 
+compare_media_hash_case() {
+  local name="$1"
+  local off_media="$2"
+  local force_media="$3"
+  if [[ ! -f "$off_media" || ! -f "$force_media" ]]; then
+    fail_case "$name" "missing media file(s) for hash compare"
+    return
+  fi
+  local off_sha force_sha off_size force_size
+  off_sha="$(shasum -a 256 "$off_media" | awk '{print $1}')"
+  force_sha="$(shasum -a 256 "$force_media" | awk '{print $1}')"
+  off_size="$(wc -c <"$off_media" | tr -d '[:space:]')"
+  force_size="$(wc -c <"$force_media" | tr -d '[:space:]')"
+  if [[ "$off_sha" != "$force_sha" || "$off_size" != "$force_size" ]]; then
+    fail_case "$name" "media hash/size mismatch"
+    return
+  fi
+  pass_case "$name-hash"
+}
+
 run_partition_workflow_cases() {
   local name
   local off_media
@@ -489,6 +509,7 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "part-add" "$off_media" "$force_media" rdb part add "__MEDIA__" DH0 PDS3 8MB; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
 
   name="partition-rdb-fsupdate"
   off_media="$TMP_DIR/${name}.off.img"
@@ -509,6 +530,7 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "fs-update" "$off_media" "$force_media" rdb filesystem update "__MEDIA__" 1 --dos-type PDS2 --name PFS3AIO; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
 
   name="partition-rdb-partupdate-move"
   off_media="$TMP_DIR/${name}.off.img"
@@ -531,6 +553,7 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "part-move" "$off_media" "$force_media" rdb part move "__MEDIA__" 1 2; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
 
   name="partition-rdb-part-delete"
   off_media="$TMP_DIR/${name}.off.img"
@@ -551,6 +574,7 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "part-delete" "$off_media" "$force_media" rdb part delete "__MEDIA__" 1; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
 
   name="partition-rdb-fs-delete-after-part-delete"
   off_media="$TMP_DIR/${name}.off.img"
@@ -573,6 +597,7 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "fs-delete" "$off_media" "$force_media" rdb filesystem delete "__MEDIA__" 1; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
+  compare_media_hash_case "$name" "$off_media" "$force_media"
 }
 
 echo "Running output parity checks"
