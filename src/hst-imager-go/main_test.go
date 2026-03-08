@@ -844,8 +844,12 @@ func TestMbrLowLevelBinaryParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := sector0[446 : 446+16]
-	startHead, startSecCyl, startCyl := encodeMbrChs(63)
-	endHead, endSecCyl, endCyl := encodeMbrChs(63 + uint32((16*1024)/512) - 1)
+	totalSectors, err := mediaCapacitySectors(mediaA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startHead, startSecCyl, startCyl := encodeMbrChs(63, totalSectors)
+	endHead, endSecCyl, endCyl := encodeMbrChs(63+uint32((16*1024)/512)-1, totalSectors)
 	if entry[1] != startHead || entry[2] != startSecCyl || entry[3] != startCyl {
 		t.Fatalf("unexpected start CHS bytes: %02x %02x %02x", entry[1], entry[2], entry[3])
 	}
@@ -934,6 +938,34 @@ func TestMbrLowLevelBinaryParity(t *testing.T) {
 	_ = fb.Close()
 	if !bytes.Equal(cloned, pattern) {
 		t.Fatal("cloned bytes do not match source partition bytes")
+	}
+}
+
+func TestMbrChsGeometryMatchesLegacyProgression(t *testing.T) {
+	tests := []struct {
+		name        string
+		sizeBytes   int64
+		wantHeads   uint32
+		wantSectors uint32
+	}{
+		{name: "32mb", sizeBytes: 32 * 1024 * 1024, wantHeads: 4, wantSectors: 17},
+		{name: "64mb", sizeBytes: 64 * 1024 * 1024, wantHeads: 8, wantSectors: 17},
+		{name: "128mb", sizeBytes: 128 * 1024 * 1024, wantHeads: 16, wantSectors: 17},
+		{name: "256mb", sizeBytes: 256 * 1024 * 1024, wantHeads: 16, wantSectors: 63},
+		{name: "512mb", sizeBytes: 512 * 1024 * 1024, wantHeads: 32, wantSectors: 63},
+		{name: "1gb", sizeBytes: 1024 * 1024 * 1024, wantHeads: 64, wantSectors: 63},
+		{name: "2gb", sizeBytes: 2 * 1024 * 1024 * 1024, wantHeads: 128, wantSectors: 63},
+		{name: "4gb", sizeBytes: 4 * 1024 * 1024 * 1024, wantHeads: 255, wantSectors: 63},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			totalSectors := uint32(tc.sizeBytes / mbrSectorSize)
+			heads, sectors := mbrChsGeometry(totalSectors)
+			if heads != tc.wantHeads || sectors != tc.wantSectors {
+				t.Fatalf("unexpected geometry for %s: got %d/%d, want %d/%d", tc.name, heads, sectors, tc.wantHeads, tc.wantSectors)
+			}
+		})
 	}
 }
 

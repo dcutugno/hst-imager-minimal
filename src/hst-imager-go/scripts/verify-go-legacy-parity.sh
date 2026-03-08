@@ -526,7 +526,7 @@ run_fuzz_workflow_cases() {
   local rounds="${HST_PARITY_FUZZ_ROUNDS:-0}"
   local base_seed="${HST_PARITY_FUZZ_SEED:-4242}"
   local strict_hash="${HST_PARITY_FUZZ_STRICT_HASH:-0}"
-  local i seed name off_media force_media rc table add_count part_count idx size
+  local i seed name off_media force_media off_dir force_dir rc table add_count part_count idx size
 
   if [[ "$rounds" -le 0 ]]; then
     echo "Skipping randomized parity checks (HST_PARITY_FUZZ_ROUNDS=$rounds)"
@@ -537,8 +537,12 @@ run_fuzz_workflow_cases() {
     seed=$((base_seed + i))
     RANDOM=$seed
     name="fuzz-seq-${i}"
-    off_media="$TMP_DIR/${name}.off.img"
-    force_media="$TMP_DIR/${name}.force.img"
+    # Use identical media basenames for both modes to avoid path-derived RDB label/checksum noise.
+    off_dir="$TMP_DIR/${name}.off"
+    force_dir="$TMP_DIR/${name}.force"
+    mkdir -p "$off_dir" "$force_dir"
+    off_media="$off_dir/${name}.img"
+    force_media="$force_dir/${name}.img"
 
     run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 64MB; rc=$?
     if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
