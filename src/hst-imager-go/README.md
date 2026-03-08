@@ -48,7 +48,14 @@ cd /Users/davide/Downloads/Git-Sources/hst-imager-minimal/src/hst-imager-go
 Notes:
 - Set `HST_IMAGER_LEGACY_BIN` to override legacy binary location.
 - Set `HST_PARITY_HEAVY=1` to include heavy large-image write parity cases.
+- Set `HST_PARITY_ERROR_MATRIX=1|0` to enable/disable broad missing-argument/error-path differential checks (default `1`).
+- Set `HST_PARITY_FUZZ_ROUNDS=<N>` and optional `HST_PARITY_FUZZ_SEED=<seed>` to run deterministic randomized workflow differential checks (default `0` rounds).
+- Set `HST_PARITY_FUZZ_STRICT_HASH=1` to enable raw media hash checks in fuzz workflows (disabled by default; semantic fuzz parity is still validated).
+- Set `HST_PARITY_DEEP_FS=1` to enable deep archive/filesystem fixtures (special chars and nested trees).
 - On failures, the script prints a temp directory containing `.diff` artifacts for each failed case.
+
+Cross-platform automation:
+- GitHub Actions workflow `/Users/davide/Downloads/Git-Sources/hst-imager-minimal/.github/workflows/go-legacy-parity.yml` runs baseline parity on Linux/macOS, smoke checks on Windows, and a non-blocking deep differential report job.
 
 ## Status
 This Go prototype now has functional coverage for all commands currently exposed in `command_tree.go`.

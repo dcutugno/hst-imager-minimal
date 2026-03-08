@@ -7,6 +7,8 @@ cd "$ROOT_DIR"
 GO_BIN="${GO_BIN:-$ROOT_DIR/hst-imager-go}"
 LEGACY_BIN="${HST_IMAGER_LEGACY_BIN:-}"
 HEAVY="${HST_PARITY_HEAVY:-0}"
+DEEP_FS="${HST_PARITY_DEEP_FS:-0}"
+RUN_ERROR_MATRIX="${HST_PARITY_ERROR_MATRIX:-1}"
 
 if [[ -z "$LEGACY_BIN" ]]; then
   if [[ -x /tmp/hst-imager-legacy/Hst.Imager.ConsoleApp ]]; then
@@ -33,12 +35,40 @@ SKIP=0
 
 DATA_ROOT="$ROOT_DIR/../Hst.Imager.Core.Tests/TestData"
 LHA_AMIGA="$DATA_ROOT/Lha/amiga.lha"
+LHA_DIRS="$DATA_ROOT/Lha/dirs-files.lha"
+LHA_SPECIAL="$DATA_ROOT/Lha/special_chars.lha"
 LZX_AMIGA="$DATA_ROOT/Lzx/amiga.lzx"
+LZX_DIRS="$DATA_ROOT/Lzx/dirs-files.lzx"
+LZX_SPECIAL="$DATA_ROOT/Lzx/special_chars.lzx"
 RAR_IMG="$DATA_ROOT/compressed-images/1gb.img.rar"
 GZ_IMG="$DATA_ROOT/compressed-images/1gb.img.gz"
 XZ_IMG="$DATA_ROOT/compressed-images/1gb.img.xz"
 XZ_SMALL="$DATA_ROOT/Xz/test.txt.xz"
+ZIP_DIRS="$DATA_ROOT/Zip/dirs-files.zip"
+ZIP_SPECIAL="$DATA_ROOT/Zip/special_chars.zip"
 PFS3_AIO="$DATA_ROOT/Pfs3/pfs3aio"
+
+hash_file() {
+  local path="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | awk '{print $NF}'
+    return
+  fi
+  echo "ERROR: no SHA-256 tool available (shasum, sha256sum, or openssl required)" >&2
+  exit 1
+}
+
+file_size_bytes() {
+  wc -c <"$1" | tr -d '[:space:]'
+}
 
 normalize_text() {
   local in_file="$1"
@@ -173,8 +203,8 @@ snapshot_tree() {
       if [[ -d "$path" ]]; then
         printf "D %s\n" "$rel"
       elif [[ -f "$path" ]]; then
-        size="$(wc -c <"$path" | tr -d '[:space:]')"
-        sha="$(shasum -a 256 "$path" | awk '{print $1}')"
+        size="$(file_size_bytes "$path")"
+        sha="$(hash_file "$path")"
         printf "F %s %s %s\n" "$rel" "$size" "$sha"
       else
         printf "O %s\n" "$rel"
@@ -258,10 +288,10 @@ compare_write_case() {
   fi
 
   local off_sha force_sha off_size force_size
-  off_sha="$(shasum -a 256 "$off_file" | awk '{print $1}')"
-  force_sha="$(shasum -a 256 "$force_file" | awk '{print $1}')"
-  off_size="$(wc -c <"$off_file" | tr -d '[:space:]')"
-  force_size="$(wc -c <"$force_file" | tr -d '[:space:]')"
+  off_sha="$(hash_file "$off_file")"
+  force_sha="$(hash_file "$force_file")"
+  off_size="$(file_size_bytes "$off_file")"
+  force_size="$(file_size_bytes "$force_file")"
 
   if [[ "$off_sha" != "$force_sha" || "$off_size" != "$force_size" ]]; then
     fail_case "$name" "output file hash/size mismatch"
@@ -387,15 +417,200 @@ compare_media_hash_case() {
     return
   fi
   local off_sha force_sha off_size force_size
-  off_sha="$(shasum -a 256 "$off_media" | awk '{print $1}')"
-  force_sha="$(shasum -a 256 "$force_media" | awk '{print $1}')"
-  off_size="$(wc -c <"$off_media" | tr -d '[:space:]')"
-  force_size="$(wc -c <"$force_media" | tr -d '[:space:]')"
+  off_sha="$(hash_file "$off_media")"
+  force_sha="$(hash_file "$force_media")"
+  off_size="$(file_size_bytes "$off_media")"
+  force_size="$(file_size_bytes "$force_media")"
   if [[ "$off_sha" != "$force_sha" || "$off_size" != "$force_size" ]]; then
     fail_case "$name" "media hash/size mismatch"
     return
   fi
   pass_case "$name-hash"
+}
+
+compare_error_semantic_case() {
+  local name="$1"
+  local expected_pattern="$2"
+  shift 2
+
+  local off_out="$TMP_DIR/${name}.off.out"
+  local off_err="$TMP_DIR/${name}.off.err"
+  local off_rc="$TMP_DIR/${name}.off.rc"
+  local force_out="$TMP_DIR/${name}.force.out"
+  local force_err="$TMP_DIR/${name}.force.err"
+  local force_rc="$TMP_DIR/${name}.force.rc"
+
+  run_mode off "$off_out" "$off_err" "$off_rc" "$@"
+  run_mode force "$force_out" "$force_err" "$force_rc" "$@"
+
+  if [[ "$(cat "$force_rc")" != "0" ]] && grep -Eq "Unrecognized command or argument" "$force_out" "$force_err"; then
+    skip_case "$name" "legacy backend does not expose this command in the published baseline"
+    return
+  fi
+  if ! diff -u "$off_rc" "$force_rc" >"$TMP_DIR/${name}.rc.diff"; then
+    fail_case "$name" "exit code mismatch (see $TMP_DIR/${name}.rc.diff)"
+    return
+  fi
+  if [[ "$(cat "$off_rc")" == "0" ]]; then
+    fail_case "$name" "expected non-zero exit code for error path"
+    return
+  fi
+
+  normalize_text "$off_out" "$off_out.norm"
+  normalize_text "$off_err" "$off_err.norm"
+  normalize_text "$force_out" "$force_out.norm"
+  normalize_text "$force_err" "$force_err.norm"
+  cat "$off_out.norm" "$off_err.norm" >"$off_out.all"
+  cat "$force_out.norm" "$force_err.norm" >"$force_out.all"
+
+  if [[ -n "$expected_pattern" ]]; then
+    if ! grep -Eiq "$expected_pattern" "$off_out.all"; then
+      fail_case "$name" "go error output missing expected pattern '$expected_pattern'"
+      return
+    fi
+    if ! grep -Eiq "$expected_pattern" "$force_out.all"; then
+      fail_case "$name" "legacy error output missing expected pattern '$expected_pattern'"
+      return
+    fi
+  fi
+
+  pass_case "$name"
+}
+
+run_error_matrix_cases() {
+  compare_error_semantic_case "err-blank-missing-args" "usage" blank
+  compare_error_semantic_case "err-info-missing-args" "usage" info
+  compare_error_semantic_case "err-read-missing-args" "usage" read
+  compare_error_semantic_case "err-write-missing-args" "usage" write
+  compare_error_semantic_case "err-transfer-missing-args" "usage" transfer
+  compare_error_semantic_case "err-compare-missing-args" "usage" compare
+  compare_error_semantic_case "err-block-read-missing-args" "usage" block read
+  compare_error_semantic_case "err-block-view-missing-args" "usage" block view
+  compare_error_semantic_case "err-settings-update-missing-args" "usage" settings update
+  compare_error_semantic_case "err-fs-dir-missing-args" "usage" fs dir
+  compare_error_semantic_case "err-fs-copy-missing-args" "usage" fs copy
+  compare_error_semantic_case "err-fs-extract-missing-args" "usage" fs extract
+  compare_error_semantic_case "err-fs-mkdir-missing-args" "usage" fs mkdir
+  compare_error_semantic_case "err-adf-create-missing-args" "usage" adf create
+  compare_error_semantic_case "err-archive-list-missing-args" "usage" archive list
+  compare_error_semantic_case "err-mbr-init-missing-args" "usage" mbr initialize
+  compare_error_semantic_case "err-mbr-part-add-missing-args" "usage" mbr part add
+  compare_error_semantic_case "err-mbr-part-delete-missing-args" "usage" mbr part delete
+  compare_error_semantic_case "err-mbr-part-format-missing-args" "usage" mbr part format
+  compare_error_semantic_case "err-mbr-part-export-missing-args" "usage" mbr part export
+  compare_error_semantic_case "err-mbr-part-import-missing-args" "usage" mbr part import
+  compare_error_semantic_case "err-mbr-part-clone-missing-args" "usage" mbr part clone
+  compare_error_semantic_case "err-gpt-init-missing-args" "usage" gpt initialize
+  compare_error_semantic_case "err-gpt-part-add-missing-args" "usage" gpt part add
+  compare_error_semantic_case "err-gpt-part-delete-missing-args" "usage" gpt part delete
+  compare_error_semantic_case "err-gpt-part-format-missing-args" "usage" gpt part format
+  compare_error_semantic_case "err-rdb-init-missing-args" "usage" rdb initialize
+  compare_error_semantic_case "err-rdb-fs-add-missing-args" "usage" rdb filesystem add
+  compare_error_semantic_case "err-rdb-fs-update-missing-args" "usage" rdb filesystem update
+  compare_error_semantic_case "err-rdb-fs-delete-missing-args" "usage" rdb filesystem delete
+  compare_error_semantic_case "err-rdb-part-add-missing-args" "usage" rdb part add
+  compare_error_semantic_case "err-rdb-part-update-missing-args" "usage" rdb part update
+  compare_error_semantic_case "err-rdb-part-delete-missing-args" "usage" rdb part delete
+  compare_error_semantic_case "err-rdb-part-copy-missing-args" "usage" rdb part copy
+  compare_error_semantic_case "err-rdb-part-export-missing-args" "usage" rdb part export
+  compare_error_semantic_case "err-rdb-part-import-missing-args" "usage" rdb part import
+  compare_error_semantic_case "err-rdb-part-kill-missing-args" "usage" rdb part kill
+  compare_error_semantic_case "err-rdb-part-move-missing-args" "usage" rdb part move
+  compare_error_semantic_case "err-rdb-part-format-missing-args" "usage" rdb part format
+  compare_error_semantic_case "err-rdb-backup-missing-args" "usage" rdb backup
+  compare_error_semantic_case "err-rdb-restore-missing-args" "usage" rdb restore
+  compare_error_semantic_case "err-script-missing-args" "usage" script
+}
+
+run_fuzz_workflow_cases() {
+  local rounds="${HST_PARITY_FUZZ_ROUNDS:-0}"
+  local base_seed="${HST_PARITY_FUZZ_SEED:-4242}"
+  local strict_hash="${HST_PARITY_FUZZ_STRICT_HASH:-0}"
+  local i seed name off_media force_media rc table add_count part_count idx size
+
+  if [[ "$rounds" -le 0 ]]; then
+    echo "Skipping randomized parity checks (HST_PARITY_FUZZ_ROUNDS=$rounds)"
+    return
+  fi
+
+  for ((i = 1; i <= rounds; i++)); do
+    seed=$((base_seed + i))
+    RANDOM=$seed
+    name="fuzz-seq-${i}"
+    off_media="$TMP_DIR/${name}.off.img"
+    force_media="$TMP_DIR/${name}.force.img"
+
+    run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 64MB; rc=$?
+    if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+
+    table=$((RANDOM % 3))
+    if [[ "$table" -eq 0 ]]; then
+      run_step_pair "$name" "mbr-init" "$off_media" "$force_media" mbr initialize "__MEDIA__"; rc=$?
+      if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      add_count=$((RANDOM % 3 + 1))
+      part_count=0
+      for ((idx = 1; idx <= add_count; idx++)); do
+        case $((RANDOM % 3)) in
+          0) size="4MB" ;;
+          1) size="8MB" ;;
+          *) size="12MB" ;;
+        esac
+        run_step_pair "$name" "mbr-add-${idx}" "$off_media" "$force_media" mbr part add "__MEDIA__" fat32 "$size"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+        part_count=$((part_count + 1))
+      done
+      if [[ "$part_count" -gt 1 && $((RANDOM % 2)) -eq 0 ]]; then
+        idx=$((RANDOM % part_count + 1))
+        run_step_pair "$name" "mbr-delete" "$off_media" "$force_media" mbr part delete "__MEDIA__" "$idx"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      fi
+    elif [[ "$table" -eq 1 ]]; then
+      run_step_pair "$name" "gpt-init" "$off_media" "$force_media" gpt initialize "__MEDIA__"; rc=$?
+      if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      add_count=$((RANDOM % 2 + 1))
+      part_count=0
+      for ((idx = 1; idx <= add_count; idx++)); do
+        if [[ $((RANDOM % 2)) -eq 0 ]]; then
+          size="8MB"
+        else
+          size="16MB"
+        fi
+        run_step_pair "$name" "gpt-add-${idx}" "$off_media" "$force_media" gpt part add "__MEDIA__" ntfs "DATA${idx}" "$size"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+        part_count=$((part_count + 1))
+      done
+      if [[ "$part_count" -gt 1 && $((RANDOM % 2)) -eq 0 ]]; then
+        idx=$((RANDOM % part_count + 1))
+        run_step_pair "$name" "gpt-delete" "$off_media" "$force_media" gpt part delete "__MEDIA__" "$idx"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      fi
+    else
+      run_step_pair "$name" "rdb-init" "$off_media" "$force_media" rdb initialize "__MEDIA__"; rc=$?
+      if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      run_step_pair "$name" "rdb-fs-add" "$off_media" "$force_media" rdb filesystem add "__MEDIA__" "$PFS3_AIO" PDS3; rc=$?
+      if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      add_count=$((RANDOM % 2 + 1))
+      part_count=0
+      for ((idx = 1; idx <= add_count; idx++)); do
+        size="8MB"
+        run_step_pair "$name" "rdb-add-${idx}" "$off_media" "$force_media" rdb part add "__MEDIA__" "DH${idx}" PDS3 "$size"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+        part_count=$((part_count + 1))
+      done
+      if [[ "$part_count" -gt 1 && $((RANDOM % 2)) -eq 0 ]]; then
+        idx=$((RANDOM % part_count + 1))
+        run_step_pair "$name" "rdb-delete" "$off_media" "$force_media" rdb part delete "__MEDIA__" "$idx"; rc=$?
+        if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+      fi
+    fi
+
+    compare_info_semantic_case "$name" "$off_media" "$force_media"
+    # Optional: strict raw-image hash check for fuzzed workflows.
+    # Disabled by default because semantic parity can still hold while low-level container bytes differ.
+    if [[ "$strict_hash" == "1" && "$table" -ne 1 ]]; then
+      compare_media_hash_case "$name" "$off_media" "$force_media"
+    fi
+  done
 }
 
 run_partition_workflow_cases() {
@@ -702,10 +917,26 @@ compare_fs_dir_json_case "fs-dir-json-rar-img" "$RAR_IMG"
 compare_fs_dir_json_case "fs-dir-json-gz-img" "$GZ_IMG"
 compare_fs_dir_json_case "fs-dir-json-xz-img" "$XZ_IMG"
 compare_fs_dir_json_case "fs-dir-json-xz-text" "$XZ_SMALL"
+if [[ "$DEEP_FS" == "1" ]]; then
+  compare_fs_dir_json_case "fs-dir-json-lha-dirs" "$LHA_DIRS"
+  compare_fs_dir_json_case "fs-dir-json-lha-special" "$LHA_SPECIAL"
+  compare_fs_dir_json_case "fs-dir-json-lzx-dirs" "$LZX_DIRS"
+  compare_fs_dir_json_case "fs-dir-json-lzx-special" "$LZX_SPECIAL"
+  compare_fs_dir_json_case "fs-dir-json-zip-dirs" "$ZIP_DIRS"
+  compare_fs_dir_json_case "fs-dir-json-zip-special" "$ZIP_SPECIAL"
+fi
 
 echo "Running extraction parity checks"
 compare_extract_case "extract-lha-amiga" "$LHA_AMIGA"
 compare_extract_case "extract-lzx-amiga" "$LZX_AMIGA"
+if [[ "$DEEP_FS" == "1" ]]; then
+  compare_extract_case "extract-lha-dirs" "$LHA_DIRS"
+  compare_extract_case "extract-lha-special" "$LHA_SPECIAL"
+  compare_extract_case "extract-lzx-dirs" "$LZX_DIRS"
+  compare_extract_case "extract-lzx-special" "$LZX_SPECIAL"
+  compare_extract_case "extract-zip-dirs" "$ZIP_DIRS"
+  compare_extract_case "extract-zip-special" "$ZIP_SPECIAL"
+fi
 
 echo "Running write parity checks"
 compare_write_case "write-xz-small" "$XZ_SMALL"
@@ -723,6 +954,14 @@ compare_compare_case "compare-size5-mismatch" "1" "$TMP_DIR/compare-a.bin" "$TMP
 
 echo "Running partition workflow parity checks"
 run_partition_workflow_cases
+
+if [[ "$RUN_ERROR_MATRIX" == "1" ]]; then
+  echo "Running error-path parity matrix"
+  run_error_matrix_cases
+fi
+
+echo "Running randomized parity workflows"
+run_fuzz_workflow_cases
 
 echo "Summary: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 if [[ "$FAIL" -ne 0 ]]; then

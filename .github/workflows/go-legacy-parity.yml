@@ -1,0 +1,143 @@
+name: Go Legacy Parity
+
+on:
+  push:
+    paths:
+      - "src/hst-imager-go/**"
+      - "src/Hst.Imager.Core/**"
+      - "src/Hst.Imager.ConsoleApp/**"
+      - ".github/workflows/go-legacy-parity.yml"
+  pull_request:
+    paths:
+      - "src/hst-imager-go/**"
+      - "src/Hst.Imager.Core/**"
+      - "src/Hst.Imager.ConsoleApp/**"
+      - ".github/workflows/go-legacy-parity.yml"
+
+jobs:
+  baseline-parity:
+    name: Baseline Parity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install jq (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v jq >/dev/null 2>&1; then
+            exit 0
+          fi
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          elif [[ "${RUNNER_OS}" == "macOS" ]]; then
+            brew install jq
+          else
+            echo "Unsupported runner for jq bootstrap: ${RUNNER_OS}"
+            exit 1
+          fi
+
+      - name: Publish legacy .NET console app
+        shell: bash
+        run: |
+          set -euo pipefail
+          LEGACY_OUT="${RUNNER_TEMP}/hst-imager-legacy"
+          mkdir -p "${LEGACY_OUT}"
+          cd src
+          dotnet publish Hst.Imager.ConsoleApp/Hst.Imager.ConsoleApp.csproj -c Release -o "${LEGACY_OUT}"
+          echo "HST_IMAGER_LEGACY_BIN=${LEGACY_OUT}/Hst.Imager.ConsoleApp.dll" >> "${GITHUB_ENV}"
+
+      - name: Go tests and parity checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GOCACHE="${RUNNER_TEMP}/go-build-cache"
+          mkdir -p "${GOCACHE}"
+          cd src/hst-imager-go
+          go test -count=1 ./...
+          ./scripts/verify-go-prototype.sh
+          HST_IMAGER_LEGACY_BIN="${HST_IMAGER_LEGACY_BIN}" ./scripts/verify-go-legacy-parity.sh
+
+  windows-smoke:
+    name: Windows Smoke
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Go tests and prototype checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GOCACHE="${RUNNER_TEMP}/go-build-cache"
+          mkdir -p "${GOCACHE}"
+          cd src/hst-imager-go
+          go test -count=1 ./...
+          ./scripts/verify-go-prototype.sh
+
+  deep-differential:
+    name: Deep Differential (Non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Publish legacy .NET console app
+        shell: bash
+        run: |
+          set -euo pipefail
+          LEGACY_OUT="${RUNNER_TEMP}/hst-imager-legacy"
+          mkdir -p "${LEGACY_OUT}"
+          cd src
+          dotnet publish Hst.Imager.ConsoleApp/Hst.Imager.ConsoleApp.csproj -c Release -o "${LEGACY_OUT}"
+          echo "HST_IMAGER_LEGACY_BIN=${LEGACY_OUT}/Hst.Imager.ConsoleApp.dll" >> "${GITHUB_ENV}"
+
+      - name: Run deep parity + fuzz (report mode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GOCACHE="${RUNNER_TEMP}/go-build-cache"
+          mkdir -p "${GOCACHE}"
+          cd src/hst-imager-go
+          HST_IMAGER_LEGACY_BIN="${HST_IMAGER_LEGACY_BIN}" \
+          HST_PARITY_DEEP_FS=1 \
+          HST_PARITY_FUZZ_ROUNDS=6 \
+          ./scripts/verify-go-legacy-parity.sh || true

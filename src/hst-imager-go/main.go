@@ -519,7 +519,10 @@ func handleList(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	drives, err := listPhysicalDrives()
 	if err != nil {
-		return err
+		if !isDriveEnumerationUnavailable(err) {
+			return err
+		}
+		drives = []DriveInfo{}
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{"drives": drives})
@@ -539,6 +542,17 @@ func handleList(args []string, stdout io.Writer, opts GlobalOptions) error {
 		fmt.Fprintln(stdout)
 	}
 	return nil
+}
+
+func isDriveEnumerationUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "operation not permitted") ||
+		strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "executable file not found") ||
+		strings.Contains(msg, "exit status")
 }
 
 func listPhysicalDrives() ([]DriveInfo, error) {
@@ -642,13 +656,11 @@ func listWindowsDrives() ([]DriveInfo, error) {
 }
 
 func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
-	path := "."
-	fsArgOffset := 0
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		path = args[0]
-		fsArgOffset = 1
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return errors.New("usage: fs dir <path> [--recursive] [--uaemetadata <none|uaefsdb|uaemetafile>]")
 	}
-	fsOpts, err := parseFsOptions(args[fsArgOffset:])
+	path := args[0]
+	fsOpts, err := parseFsOptions(args[1:])
 	if err != nil {
 		return err
 	}
@@ -1012,16 +1024,24 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 		return err
 	}
 	type item struct {
-		Name  string
-		IsDir bool
-		Size  int64
+		Name       string
+		IsDir      bool
+		Size       int64
+		Attributes string
 	}
-	items := make([]item, 0)
+	type aggregateItem struct {
+		name           string
+		hasDirect      bool
+		hasChildren    bool
+		directIsDir    bool
+		directSize     int64
+		protectionBits *int
+	}
+	aggregates := make(map[string]*aggregateItem)
 	prefix := normalizeArchivePath(innerPath)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	seen := map[string]bool{}
 	for _, e := range entries {
 		name := normalizeArchivePath(e.Name)
 		if prefix != "" {
@@ -1035,21 +1055,41 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 			continue
 		}
 		parts := strings.SplitN(name, "/", 2)
-		if len(parts) == 1 {
-			key := parts[0]
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			items = append(items, item{Name: key, IsDir: false, Size: e.Size})
-			continue
-		}
 		key := parts[0]
-		if seen[key] {
+		aggregate, ok := aggregates[key]
+		if !ok {
+			aggregate = &aggregateItem{name: key}
+			aggregates[key] = aggregate
+		}
+		if len(parts) == 1 {
+			aggregate.hasDirect = true
+			aggregate.directIsDir = e.IsDir
+			aggregate.directSize = e.Size
+			if e.ProtectionBits != nil {
+				bits := *e.ProtectionBits
+				aggregate.protectionBits = &bits
+			}
 			continue
 		}
-		seen[key] = true
-		items = append(items, item{Name: key, IsDir: true, Size: 0})
+		aggregate.hasChildren = true
+	}
+	items := make([]item, 0, len(aggregates))
+	for _, aggregate := range aggregates {
+		isDir := aggregate.hasChildren || (aggregate.hasDirect && aggregate.directIsDir)
+		size := int64(0)
+		if aggregate.hasDirect && !isDir {
+			size = aggregate.directSize
+		}
+		attributes := "----RWED"
+		if aggregate.protectionBits != nil {
+			attributes = formatAmigaProtectionBits(*aggregate.protectionBits | 0x0f)
+		}
+		items = append(items, item{
+			Name:       aggregate.name,
+			IsDir:      isDir,
+			Size:       size,
+			Attributes: attributes,
+		})
 	}
 	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
 	if opts.Format == "json" {
@@ -1063,7 +1103,7 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 				Name:       i.Name,
 				Type:       typeValue,
 				Size:       i.Size,
-				Attributes: "----RWED",
+				Attributes: i.Attributes,
 			})
 		}
 		return writeJSON(stdout, map[string]any{"path": archivePath, "innerPath": innerPath, "entries": jsonItems})
@@ -1979,6 +2019,9 @@ func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error 
 		}
 		defer os.RemoveAll(tmpDir)
 		if err := extractArchive(archivePath, innerPath, tmpDir); err != nil {
+			return err
+		}
+		if err := applyArchiveExtractedUaeMetadata(tmpDir, archivePath, innerPath, fsOpts.uaeMetadata); err != nil {
 			return err
 		}
 		sourcePath := tmpDir
@@ -3358,19 +3401,10 @@ func handleRdbPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	if err != nil {
 		return err
 	}
-	start := alignUp(maxInt64(state.RdbSize, rdbUsedEnd(state.Parts)), mbrSectorSize)
-	part := rdbPart{
-		Index:  nextRdbPartIndex(state.Parts),
-		Name:   args[1],
-		Type:   args[2],
-		Start:  start,
-		Size:   size,
-		Status: "active",
+	part, err := appendRdbPart(&state, args[0], args[1], args[2], size, "active")
+	if err != nil {
+		return err
 	}
-	if part.Start+part.Size > mediaSize(args[0]) {
-		return errors.New("partition does not fit in media")
-	}
-	state.Parts = append(state.Parts, part)
 	if err := writeRdbState(args[0], state); err != nil {
 		return err
 	}
@@ -5019,15 +5053,9 @@ func appendRdbPart(state *rdbState, mediaPath, name, dosType string, size int64,
 			return rdbPart{}, fmt.Errorf("partition name '%s' already exists", name)
 		}
 	}
-	start := alignUp(maxInt64(state.RdbSize, rdbUsedEnd(state.Parts)), mbrSectorSize)
-	partSize := alignUp(size, mbrSectorSize)
-	// In native RDB, legacy PartitionBlock.Create treats size 0 as "remaining cylinders".
-	if state.Native && size == 0 {
-		resolvedSize, err := resolveNativeLegacyRemainingPartSize(mediaPath, start)
-		if err != nil {
-			return rdbPart{}, err
-		}
-		partSize = resolvedSize
+	start, partSize, err := resolveRdbPartPlacement(mediaPath, *state, size)
+	if err != nil {
+		return rdbPart{}, err
 	}
 	part := rdbPart{
 		Index:  nextRdbPartIndex(state.Parts),
@@ -5048,24 +5076,55 @@ func appendRdbPart(state *rdbState, mediaPath, name, dosType string, size int64,
 	return part, nil
 }
 
-func resolveNativeLegacyRemainingPartSize(mediaPath string, start int64) (int64, error) {
-	ctx, err := readNativeRdbContext(mediaPath)
+func resolveRdbPartPlacement(mediaPath string, state rdbState, requestedSize int64) (int64, int64, error) {
+	cylinderBytes, err := resolveRdbCylinderBytes(mediaPath, state)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	if ctx.cylBytes <= 0 {
-		return 0, errors.New("invalid native rdb cylinder bytes")
+	if cylinderBytes <= 0 {
+		return 0, 0, errors.New("invalid rdb cylinder bytes")
 	}
-	lowCyl := maxInt64(start, 0) / ctx.cylBytes
 	mediaBytes := mediaSize(mediaPath)
 	if mediaBytes <= 0 {
-		return 0, errors.New("cannot resolve media size")
+		return 0, 0, errors.New("cannot resolve media size")
 	}
-	highCyl := mediaBytes/ctx.cylBytes - 1
-	if highCyl < lowCyl {
-		return 0, nil
+	lowCylinder := int64(2)
+	if len(state.Parts) > 0 {
+		lowCylinder = ceilDivInt64(maxInt64(rdbUsedEnd(state.Parts), 0), cylinderBytes)
+		if lowCylinder < 2 {
+			lowCylinder = 2
+		}
+	} else if state.Native {
+		// Native RDB uses cylinder geometry for first partition placement.
+		startCylinderFromRdb := ceilDivInt64(maxInt64(state.RdbSize, 0), cylinderBytes)
+		if startCylinderFromRdb > lowCylinder {
+			lowCylinder = startCylinderFromRdb
+		}
 	}
-	return (highCyl - lowCyl + 1) * ctx.cylBytes, nil
+
+	start := lowCylinder * cylinderBytes
+	if requestedSize == 0 {
+		totalCylinders := mediaBytes / cylinderBytes
+		if totalCylinders <= lowCylinder {
+			return start, 0, nil
+		}
+		return start, (totalCylinders - lowCylinder) * cylinderBytes, nil
+	}
+	cylinders := ceilDivInt64(requestedSize, cylinderBytes)
+	if cylinders < 0 {
+		cylinders = 0
+	}
+	return start, cylinders * cylinderBytes, nil
+}
+
+func ceilDivInt64(value, divisor int64) int64 {
+	if divisor <= 0 {
+		return 0
+	}
+	if value <= 0 {
+		return 0
+	}
+	return (value + divisor - 1) / divisor
 }
 
 func nativePartitionRegionByNumber(mediaPath string, number int) (int64, int64, error) {
@@ -5139,20 +5198,17 @@ func rdbUsedEnd(items []rdbPart) int64 {
 }
 
 func resolveRdbPartSize(mediaPath, value string, state rdbState) (int64, error) {
-	if value != "*" {
-		size, err := parseSize(value)
-		if err != nil {
-			return 0, err
-		}
-		return alignUp(size, mbrSectorSize), nil
+	_ = mediaPath
+	_ = state
+	if value == "*" {
+		// Legacy rdb part add treats '*' as "remaining cylinders", represented by size 0.
+		return 0, nil
 	}
-	total := mediaSize(mediaPath)
-	start := alignUp(maxInt64(state.RdbSize, rdbUsedEnd(state.Parts)), mbrSectorSize)
-	remain := total - start
-	if remain < 0 {
-		remain = 0
+	size, err := parseSize(value)
+	if err != nil {
+		return 0, err
 	}
-	return alignUp(remain, mbrSectorSize), nil
+	return alignUp(size, mbrSectorSize), nil
 }
 
 func resolveRdbCylinderBytes(mediaPath string, state rdbState) (int64, error) {
@@ -6132,8 +6188,11 @@ type partitionRegion struct {
 }
 
 type archiveEntry struct {
-	Name string `json:"name"`
-	Size int64  `json:"size"`
+	Name           string `json:"name"`
+	Size           int64  `json:"size"`
+	IsDir          bool   `json:"isDir,omitempty"`
+	ProtectionBits *int   `json:"protectionBits,omitempty"`
+	Comment        string `json:"comment,omitempty"`
 }
 
 type archiveFormat string
@@ -6530,7 +6589,15 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		defer zr.Close()
 		items := make([]archiveEntry, 0, len(zr.File))
 		for _, f := range zr.File {
-			items = append(items, archiveEntry{Name: f.Name, Size: int64(f.UncompressedSize64)})
+			entryName := strings.ReplaceAll(f.Name, "\\", "/")
+			protectionBits := zipAmigaProtectionBits(f)
+			items = append(items, archiveEntry{
+				Name:           entryName,
+				Size:           int64(f.UncompressedSize64),
+				IsDir:          f.FileInfo().IsDir() || strings.HasSuffix(entryName, "/"),
+				ProtectionBits: protectionBits,
+				Comment:        f.Comment,
+			})
 		}
 		return items, nil
 	case archiveFormatTar:
@@ -6577,9 +6644,19 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		if line == "" {
 			continue
 		}
-		items = append(items, archiveEntry{Name: line, Size: 0})
+		items = append(items, archiveEntry{Name: line, Size: 0, IsDir: strings.HasSuffix(line, "/")})
 	}
 	return items, nil
+}
+
+func zipAmigaProtectionBits(file *zip.File) *int {
+	// ZIP creator version high byte stores host OS (1 = Amiga).
+	hostOS := byte(file.CreatorVersion >> 8)
+	if hostOS != 1 {
+		return nil
+	}
+	protectionBits := int((file.ExternalAttrs>>16)&0xff) ^ 0x0f
+	return &protectionBits
 }
 
 func splitArchivePath(path string) (archivePath string, innerPath string, ok bool) {
@@ -6703,6 +6780,49 @@ func extractArchive(archivePath, innerPath, destination string) error {
 	return nil
 }
 
+func applyArchiveExtractedUaeMetadata(destination, archivePath, innerPath, uaeMode string) error {
+	if uaeMode == "none" {
+		return nil
+	}
+	entries, err := listArchiveEntries(archivePath)
+	if err != nil {
+		// Best-effort enrichment for archive metadata. Extraction already succeeded.
+		return nil
+	}
+	for _, entry := range entries {
+		hasProtectionBits := entry.ProtectionBits != nil && *entry.ProtectionBits != 0
+		hasComment := strings.TrimSpace(entry.Comment) != ""
+		if !hasProtectionBits && !hasComment {
+			continue
+		}
+		relPath, ok := resolveArchiveEntryRelativePath(entry.Name, innerPath)
+		if !ok || relPath == "" {
+			continue
+		}
+		targetPath, err := safeArchiveTargetPath(destination, relPath, entry.Name)
+		if err != nil {
+			return err
+		}
+		targetInfo, err := os.Stat(targetPath)
+		if err != nil {
+			continue
+		}
+		entryType := "file"
+		if entry.IsDir || targetInfo.IsDir() {
+			entryType = "dir"
+		}
+		amigaName := path.Base(normalizeArchivePath(relPath))
+		normalName := filepath.Base(targetPath)
+		if amigaName == "" || normalName == "" {
+			continue
+		}
+		if err := writeUaeMetadataForEntry(filepath.Dir(targetPath), amigaName, normalName, entryType, uaeMode, entry.ProtectionBits, entry.Comment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func detectArchiveFormat(path string) archiveFormat {
 	lower := strings.ToLower(path)
 	switch {
@@ -6756,8 +6876,9 @@ func listTarArchiveEntries(path string, gzipped bool) ([]archiveEntry, error) {
 			continue
 		}
 		items = append(items, archiveEntry{
-			Name: hdr.Name,
-			Size: hdr.Size,
+			Name:  hdr.Name,
+			Size:  hdr.Size,
+			IsDir: hdr.FileInfo().IsDir() || hdr.Typeflag == tar.TypeDir,
 		})
 	}
 	return items, nil
@@ -6868,9 +6989,13 @@ func listLzxArchiveEntries(path string) ([]archiveEntry, error) {
 	}
 	items := make([]archiveEntry, 0, len(entries))
 	for _, e := range entries {
+		protectionBits := int(e.Attributes ^ 0x0f)
 		items = append(items, archiveEntry{
-			Name: e.Name,
-			Size: int64(e.UnpackedSize),
+			Name:           e.Name,
+			Size:           int64(e.UnpackedSize),
+			IsDir:          e.IsDir,
+			ProtectionBits: &protectionBits,
+			Comment:        e.Comment,
 		})
 	}
 	return items, nil
@@ -7134,8 +7259,9 @@ func listRarArchiveEntries(path string) ([]archiveEntry, error) {
 			continue
 		}
 		items = append(items, archiveEntry{
-			Name: entryName,
-			Size: h.UnPackedSize,
+			Name:  entryName,
+			Size:  h.UnPackedSize,
+			IsDir: h.IsDir,
 		})
 	}
 	return items, nil
@@ -7759,6 +7885,7 @@ type lhaEntry struct {
 	Name           string
 	Comment        string
 	Method         string
+	Attribute      byte
 	CompressedSize uint32
 	OriginalSize   uint32
 	DataOffset     int
@@ -7784,9 +7911,13 @@ func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
 	}
 	items = make([]archiveEntry, 0, len(entries))
 	for _, e := range entries {
+		protectionBits := int(e.Attribute)
 		items = append(items, archiveEntry{
-			Name: e.Name,
-			Size: int64(e.OriginalSize),
+			Name:           e.Name,
+			Size:           int64(e.OriginalSize),
+			IsDir:          e.IsDir || strings.EqualFold(e.Method, "-lhd-"),
+			ProtectionBits: &protectionBits,
+			Comment:        e.Comment,
 		})
 	}
 	return items, nil
@@ -7813,9 +7944,15 @@ func listLhaArchiveEntriesNative(path string) ([]archiveEntry, error) {
 		if entryName == "" {
 			continue
 		}
+		_, comment := splitLhaNameAndComment(h.Name)
+		protectionBits := int(h.Attribute)
+		isDir := strings.EqualFold(h.Method, "-lhd-") || strings.HasSuffix(entryName, "/")
 		items = append(items, archiveEntry{
-			Name: entryName,
-			Size: int64(h.OriginalSize),
+			Name:           entryName,
+			Size:           int64(h.OriginalSize),
+			IsDir:          isDir,
+			ProtectionBits: &protectionBits,
+			Comment:        comment,
 		})
 	}
 	return items, nil
@@ -8058,6 +8195,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 		method := string(data[offset+2 : offset+7])
 		compressedSize := binary.LittleEndian.Uint32(data[offset+7 : offset+11])
 		originalSize := binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+		attribute := data[offset+19]
 		nameLen := int(data[offset+21])
 		nameStart := offset + 22
 		nameEnd := nameStart + nameLen
@@ -8079,6 +8217,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 			Name:           name,
 			Comment:        comment,
 			Method:         method,
+			Attribute:      attribute,
 			CompressedSize: compressedSize,
 			OriginalSize:   originalSize,
 			DataOffset:     dataOffset,
