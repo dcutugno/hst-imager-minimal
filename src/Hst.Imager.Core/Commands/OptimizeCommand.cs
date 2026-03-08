@@ -18,6 +18,7 @@
     {
         public override async Task<Result> Execute(CancellationToken token)
         {
+            _ = logger;
             OnInformationMessage($"Optimizing image file at '{path}'");
 
             if (commandHelper.IsVhd(path))
