@@ -1649,6 +1649,24 @@ func copyFile(source, destination string, size int64) (int64, error) {
 }
 
 func copyFileWithOptions(source, destination string, size int64, opts copyFileOptions) (int64, error) {
+	if opts.requireExistingDestination && opts.preserveDestinationSize {
+		capacity, hasCapacity, err := resolveDestinationCapacity(destination)
+		if err != nil {
+			return 0, err
+		}
+		if hasCapacity {
+			if size > 0 {
+				if size > capacity {
+					return 0, errors.New("destination partition too small")
+				}
+			} else if sourceSize, hasSourceSize, err := resolveSourceStreamSize(source); err != nil {
+				return 0, err
+			} else if hasSourceSize && sourceSize > capacity {
+				return 0, errors.New("destination partition too small")
+			}
+		}
+	}
+
 	src, err := openSourceReader(source)
 	if err != nil {
 		return 0, err
@@ -1678,6 +1696,77 @@ func copyFileWithOptions(source, destination string, size int64, opts copyFileOp
 		return written, errors.New("destination partition too small")
 	}
 	return written, err
+}
+
+func resolveDestinationCapacity(path string) (int64, bool, error) {
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return 0, false, err
+	} else if ok {
+		return region.Size, true, nil
+	}
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".gz", ".xz", ".zip":
+		return 0, false, nil
+	default:
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, false, err
+		}
+		return info.Size(), true, nil
+	}
+}
+
+func resolveSourceStreamSize(path string) (int64, bool, error) {
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return 0, false, err
+	} else if ok {
+		return region.Size, true, nil
+	}
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".gz", ".xz":
+		return 0, false, nil
+	case ".zip":
+		zr, err := zip.OpenReader(path)
+		if err != nil {
+			return 0, false, err
+		}
+		defer zr.Close()
+		for _, f := range zr.File {
+			if !f.FileInfo().IsDir() {
+				return int64(f.UncompressedSize64), true, nil
+			}
+		}
+		return 0, false, errors.New("zip archive has no file entries")
+	case ".rar":
+		rr, err := rardecode.OpenReader(path, "")
+		if err != nil {
+			return 0, false, err
+		}
+		defer rr.Close()
+		for {
+			h, err := rr.Next()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return 0, false, errors.New("rar archive has no file entries")
+				}
+				return 0, false, err
+			}
+			if h != nil && !h.IsDir {
+				if h.UnKnownSize || h.UnPackedSize < 0 {
+					return 0, false, nil
+				}
+				return h.UnPackedSize, true, nil
+			}
+		}
+	default:
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, false, err
+		}
+		return info.Size(), true, nil
+	}
 }
 
 func compareFiles(source, destination string, size int64) (bool, int64, error) {
@@ -6591,7 +6680,8 @@ func openDestinationWriterWithOptions(path string, requireExisting, preserveSize
 		}, nil
 	default:
 		if requireExisting {
-			if _, err := os.Stat(path); err != nil {
+			info, err := os.Stat(path)
+			if err != nil {
 				return nil, err
 			}
 			f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
@@ -6601,6 +6691,9 @@ func openDestinationWriterWithOptions(path string, requireExisting, preserveSize
 			if _, err := f.Seek(0, io.SeekStart); err != nil {
 				_ = f.Close()
 				return nil, err
+			}
+			if preserveSize {
+				return &partitionWriteCloser{f: f, remaining: info.Size()}, nil
 			}
 			return f, nil
 		}

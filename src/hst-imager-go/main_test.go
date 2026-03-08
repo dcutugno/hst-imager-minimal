@@ -464,7 +464,11 @@ func TestWriteFromXzCompressedSource(t *testing.T) {
 	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
 	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")
 	dest := filepath.Join(t.TempDir(), "out.txt")
-	if err := os.WriteFile(dest, nil, 0o644); err != nil {
+	want, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, make([]byte, len(want)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -477,12 +481,25 @@ func TestWriteFromXzCompressedSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := os.ReadFile(plainPath)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("written data does not match uncompressed xz content")
+	}
+}
+
+func TestWriteFailsWhenSourceExceedsDestinationSize(t *testing.T) {
+	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
+	dest := filepath.Join(t.TempDir(), "small.bin")
+	if err := os.WriteFile(dest, make([]byte, 32), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err := run([]string{"write", xzPath, dest}, &out)
+	if err == nil {
+		t.Fatal("expected write to fail when destination is smaller than source")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "destination partition too small") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
