@@ -1557,6 +1557,95 @@ func TestNativeRdbFsUpdatePathMutatesImage(t *testing.T) {
 	}
 }
 
+func TestRdbPartCopyZeroSizeSourceCopiesUntilEof(t *testing.T) {
+	tmp := t.TempDir()
+	sourceMedia := filepath.Join(tmp, "src.img")
+	destinationMedia := filepath.Join(tmp, "dst.img")
+
+	if err := createBlankFile(sourceMedia, 3*1024*1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := createBlankFile(destinationMedia, 3*1024*1024); err != nil {
+		t.Fatal(err)
+	}
+
+	sourcePattern := bytes.Repeat([]byte{0xab}, 1024*1024)
+	srcFile, err := os.OpenFile(sourceMedia, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srcFile.WriteAt(sourcePattern, rdbMetaStart); err != nil {
+		_ = srcFile.Close()
+		t.Fatal(err)
+	}
+	if err := srcFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceState := rdbState{
+		RdbSize:   rdbMetaStart,
+		FsDataEnd: rdbMetaStart,
+		Fs: []rdbFileSystem{{
+			Index:   1,
+			Name:    "PFS3",
+			DosType: "PDS3",
+		}},
+		Parts: []rdbPart{{
+			Index:  1,
+			Name:   "DH0",
+			Type:   "PDS3",
+			Start:  rdbMetaStart,
+			Size:   0,
+			Status: "active",
+		}},
+	}
+	if err := writeRdbState(sourceMedia, sourceState); err != nil {
+		t.Fatal(err)
+	}
+	destinationState := rdbState{
+		RdbSize:   rdbMetaStart,
+		FsDataEnd: rdbMetaStart,
+		Fs: []rdbFileSystem{{
+			Index:   1,
+			Name:    "PFS3",
+			DosType: "PDS3",
+		}},
+		Parts: []rdbPart{},
+	}
+	if err := writeRdbState(destinationMedia, destinationState); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"rdb", "part", "copy", sourceMedia, "1", destinationMedia}, &out); err != nil {
+		t.Fatalf("rdb part copy failed: %v", err)
+	}
+
+	finalDestinationState, err := readRdbState(destinationMedia)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalDestinationState.Parts) != 1 {
+		t.Fatalf("expected 1 destination partition, got %d", len(finalDestinationState.Parts))
+	}
+	if finalDestinationState.Parts[0].Size != 0 {
+		t.Fatalf("expected destination partition size 0 for synthetic state, got %d", finalDestinationState.Parts[0].Size)
+	}
+
+	sourceBytes, err := os.ReadFile(sourceMedia)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationBytes, err := os.ReadFile(destinationMedia)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := int(rdbMetaStart)
+	if !bytes.Equal(sourceBytes[start:], destinationBytes[start:]) {
+		t.Fatal("expected zero-size copy to copy source bytes until EOF")
+	}
+}
+
 func TestParseNativeVersionFromPfs3Binary(t *testing.T) {
 	pfs3aio := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Pfs3", "pfs3aio")
 	b, err := os.ReadFile(pfs3aio)

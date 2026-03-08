@@ -3515,6 +3515,108 @@ func handleRdbPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 }
 
 func handleRdbPartCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) < 3 {
+		return errors.New("usage: rdb part copy <src-media> <src-index> <dst-media> [--name <name>] [--dos-type <dostype>]")
+	}
+
+	// Legacy mode: rdb part copy <src-media> <src-index> <dst-media> [--name <name>] [--dos-type <dostype>]
+	if _, err := strconv.Atoi(args[1]); err == nil && (len(args) == 3 || len(args) > 3 && strings.HasPrefix(args[3], "-")) {
+		srcIdx, err := strconv.Atoi(args[1])
+		if err != nil {
+			return err
+		}
+		dstMedia := args[2]
+		var name string
+		var dosType string
+		for i := 3; i < len(args); i++ {
+			switch args[i] {
+			case "--name", "-n":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --name")
+				}
+				name = args[i+1]
+				i++
+			case "--dos-type", "-dt":
+				if i+1 >= len(args) {
+					return errors.New("missing value for --dos-type")
+				}
+				dosType = args[i+1]
+				i++
+			default:
+				return fmt.Errorf("unsupported argument: %s", args[i])
+			}
+		}
+
+		srcState, err := readRdbState(args[0])
+		if err != nil {
+			return err
+		}
+		dstState, err := readRdbState(dstMedia)
+		if err != nil {
+			return err
+		}
+		normalizeRdbStateIndexes(&srcState)
+		normalizeRdbStateIndexes(&dstState)
+
+		srcPart, err := findRdbPartByNumber(srcState.Parts, srcIdx)
+		if err != nil {
+			return err
+		}
+		srcCopySize := srcPart.Size
+		srcCopyStart := srcPart.Start
+		if srcState.Native {
+			nativeStart, nativeSize, err := nativePartitionRegionByNumber(args[0], srcIdx)
+			if err != nil {
+				return err
+			}
+			srcCopyStart = nativeStart
+			srcCopySize = nativeSize
+		}
+		if dosType == "" {
+			dosType = srcPart.Type
+		}
+		if len(strings.TrimSpace(dosType)) != 4 {
+			return errors.New("DOS type must be 4 characters")
+		}
+		if !rdbHasDosType(dstState.Fs, dosType) {
+			return fmt.Errorf("file system with DOS type '%s' not found in destination Rigid Disk Block", dosType)
+		}
+		if name == "" {
+			name = srcPart.Name
+		}
+		dstPart, err := appendRdbPart(&dstState, dstMedia, name, dosType, srcCopySize, srcPart.Status)
+		if err != nil {
+			return err
+		}
+		if err := writeRdbState(dstMedia, dstState); err != nil {
+			return err
+		}
+		if dstState.Native {
+			nativeSize := srcCopySize
+			// Legacy copy semantics create a destination partition spanning remaining cylinders when source size is zero.
+			if nativeSize == 0 {
+				nativeSize = dstPart.Size
+			}
+			if err := patchNativePartHighFromLegacySize(dstMedia, dstPart.Index, nativeSize); err != nil {
+				return err
+			}
+		}
+		copySize := srcCopySize
+		// Legacy stream copier treats size 0 as "copy until source EOF".
+		if copySize == 0 {
+			copySize = mediaSize(args[0]) - srcCopyStart
+			if copySize < 0 {
+				copySize = 0
+			}
+		}
+		written, err := copyRange(args[0], dstMedia, srcCopyStart, dstPart.Start, copySize)
+		if err != nil {
+			return err
+		}
+		return printSimpleStatus(stdout, opts, "rdb partition copied", map[string]any{"bytes": written, "index": dstPart.Index})
+	}
+
+	// Backward-compatible mode: rdb part copy <src-media> <src-index> <dst-media> <dst-index>
 	if len(args) < 4 {
 		return errors.New("usage: rdb part copy <src-media> <src-index> <dst-media> <dst-index>")
 	}
@@ -3581,8 +3683,80 @@ func handleRdbPartExport(args []string, stdout io.Writer, opts GlobalOptions) er
 
 func handleRdbPartImport(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 3 {
-		return errors.New("usage: rdb part import <media> <index> <input>")
+		return errors.New("usage: rdb part import <source> <destination> <name> <dostype> [--block-size <size>] [--bootable]")
 	}
+
+	// Legacy mode: rdb part import <source> <destination> <name> <dostype> [--block-size <size>] [--bootable]
+	if len(args) >= 4 {
+		if _, err := strconv.Atoi(args[1]); err != nil {
+			srcPath := args[0]
+			dstPath := args[1]
+			name := args[2]
+			dosType := args[3]
+			blockSize := int64(512)
+			bootable := false
+			for i := 4; i < len(args); i++ {
+				switch args[i] {
+				case "--block-size", "-bs":
+					if i+1 >= len(args) {
+						return errors.New("missing value for --block-size")
+					}
+					v, err := strconv.ParseInt(args[i+1], 10, 64)
+					if err != nil || v <= 0 {
+						return fmt.Errorf("invalid block size: %s", args[i+1])
+					}
+					blockSize = v
+					i++
+				case "--bootable", "-b":
+					bootable = true
+				default:
+					return fmt.Errorf("unsupported argument: %s", args[i])
+				}
+			}
+			if len(strings.TrimSpace(dosType)) != 4 {
+				return errors.New("DOS type must be 4 characters")
+			}
+			if blockSize%512 != 0 {
+				return errors.New("File system block size must be dividable by 512")
+			}
+			srcInfo, err := os.Stat(srcPath)
+			if err != nil {
+				return err
+			}
+			srcSize := srcInfo.Size()
+			if srcSize < 0 {
+				srcSize = 0
+			}
+			state, err := readRdbState(dstPath)
+			if err != nil {
+				return err
+			}
+			normalizeRdbStateIndexes(&state)
+			if !rdbHasDosType(state.Fs, dosType) {
+				return fmt.Errorf("file system with DOS type '%s' not found in Rigid Disk Block", dosType)
+			}
+			part, err := appendRdbPart(&state, dstPath, name, dosType, alignUp(srcSize, mbrSectorSize), "active")
+			if err != nil {
+				return err
+			}
+			_ = bootable
+			if err := writeRdbState(dstPath, state); err != nil {
+				return err
+			}
+			if state.Native {
+				if err := patchNativePartHighFromLegacySize(dstPath, part.Index, srcSize); err != nil {
+					return err
+				}
+			}
+			written, err := copyRange(srcPath, dstPath, 0, part.Start, srcSize)
+			if err != nil {
+				return err
+			}
+			return printSimpleStatus(stdout, opts, "rdb partition imported", map[string]any{"bytes": written, "index": part.Index})
+		}
+	}
+
+	// Backward-compatible mode: rdb part import <media> <index> <input>
 	idx, err := strconv.Atoi(args[1])
 	if err != nil {
 		return err
@@ -4819,6 +4993,139 @@ func parseBoolArg(value string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid boolean value: %s", value)
 	}
+}
+
+func rdbHasDosType(items []rdbFileSystem, dosType string) bool {
+	for _, fs := range items {
+		if sameDosType(fs.DosType, dosType) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendRdbPart(state *rdbState, mediaPath, name, dosType string, size int64, status string) (rdbPart, error) {
+	if size < 0 {
+		return rdbPart{}, errors.New("partition size must be >= 0")
+	}
+	if len(strings.TrimSpace(name)) == 0 {
+		return rdbPart{}, errors.New("partition name is required")
+	}
+	if len(strings.TrimSpace(dosType)) != 4 {
+		return rdbPart{}, errors.New("DOS type must be 4 characters")
+	}
+	for _, p := range state.Parts {
+		if strings.EqualFold(strings.TrimSpace(p.Name), strings.TrimSpace(name)) {
+			return rdbPart{}, fmt.Errorf("partition name '%s' already exists", name)
+		}
+	}
+	start := alignUp(maxInt64(state.RdbSize, rdbUsedEnd(state.Parts)), mbrSectorSize)
+	partSize := alignUp(size, mbrSectorSize)
+	// In native RDB, legacy PartitionBlock.Create treats size 0 as "remaining cylinders".
+	if state.Native && size == 0 {
+		resolvedSize, err := resolveNativeLegacyRemainingPartSize(mediaPath, start)
+		if err != nil {
+			return rdbPart{}, err
+		}
+		partSize = resolvedSize
+	}
+	part := rdbPart{
+		Index:  nextRdbPartIndex(state.Parts),
+		Name:   name,
+		Type:   dosType,
+		Start:  start,
+		Size:   partSize,
+		Status: status,
+	}
+	if part.Status == "" {
+		part.Status = "active"
+	}
+	if part.Start+part.Size > mediaSize(mediaPath) {
+		return rdbPart{}, errors.New("partition does not fit in media")
+	}
+	state.Parts = append(state.Parts, part)
+	normalizeRdbStateIndexes(state)
+	return part, nil
+}
+
+func resolveNativeLegacyRemainingPartSize(mediaPath string, start int64) (int64, error) {
+	ctx, err := readNativeRdbContext(mediaPath)
+	if err != nil {
+		return 0, err
+	}
+	if ctx.cylBytes <= 0 {
+		return 0, errors.New("invalid native rdb cylinder bytes")
+	}
+	lowCyl := maxInt64(start, 0) / ctx.cylBytes
+	mediaBytes := mediaSize(mediaPath)
+	if mediaBytes <= 0 {
+		return 0, errors.New("cannot resolve media size")
+	}
+	highCyl := mediaBytes/ctx.cylBytes - 1
+	if highCyl < lowCyl {
+		return 0, nil
+	}
+	return (highCyl - lowCyl + 1) * ctx.cylBytes, nil
+}
+
+func nativePartitionRegionByNumber(mediaPath string, number int) (int64, int64, error) {
+	ctx, err := readNativeRdbContext(mediaPath)
+	if err != nil {
+		return 0, 0, err
+	}
+	if number < 1 || number > len(ctx.partBlocks) {
+		return 0, 0, fmt.Errorf("invalid partition number '%d'", number)
+	}
+	block := ctx.partBlocks[number-1].block
+	low := int64(readBeU32(block, 0xa4))
+	high := int64(readBeU32(block, 0xa8))
+	if ctx.cylBytes <= 0 {
+		return 0, 0, errors.New("invalid native rdb cylinder bytes")
+	}
+	start := low * ctx.cylBytes
+	cylCount := high - low + 1
+	if cylCount < 0 {
+		cylCount = 0
+	}
+	size := cylCount * ctx.cylBytes
+	return start, size, nil
+}
+
+func patchNativePartHighFromLegacySize(mediaPath string, number int, sizeBytes int64) error {
+	f, err := os.OpenFile(mediaPath, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ctx, err := readNativeRdbContextFromFile(f)
+	if err != nil {
+		return err
+	}
+	if number < 1 || number > len(ctx.partBlocks) {
+		return fmt.Errorf("invalid partition number '%d'", number)
+	}
+	block := ctx.partBlocks[number-1].block
+	low := readBeU32(block, 0xa4)
+	if ctx.cylBytes <= 0 {
+		return errors.New("invalid native rdb cylinder bytes")
+	}
+	cylinders := int64(0)
+	if sizeBytes > 0 {
+		cylinders = sizeBytes / ctx.cylBytes
+	}
+	high := uint32(0)
+	if cylinders <= 0 {
+		high = low - 1
+	} else {
+		high = low + uint32(cylinders) - 1
+	}
+	writeBeU32(block, 0xa8, high)
+	updateAmigaBlockChecksum(block)
+	_, err = f.WriteAt(block, int64(ctx.partBlocks[number-1].blockIndex)*ctx.blockSize)
+	if err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func rdbUsedEnd(items []rdbPart) int64 {

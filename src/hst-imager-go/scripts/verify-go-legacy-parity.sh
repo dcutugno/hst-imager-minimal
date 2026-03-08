@@ -599,6 +599,57 @@ run_partition_workflow_cases() {
   compare_info_semantic_case "$name" "$off_media" "$force_media"
   compare_media_hash_case "$name" "$off_media" "$force_media"
 
+  name="partition-rdb-part-import-copy"
+  seed_src="$TMP_DIR/${name}.seed-src.img"
+  seed_dst="$TMP_DIR/${name}.seed-dst.img"
+  off_src="$TMP_DIR/${name}.off-src.img"
+  force_src="$TMP_DIR/${name}.force-src.img"
+  off_dst="$TMP_DIR/${name}.off-dst.img"
+  force_dst="$TMP_DIR/${name}.force-dst.img"
+  payload="$TMP_DIR/${name}.payload.bin"
+  printf 'ABCDEFGH' >"$payload"
+  run_mode force "$TMP_DIR/${name}.seed.blank-src.out" "$TMP_DIR/${name}.seed.blank-src.err" "$TMP_DIR/${name}.seed.blank-src.rc" blank "$seed_src" 64MB
+  run_mode force "$TMP_DIR/${name}.seed.blank-dst.out" "$TMP_DIR/${name}.seed.blank-dst.err" "$TMP_DIR/${name}.seed.blank-dst.rc" blank "$seed_dst" 64MB
+  run_mode force "$TMP_DIR/${name}.seed.init-src.out" "$TMP_DIR/${name}.seed.init-src.err" "$TMP_DIR/${name}.seed.init-src.rc" rdb initialize "$seed_src"
+  run_mode force "$TMP_DIR/${name}.seed.init-dst.out" "$TMP_DIR/${name}.seed.init-dst.err" "$TMP_DIR/${name}.seed.init-dst.rc" rdb initialize "$seed_dst"
+  if [[ "$(cat "$TMP_DIR/${name}.seed.init-src.rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$TMP_DIR/${name}.seed.init-src.out" "$TMP_DIR/${name}.seed.init-src.err"; then
+    skip_case "$name" "legacy backend does not expose rdb initialize in the published baseline"
+    return
+  fi
+  run_mode force "$TMP_DIR/${name}.seed.fs-src.out" "$TMP_DIR/${name}.seed.fs-src.err" "$TMP_DIR/${name}.seed.fs-src.rc" rdb filesystem add "$seed_src" "$PFS3_AIO" PDS3
+  run_mode force "$TMP_DIR/${name}.seed.fs-dst.out" "$TMP_DIR/${name}.seed.fs-dst.err" "$TMP_DIR/${name}.seed.fs-dst.rc" rdb filesystem add "$seed_dst" "$PFS3_AIO" PDS3
+  cp "$seed_src" "$off_src"
+  cp "$seed_src" "$force_src"
+  cp "$seed_dst" "$off_dst"
+  cp "$seed_dst" "$force_dst"
+
+  run_mode off "$TMP_DIR/${name}.import.off.out" "$TMP_DIR/${name}.import.off.err" "$TMP_DIR/${name}.import.off.rc" rdb part import "$payload" "$off_src" DH0 PDS3
+  run_mode force "$TMP_DIR/${name}.import.force.out" "$TMP_DIR/${name}.import.force.err" "$TMP_DIR/${name}.import.force.rc" rdb part import "$payload" "$force_src" DH0 PDS3
+  if [[ "$(cat "$TMP_DIR/${name}.import.force.rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$TMP_DIR/${name}.import.force.out" "$TMP_DIR/${name}.import.force.err"; then
+    skip_case "$name" "legacy backend does not expose rdb part import in the published baseline"
+    return
+  fi
+  if ! diff -u "$TMP_DIR/${name}.import.off.rc" "$TMP_DIR/${name}.import.force.rc" >"$TMP_DIR/${name}.import.rc.diff"; then
+    fail_case "$name" "exit code mismatch at step 'import' (see $TMP_DIR/${name}.import.rc.diff)"
+    return
+  fi
+
+  run_mode off "$TMP_DIR/${name}.copy.off.out" "$TMP_DIR/${name}.copy.off.err" "$TMP_DIR/${name}.copy.off.rc" rdb part copy "$off_src" 1 "$off_dst"
+  run_mode force "$TMP_DIR/${name}.copy.force.out" "$TMP_DIR/${name}.copy.force.err" "$TMP_DIR/${name}.copy.force.rc" rdb part copy "$force_src" 1 "$force_dst"
+  if [[ "$(cat "$TMP_DIR/${name}.copy.force.rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$TMP_DIR/${name}.copy.force.out" "$TMP_DIR/${name}.copy.force.err"; then
+    skip_case "$name" "legacy backend does not expose rdb part copy in the published baseline"
+    return
+  fi
+  if ! diff -u "$TMP_DIR/${name}.copy.off.rc" "$TMP_DIR/${name}.copy.force.rc" >"$TMP_DIR/${name}.copy.rc.diff"; then
+    fail_case "$name" "exit code mismatch at step 'copy' (see $TMP_DIR/${name}.copy.rc.diff)"
+    return
+  fi
+
+  compare_info_semantic_case "${name}-src" "$off_src" "$force_src"
+  compare_media_hash_case "${name}-src" "$off_src" "$force_src"
+  compare_info_semantic_case "${name}-dst" "$off_dst" "$force_dst"
+  compare_media_hash_case "${name}-dst" "$off_dst" "$force_dst"
+
   name="partition-rdb-part-delete"
   off_media="$TMP_DIR/${name}.off.img"
   force_media="$TMP_DIR/${name}.force.img"
