@@ -31,6 +31,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.22.x"
+          cache-dependency-path: src/hst-imager-go/go.sum
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -86,6 +87,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.22.x"
+          cache-dependency-path: src/hst-imager-go/go.sum
 
       - name: Go tests and prototype checks
         shell: bash
@@ -109,6 +111,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.22.x"
+          cache-dependency-path: src/hst-imager-go/go.sum
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
