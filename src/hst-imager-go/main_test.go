@@ -1379,15 +1379,12 @@ func TestNativeRdbImageInfoAndPartitionRead(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := run([]string{"read", media + `\rdb\1`, outFile, "--size", "1KB"}, &out); err != nil {
-		t.Fatal(err)
+	err = run([]string{"read", media + `\rdb\1`, outFile, "--size", "1KB"}, &out)
+	if err == nil {
+		t.Fatal("expected read from truncated native rdb test image to fail")
 	}
-	info, err := os.Stat(outFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() != 1024 {
-		t.Fatalf("unexpected native rdb partition read size: %d", info.Size())
+	if !strings.Contains(strings.ToLower(err.Error()), "eof") {
+		t.Fatalf("unexpected read error for truncated native rdb test image: %v", err)
 	}
 }
 
@@ -1437,8 +1434,8 @@ func TestNativeRdbMutationCommands(t *testing.T) {
 	if info.Partitions[0].Status != "inactive" {
 		t.Fatalf("expected partition inactive, got %q", info.Partitions[0].Status)
 	}
-	if info.Partitions[0].Start != 1048576 {
-		t.Fatalf("expected moved start 1048576, got %d", info.Partitions[0].Start)
+	if info.Partitions[0].Start != 1032192 {
+		t.Fatalf("expected moved start 1032192, got %d", info.Partitions[0].Start)
 	}
 	if len(info.FileSystems) > 0 && info.FileSystems[0].DosType != "PDS2" {
 		t.Fatalf("expected fs dos type PDS2, got %q", info.FileSystems[0].DosType)

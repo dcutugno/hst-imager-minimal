@@ -38,6 +38,7 @@ RAR_IMG="$DATA_ROOT/compressed-images/1gb.img.rar"
 GZ_IMG="$DATA_ROOT/compressed-images/1gb.img.gz"
 XZ_IMG="$DATA_ROOT/compressed-images/1gb.img.xz"
 XZ_SMALL="$DATA_ROOT/Xz/test.txt.xz"
+PFS3_AIO="$DATA_ROOT/Pfs3/pfs3aio"
 
 normalize_text() {
   local in_file="$1"
@@ -381,6 +382,7 @@ run_partition_workflow_cases() {
   local name
   local off_media
   local force_media
+  local seed_media
   local rc
 
   name="partition-mbr-basic"
@@ -467,6 +469,24 @@ run_partition_workflow_cases() {
   run_step_pair "$name" "blank" "$off_media" "$force_media" blank "__MEDIA__" 64MB; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   run_step_pair "$name" "initialize" "$off_media" "$force_media" rdb initialize "__MEDIA__"; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  compare_info_semantic_case "$name" "$off_media" "$force_media"
+
+  name="partition-rdb-fsadd-partadd"
+  off_media="$TMP_DIR/${name}.off.img"
+  force_media="$TMP_DIR/${name}.force.img"
+  seed_media="$TMP_DIR/${name}.seed.img"
+  run_mode force "$TMP_DIR/${name}.seed.blank.out" "$TMP_DIR/${name}.seed.blank.err" "$TMP_DIR/${name}.seed.blank.rc" blank "$seed_media" 64MB
+  run_mode force "$TMP_DIR/${name}.seed.init.out" "$TMP_DIR/${name}.seed.init.err" "$TMP_DIR/${name}.seed.init.rc" rdb initialize "$seed_media"
+  if [[ "$(cat "$TMP_DIR/${name}.seed.init.rc")" != "0" ]] && grep -Eq "Unrecognized command or argument|Show help and usage information" "$TMP_DIR/${name}.seed.init.out" "$TMP_DIR/${name}.seed.init.err"; then
+    skip_case "$name" "legacy backend does not expose rdb initialize in the published baseline"
+    return
+  fi
+  cp "$seed_media" "$off_media"
+  cp "$seed_media" "$force_media"
+  run_step_pair "$name" "fs-add" "$off_media" "$force_media" rdb filesystem add "__MEDIA__" "$PFS3_AIO" PDS3; rc=$?
+  if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
+  run_step_pair "$name" "part-add" "$off_media" "$force_media" rdb part add "__MEDIA__" DH0 PDS3 8MB; rc=$?
   if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
   compare_info_semantic_case "$name" "$off_media" "$force_media"
 }

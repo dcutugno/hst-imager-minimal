@@ -137,6 +137,8 @@ type rdbPart struct {
 type nativeRdbContext struct {
 	blockSize  int64
 	cylBytes   int64
+	rdbBlockLo int64
+	rdbBlockHi int64
 	rdskBlock  []byte
 	partBlocks []nativeRdbChainBlock
 	fsBlocks   []nativeRdbChainBlock
@@ -3137,6 +3139,22 @@ func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if err != nil {
 		return err
 	}
+	fs := rdbFileSystem{
+		Index:    nextRdbFsIndex(state.Fs),
+		Name:     filepath.Base(args[1]),
+		DataSize: int64(len(b)),
+	}
+	if len(args) > 2 {
+		fs.DosType = args[2]
+	}
+	if state.Native {
+		// Native RDB stores filesystem metadata in FSHD blocks; payload bytes are managed by the native writer.
+		state.Fs = append(state.Fs, fs)
+		if err := writeRdbState(args[0], state); err != nil {
+			return err
+		}
+		return printSimpleStatus(stdout, opts, "rdb filesystem added", map[string]any{"index": fs.Index, "name": fs.Name, "size": fs.DataSize})
+	}
 	offset := alignUp(state.FsDataEnd, mbrSectorSize)
 	if offset+int64(len(b)) > state.RdbSize {
 		return errors.New("rdb has insufficient space for filesystem binary, resize rdb first")
@@ -3144,15 +3162,7 @@ func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if err := writeBytesAt(args[0], offset, b); err != nil {
 		return err
 	}
-	fs := rdbFileSystem{
-		Index:      nextRdbFsIndex(state.Fs),
-		Name:       filepath.Base(args[1]),
-		DataOffset: offset,
-		DataSize:   int64(len(b)),
-	}
-	if len(args) > 2 {
-		fs.DosType = args[2]
-	}
+	fs.DataOffset = offset
 	state.Fs = append(state.Fs, fs)
 	state.FsDataEnd = offset + int64(len(b))
 	if err := writeRdbState(args[0], state); err != nil {
@@ -3695,12 +3705,6 @@ func writeNativeRdbState(path string, state rdbState) error {
 	if err != nil {
 		return err
 	}
-	if len(ctx.partBlocks) == 0 && len(state.Parts) > 0 {
-		return errors.New("native rdb add requires existing PART template")
-	}
-	if len(ctx.fsBlocks) == 0 && len(state.Fs) > 0 {
-		return errors.New("native rdb fs add requires existing FSHD template")
-	}
 	if err := applyNativePartState(&ctx, state); err != nil {
 		return err
 	}
@@ -3734,18 +3738,22 @@ func readNativeRdbContextFromFile(f *os.File) (nativeRdbContext, error) {
 	if blockSize <= 0 {
 		blockSize = mbrSectorSize
 	}
-	sectorsPerTrack := int64(readBeU32(sector, 0x48))
-	heads := int64(readBeU32(sector, 0x4c))
+	sectorsPerTrack := int64(readBeU32(sector, 0x44))
+	heads := int64(readBeU32(sector, 0x48))
 	if sectorsPerTrack <= 0 {
 		sectorsPerTrack = 63
 	}
 	if heads <= 0 {
 		heads = 16
 	}
+	rdbBlockLo := int64(readBeU32(sector, 0x80))
+	rdbBlockHi := int64(readBeU32(sector, 0x84))
 	ctx := nativeRdbContext{
-		blockSize: blockSize,
-		cylBytes:  sectorsPerTrack * heads * blockSize,
-		rdskBlock: append([]byte(nil), sector...),
+		blockSize:  blockSize,
+		cylBytes:   sectorsPerTrack * heads * blockSize,
+		rdbBlockLo: rdbBlockLo,
+		rdbBlockHi: rdbBlockHi,
+		rdskBlock:  append([]byte(nil), sector...),
 	}
 	partPtr := int32(readBeU32(sector, 0x1c))
 	fsPtr := int32(readBeU32(sector, 0x20))
@@ -3804,12 +3812,12 @@ func nativeContextToState(ctx nativeRdbContext) rdbState {
 		flags := readBeU32(block, 0x14)
 		lowCyl := int64(readBeU32(block, 0xa4))
 		highCyl := int64(readBeU32(block, 0xa8))
-		dosType := string(block[0xc0:0xc4])
+		dosType := formatDosTypeField(block[0xc0:0xc4])
 		if highCyl < lowCyl {
 			highCyl = lowCyl
 		}
 		status := "active"
-		if flags&0x1 == 0 {
+		if flags&0x2 != 0 {
 			status = "inactive"
 		}
 		state.Parts = append(state.Parts, rdbPart{
@@ -3826,7 +3834,7 @@ func nativeContextToState(ctx nativeRdbContext) rdbState {
 			maxBlock = fb.blockIndex
 		}
 		block := fb.block
-		dosType := string(block[0x20:0x24])
+		dosType := formatDosTypeField(block[0x20:0x24])
 		version := fmt.Sprintf("%d.%d", readBeU16(block, 0x24), readBeU16(block, 0x26))
 		name := readAsciiCString(block, 0xac, int(ctx.blockSize-0xac))
 		if name == "" {
@@ -3841,7 +3849,11 @@ func nativeContextToState(ctx nativeRdbContext) rdbState {
 			DataSize:   ctx.blockSize,
 		})
 	}
-	state.RdbSize = int64(maxBlock+1) * ctx.blockSize
+	if ctx.rdbBlockHi >= ctx.rdbBlockLo && ctx.rdbBlockLo >= 0 {
+		state.RdbSize = (ctx.rdbBlockHi - ctx.rdbBlockLo + 1) * ctx.blockSize
+	} else {
+		state.RdbSize = int64(maxBlock+1) * ctx.blockSize
+	}
 	if state.RdbSize < ctx.blockSize {
 		state.RdbSize = ctx.blockSize
 	}
@@ -3853,11 +3865,13 @@ func applyNativePartState(ctx *nativeRdbContext, state rdbState) error {
 	desired := len(state.Parts)
 	current := len(ctx.partBlocks)
 	if desired > current {
-		if current == 0 {
-			return errors.New("cannot add native rdb partition without template")
-		}
 		maxIdx := maxNativeBlockIndex(ctx)
-		template := append([]byte(nil), ctx.partBlocks[current-1].block...)
+		var template []byte
+		if current == 0 {
+			template = newNativePartBlock(ctx.blockSize)
+		} else {
+			template = append([]byte(nil), ctx.partBlocks[current-1].block...)
+		}
 		for i := current; i < desired; i++ {
 			maxIdx++
 			block := append([]byte(nil), template...)
@@ -3881,10 +3895,11 @@ func applyNativePartState(ctx *nativeRdbContext, state rdbState) error {
 		}
 		block := ctx.partBlocks[i].block
 		flags := readBeU32(block, 0x14)
+		// Preserve native flag bits and only toggle NoMount semantics for inactive/killed states.
 		if p.Status == "inactive" || p.Status == "killed" {
-			flags &^= 0x1
+			flags |= 0x2
 		} else {
-			flags |= 0x1
+			flags &^= 0x2
 		}
 		writeBeU32(block, 0x14, flags)
 		lowCyl := uint32(0)
@@ -3902,7 +3917,7 @@ func applyNativePartState(ctx *nativeRdbContext, state rdbState) error {
 		writeBeU32(block, 0xa4, lowCyl)
 		writeBeU32(block, 0xa8, highCyl)
 		writeBString(block, 0x24, p.Name)
-		writeFourCC(block, 0xc0, p.Type)
+		writeDosTypeField(block, 0xc0, p.Type)
 		updateAmigaBlockChecksum(block)
 	}
 	return nil
@@ -3912,11 +3927,13 @@ func applyNativeFsState(ctx *nativeRdbContext, state rdbState) error {
 	desired := len(state.Fs)
 	current := len(ctx.fsBlocks)
 	if desired > current {
-		if current == 0 {
-			return errors.New("cannot add native rdb filesystem without template")
-		}
 		maxIdx := maxNativeBlockIndex(ctx)
-		template := append([]byte(nil), ctx.fsBlocks[current-1].block...)
+		var template []byte
+		if current == 0 {
+			template = newNativeFsHeaderBlock(ctx.blockSize)
+		} else {
+			template = append([]byte(nil), ctx.fsBlocks[current-1].block...)
+		}
 		for i := current; i < desired; i++ {
 			maxIdx++
 			block := append([]byte(nil), template...)
@@ -3939,7 +3956,7 @@ func applyNativeFsState(ctx *nativeRdbContext, state rdbState) error {
 			break
 		}
 		block := ctx.fsBlocks[i].block
-		writeFourCC(block, 0x20, fs.DosType)
+		writeDosTypeField(block, 0x20, fs.DosType)
 		if fs.Version != "" {
 			parts := strings.SplitN(fs.Version, ".", 2)
 			major, _ := strconv.Atoi(parts[0])
@@ -4000,6 +4017,31 @@ func maxNativeBlockIndex(ctx *nativeRdbContext) int32 {
 		}
 	}
 	return maxIdx
+}
+
+func newNativePartBlock(blockSize int64) []byte {
+	if blockSize <= 0 {
+		blockSize = mbrSectorSize
+	}
+	block := make([]byte, blockSize)
+	copy(block[:4], []byte("PART"))
+	writeBeU32(block, 0x04, uint32(blockSize/4))
+	writeBeU32(block, 0x0c, 7)
+	writeBeU32(block, 0x10, ^uint32(0))
+	writeBeU32(block, 0x14, 0)
+	return block
+}
+
+func newNativeFsHeaderBlock(blockSize int64) []byte {
+	if blockSize <= 0 {
+		blockSize = mbrSectorSize
+	}
+	block := make([]byte, blockSize)
+	copy(block[:4], []byte("FSHD"))
+	writeBeU32(block, 0x04, uint32(blockSize/4))
+	writeBeU32(block, 0x0c, 7)
+	writeBeU32(block, 0x10, ^uint32(0))
+	return block
 }
 
 func readBlockAt(f *os.File, offset int64, size int) ([]byte, error) {
@@ -4104,6 +4146,45 @@ func writeFourCC(b []byte, offset int, value string) {
 			b[offset+i] = 0
 		}
 	}
+}
+
+func formatDosTypeField(raw []byte) string {
+	if len(raw) < 4 {
+		return ""
+	}
+	out := make([]byte, 0, 4)
+	for i := 0; i < 3; i++ {
+		if raw[i] == 0 {
+			break
+		}
+		out = append(out, raw[i])
+	}
+	if raw[3] >= '0' && raw[3] <= '9' {
+		out = append(out, raw[3])
+		return string(out)
+	}
+	if raw[3] < 32 {
+		out = append(out, byte('0'+raw[3]))
+		return string(out)
+	}
+	if raw[3] != 0 {
+		out = append(out, raw[3])
+	}
+	return string(out)
+}
+
+func writeDosTypeField(b []byte, offset int, value string) {
+	if offset+4 > len(b) {
+		return
+	}
+	trimmed := strings.TrimSpace(value)
+	raw := []byte(trimmed)
+	if len(raw) == 4 && raw[3] >= '0' && raw[3] <= '9' {
+		copy(b[offset:offset+3], raw[:3])
+		b[offset+3] = raw[3] - '0'
+		return
+	}
+	writeFourCC(b, offset, value)
 }
 
 func writeAsciiCString(b []byte, offset int, value string) {
