@@ -23,7 +23,7 @@ Initial bootstrap for porting Hst Imager Console to Go.
 - transfer/read/write/compare support compressed image flows:
   - read from `.gz` and `.zip`
   - write to `.gz` and `.zip`
-- archive listing/extract now supports non-zip formats via `bsdtar` fallback (including `.lha`/`.lzx` when available in runtime tar support)
+- archive listing/extract now supports native non-zip formats in pure Go (`.tar`, `.tgz`, `.tar.gz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.lha/.lzh`, `.lzx`, `.rar`, `.gz`, `.xz`), with `bsdtar` fallback for unsupported legacy variants
 - partition path support in I/O commands using `\mbr\N`, `\gpt\N`, `\rdb\N` suffixes
 - `fs dir <media>\mbr|gpt|rdb` lists partition containers
 
@@ -85,7 +85,8 @@ Pure-Go parity progress:
 - `fs dir` now reads `_UAEFSDB.___` and `.uaem` metadata in pure Go to resolve Amiga names/protection bits/comments, hides metadata files from listings, and supports recursive metadata-aware path mapping.
 - `fs copy`/`fs extract` now read source UAE metadata in pure Go and propagate metadata properties (protection bits/comments) to destination metadata files, including entries where names do not require remapping.
 - `fs dir`/`fs copy`/`fs extract` now resolve Amiga-style source path components via UAE metadata mappings (e.g. `file1*` -> `__uae___file1_` or `file1%2a`) in pure-Go mode.
-- archive handling now supports native non-zip tar-family formats in Go (`.tar`, `.tgz`, `.tar.gz`) for both `archive list` and `fs extract`.
+- archive handling now supports native non-zip tar-family formats in Go (`.tar`, `.tgz`, `.tar.gz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`) for both `archive list` and `fs extract`.
+- single-stream compressed archives now have native pure-Go handling for `archive list` and `fs extract` (`.gz`, `.xz`) with inner-path matching semantics.
 - `fs extract` archive-root behavior now matches legacy semantics: when inner path is empty, extraction is recursive even without `--recursive`.
 - archive path extraction now handles exact single-file inner paths and case-insensitive matching (`archive\Dir\File`).
 - LHA now has native `archive list` and native `fs extract` for mixed archives, including compressed `-lh4-/-lh5-/-lh6-/-lh7-` and stored `-lh0-` through vendored `koron-go/lha`.

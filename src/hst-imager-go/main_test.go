@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ulikunitz/xz"
 )
 
 func TestMain(m *testing.M) {
@@ -154,6 +156,47 @@ func TestFsExtractTarGzNative(t *testing.T) {
 	}
 }
 
+func TestArchiveListTarXzNative(t *testing.T) {
+	tmp := t.TempDir()
+	tarXzPath := filepath.Join(tmp, "sample.tar.xz")
+	if err := writeTarXzArchive(tarXzPath, map[string]string{
+		"dir/a.txt": "aaa",
+		"root.txt":  "root",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", tarXzPath}, &out); err != nil {
+		t.Fatalf("archive list tar.xz failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "dir/a.txt") || !strings.Contains(out.String(), "root.txt") {
+		t.Fatalf("unexpected tar.xz archive list output: %q", out.String())
+	}
+}
+
+func TestFsExtractTarXzNative(t *testing.T) {
+	tmp := t.TempDir()
+	tarXzPath := filepath.Join(tmp, "sample.tar.xz")
+	if err := writeTarXzArchive(tarXzPath, map[string]string{
+		"dir/a.txt": "aaa",
+		"dir/b.txt": "bbb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", tarXzPath + string(os.PathSeparator) + "DIR" + string(os.PathSeparator) + "A.TXT", dest}, &out); err != nil {
+		t.Fatalf("fs extract tar.xz failed: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dest, "a.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file a.txt: %v", err)
+	}
+	if string(b) != "aaa" {
+		t.Fatalf("unexpected extracted content: %q", string(b))
+	}
+}
+
 func TestFsExtractArchiveRootWithoutRecursive(t *testing.T) {
 	tmp := t.TempDir()
 	zipPath := filepath.Join(tmp, "sample.zip")
@@ -221,6 +264,114 @@ func TestFsExtractArchiveSingleFileWithoutRecursive(t *testing.T) {
 	}
 	if string(b) != "aaa" {
 		t.Fatalf("unexpected extracted content: %q", string(b))
+	}
+}
+
+func TestArchiveListGzipWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	gzPath := filepath.Join(tmp, "sample.bin.gz")
+	payload := []byte("hello gzip")
+	if err := writeGzipFileWithName(gzPath, "dir/payload.bin", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", gzPath}, &out); err != nil {
+		t.Fatalf("archive list gzip without bsdtar failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "dir/payload.bin") {
+		t.Fatalf("unexpected gzip list output: %q", out.String())
+	}
+}
+
+func TestFsExtractGzipInnerPathCaseInsensitiveWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	gzPath := filepath.Join(tmp, "sample.bin.gz")
+	payload := []byte("hello gzip")
+	if err := writeGzipFileWithName(gzPath, "dir/payload.bin", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	source := gzPath + string(os.PathSeparator) + "DIR" + string(os.PathSeparator) + "PAYLOAD.BIN"
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", source, dest}, &out); err != nil {
+		t.Fatalf("fs extract gzip without bsdtar failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "payload.bin"))
+	if err != nil {
+		t.Fatalf("expected extracted file payload.bin: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("unexpected extracted content: %q", string(got))
+	}
+}
+
+func TestArchiveListXzWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", xzPath}, &out); err != nil {
+		t.Fatalf("archive list xz without bsdtar failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "test.txt") {
+		t.Fatalf("unexpected xz list output: %q", out.String())
+	}
+}
+
+func TestFsExtractXzInnerPathCaseInsensitiveWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
+	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")
+	want, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out")
+	source := xzPath + string(os.PathSeparator) + "TEST.TXT"
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", source, dest}, &out); err != nil {
+		t.Fatalf("fs extract xz without bsdtar failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "test.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file test.txt: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("extracted xz file content mismatch")
+	}
+}
+
+func TestFsExtractLzhInnerPathWorksWithoutBsdtar(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	srcLha := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "amiga.lha")
+	data, err := os.ReadFile(srcLha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lzhPath := filepath.Join(tmp, "amiga.lzh")
+	if err := os.WriteFile(lzhPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	source := lzhPath + string(os.PathSeparator) + "TEST1" + string(os.PathSeparator) + "TEST2.INFO"
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", source, dest}, &out); err != nil {
+		t.Fatalf("fs extract lzh inner path without bsdtar failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dest, "test2.info"))
+	if err != nil {
+		t.Fatalf("expected extracted file test2.info: %v", err)
+	}
+	if info.Size() != 900 {
+		t.Fatalf("expected test2.info size 900, got %d", info.Size())
 	}
 }
 
@@ -557,6 +708,50 @@ func writeTarGzArchive(path string, files map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func writeTarXzArchive(path string, files map[string]string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	xw, err := xz.NewWriter(f)
+	if err != nil {
+		return err
+	}
+	defer xw.Close()
+	tw := tar.NewWriter(xw)
+	defer tw.Close()
+	for name, content := range files {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, strings.NewReader(content)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeGzipFileWithName(path, name string, payload []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gw := gzip.NewWriter(f)
+	gw.Name = name
+	if _, err := gw.Write(payload); err != nil {
+		_ = gw.Close()
+		return err
+	}
+	return gw.Close()
 }
 
 func TestBlankInfoTransferCompareFlow(t *testing.T) {
@@ -983,6 +1178,47 @@ func TestMbrChsGeometryMatchesLegacyProgression(t *testing.T) {
 				t.Fatalf("unexpected geometry for %s: got %d/%d, want %d/%d", tc.name, heads, sectors, tc.wantHeads, tc.wantSectors)
 			}
 		})
+	}
+}
+
+func TestMbrMultiPartitionChsMatchesLegacyLayout(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "multi-mbr.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "64MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "4MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "4MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	sector0, err := os.ReadFile(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry2 := sector0[446+16 : 446+32]
+	entry3 := sector0[446+32 : 446+48]
+	if got := fmt.Sprintf("%02x%02x%02x", entry2[1], entry2[2], entry2[3]); got != "030308" {
+		t.Fatalf("unexpected entry2 start CHS: %s", got)
+	}
+	if got := fmt.Sprintf("%02x%02x%02x", entry2[5], entry2[6], entry2[7]); got != "070618" {
+		t.Fatalf("unexpected entry2 end CHS: %s", got)
+	}
+	if got := fmt.Sprintf("%02x%02x%02x", entry3[1], entry3[2], entry3[3]); got != "070718" {
+		t.Fatalf("unexpected entry3 start CHS: %s", got)
+	}
+	if got := fmt.Sprintf("%02x%02x%02x", entry3[5], entry3[6], entry3[7]); got != "090820" {
+		t.Fatalf("unexpected entry3 end CHS: %s", got)
 	}
 }
 

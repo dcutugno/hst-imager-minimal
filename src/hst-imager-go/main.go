@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha1"
@@ -2489,6 +2490,8 @@ func writeMbrPartitions(path string, parts []mbrPartition) error {
 	if err != nil {
 		return err
 	}
+	primaryHeads, primarySectors := mbrChsGeometry(capacitySectors)
+	secondaryHeads, secondarySectors := mbrChsSecondaryGeometry(capacitySectors)
 	sector := make([]byte, mbrSectorSize)
 	if _, err := io.ReadFull(f, sector); err != nil {
 		return err
@@ -2505,7 +2508,13 @@ func writeMbrPartitions(path string, parts []mbrPartition) error {
 		if p.Bootable {
 			sector[offset] = 0x80
 		}
-		startHead, startSectorCylinder, startCylinder := encodeMbrChs(p.StartLBA, capacitySectors)
+		headsPerCylinder := primaryHeads
+		sectorsPerTrack := primarySectors
+		if p.Index > 1 {
+			headsPerCylinder = secondaryHeads
+			sectorsPerTrack = secondarySectors
+		}
+		startHead, startSectorCylinder, startCylinder := encodeMbrChsWithGeometry(p.StartLBA, headsPerCylinder, sectorsPerTrack)
 		sector[offset+1] = startHead
 		sector[offset+2] = startSectorCylinder
 		sector[offset+3] = startCylinder
@@ -2514,7 +2523,7 @@ func writeMbrPartitions(path string, parts []mbrPartition) error {
 		if p.SectorCount > 0 {
 			lastLBA = p.StartLBA + p.SectorCount - 1
 		}
-		endHead, endSectorCylinder, endCylinder := encodeMbrChs(lastLBA, capacitySectors)
+		endHead, endSectorCylinder, endCylinder := encodeMbrChsWithGeometry(lastLBA, headsPerCylinder, sectorsPerTrack)
 		sector[offset+5] = endHead
 		sector[offset+6] = endSectorCylinder
 		sector[offset+7] = endCylinder
@@ -2530,24 +2539,24 @@ func writeMbrPartitions(path string, parts []mbrPartition) error {
 }
 
 func encodeMbrChs(lba, totalSectors uint32) (head, sectorCylinder, cylinder byte) {
-	const maxCylinder uint32 = 1023
-
 	headsPerCylinder, sectorsPerTrack := mbrChsGeometry(totalSectors)
+	return encodeMbrChsWithGeometry(lba, headsPerCylinder, sectorsPerTrack)
+}
+
+func encodeMbrChsWithGeometry(lba, headsPerCylinder, sectorsPerTrack uint32) (head, sectorCylinder, cylinder byte) {
+	const maxCylinder uint32 = 1023
 	if headsPerCylinder == 0 || sectorsPerTrack == 0 {
 		return 0, 0, 0
 	}
-
 	maxAddressableLBA := (uint64(maxCylinder)+1)*uint64(headsPerCylinder)*uint64(sectorsPerTrack) - 1
 	if uint64(lba) > maxAddressableLBA {
 		return 0xfe, 0xff, 0xff
 	}
-
 	chsSpan := uint64(headsPerCylinder) * uint64(sectorsPerTrack)
 	cyl := uint64(lba) / chsSpan
 	rem := uint64(lba) % chsSpan
 	hd := rem / uint64(sectorsPerTrack)
 	sec := (rem % uint64(sectorsPerTrack)) + 1
-
 	head = byte(hd)
 	sectorCylinder = byte((sec & 0x3f) | ((cyl >> 2) & 0xc0))
 	cylinder = byte(cyl & 0xff)
@@ -2575,6 +2584,23 @@ func mbrChsGeometry(totalSectors uint32) (headsPerCylinder, sectorsPerTrack uint
 		sectorsPerTrack = 63
 		cylinders = uint64(totalSectors) / (uint64(headsPerCylinder) * uint64(sectorsPerTrack))
 	}
+	for cylinders > 1023 && headsPerCylinder < 128 {
+		headsPerCylinder *= 2
+		cylinders = uint64(totalSectors) / (uint64(headsPerCylinder) * uint64(sectorsPerTrack))
+	}
+	if cylinders > 1023 {
+		headsPerCylinder = 255
+	}
+	return headsPerCylinder, sectorsPerTrack
+}
+
+func mbrChsSecondaryGeometry(totalSectors uint32) (headsPerCylinder, sectorsPerTrack uint32) {
+	headsPerCylinder = 16
+	sectorsPerTrack = 63
+	if totalSectors == 0 {
+		return headsPerCylinder, sectorsPerTrack
+	}
+	cylinders := uint64(totalSectors) / (uint64(headsPerCylinder) * uint64(sectorsPerTrack))
 	for cylinders > 1023 && headsPerCylinder < 128 {
 		headsPerCylinder *= 2
 		cylinders = uint64(totalSectors) / (uint64(headsPerCylinder) * uint64(sectorsPerTrack))
@@ -6459,6 +6485,10 @@ const (
 	archiveFormatZip    archiveFormat = "zip"
 	archiveFormatTar    archiveFormat = "tar"
 	archiveFormatTarGz  archiveFormat = "targz"
+	archiveFormatTarXz  archiveFormat = "tarxz"
+	archiveFormatTarBz2 archiveFormat = "tarbz2"
+	archiveFormatGzip   archiveFormat = "gz"
+	archiveFormatXz     archiveFormat = "xz"
 	archiveFormatLha    archiveFormat = "lha"
 	archiveFormatLzx    archiveFormat = "lzx"
 	archiveFormatRar    archiveFormat = "rar"
@@ -6866,6 +6896,14 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		return listTarArchiveEntries(path, false)
 	case archiveFormatTarGz:
 		return listTarArchiveEntries(path, true)
+	case archiveFormatTarXz:
+		return listTarXzArchiveEntries(path)
+	case archiveFormatTarBz2:
+		return listTarBzip2ArchiveEntries(path)
+	case archiveFormatGzip:
+		return listGzipArchiveEntries(path)
+	case archiveFormatXz:
+		return listXzArchiveEntries(path)
 	case archiveFormatLha:
 		items, err := listLhaArchiveEntries(path)
 		if err == nil {
@@ -6923,7 +6961,7 @@ func zipAmigaProtectionBits(file *zip.File) *int {
 
 func splitArchivePath(path string) (archivePath string, innerPath string, ok bool) {
 	lower := strings.ToLower(path)
-	for _, ext := range []string{".tar.gz", ".tgz", ".zip", ".lha", ".lzx", ".tar", ".gz", ".xz", ".bz2", ".rar", ".z"} {
+	for _, ext := range []string{".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".zip", ".lha", ".lzh", ".lzx", ".tar", ".gz", ".xz", ".bz2", ".rar", ".z"} {
 		pos := strings.Index(lower, ext)
 		if pos < 0 {
 			continue
@@ -7007,6 +7045,14 @@ func extractArchive(archivePath, innerPath, destination string) error {
 		return extractTarArchive(archivePath, innerPath, destination, false)
 	case archiveFormatTarGz:
 		return extractTarArchive(archivePath, innerPath, destination, true)
+	case archiveFormatTarXz:
+		return extractTarXzArchive(archivePath, innerPath, destination)
+	case archiveFormatTarBz2:
+		return extractTarBzip2Archive(archivePath, innerPath, destination)
+	case archiveFormatGzip:
+		return extractGzipArchive(archivePath, innerPath, destination)
+	case archiveFormatXz:
+		return extractXzArchive(archivePath, innerPath, destination)
 	case archiveFormatLha:
 		if err := extractLhaArchive(archivePath, innerPath, destination); err == nil {
 			return nil
@@ -7092,8 +7138,16 @@ func detectArchiveFormat(path string) archiveFormat {
 		return archiveFormatZip
 	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
 		return archiveFormatTarGz
+	case strings.HasSuffix(lower, ".tar.xz"), strings.HasSuffix(lower, ".txz"):
+		return archiveFormatTarXz
+	case strings.HasSuffix(lower, ".tar.bz2"), strings.HasSuffix(lower, ".tbz2"), strings.HasSuffix(lower, ".tbz"):
+		return archiveFormatTarBz2
 	case strings.HasSuffix(lower, ".tar"):
 		return archiveFormatTar
+	case strings.HasSuffix(lower, ".gz"):
+		return archiveFormatGzip
+	case strings.HasSuffix(lower, ".xz"):
+		return archiveFormatXz
 	case strings.HasSuffix(lower, ".lha"), strings.HasSuffix(lower, ".lzh"):
 		return archiveFormatLha
 	case strings.HasSuffix(lower, ".lzx"):
@@ -7124,6 +7178,34 @@ func listTarArchiveEntries(path string, gzipped bool) ([]archiveEntry, error) {
 	}
 	defer closeFn()
 
+	return listTarEntriesFromReader(reader)
+}
+
+func listTarXzArchiveEntries(path string) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	xzr, err := xz.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	return listTarEntriesFromReader(xzr)
+}
+
+func listTarBzip2ArchiveEntries(path string) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return listTarEntriesFromReader(bzip2.NewReader(f))
+}
+
+func listTarEntriesFromReader(reader io.Reader) ([]archiveEntry, error) {
 	tr := tar.NewReader(reader)
 	items := make([]archiveEntry, 0)
 	for {
@@ -7146,6 +7228,130 @@ func listTarArchiveEntries(path string, gzipped bool) ([]archiveEntry, error) {
 	return items, nil
 }
 
+func defaultSingleStreamArchiveEntryName(path, ext string) string {
+	name := filepath.Base(path)
+	if strings.HasSuffix(strings.ToLower(name), ext) {
+		name = name[:len(name)-len(ext)]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "data"
+	}
+	return strings.Trim(filepath.ToSlash(name), "/")
+}
+
+func gzipArchiveEntryName(path, headerName string) string {
+	name := normalizeArchivePath(headerName)
+	if name == "" {
+		return defaultSingleStreamArchiveEntryName(path, ".gz")
+	}
+	return name
+}
+
+func listGzipArchiveEntries(path string) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	entryName := gzipArchiveEntryName(path, gr.Name)
+	if err := gr.Close(); err != nil {
+		return nil, err
+	}
+
+	size := int64(0)
+	if info, err := f.Stat(); err == nil && info.Size() >= 4 {
+		trailer := make([]byte, 4)
+		if _, err := f.ReadAt(trailer, info.Size()-4); err == nil {
+			size = int64(binary.LittleEndian.Uint32(trailer))
+		}
+	}
+
+	return []archiveEntry{{
+		Name:  entryName,
+		Size:  size,
+		IsDir: false,
+	}}, nil
+}
+
+func listXzArchiveEntries(path string) ([]archiveEntry, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return []archiveEntry{{
+		Name:  defaultSingleStreamArchiveEntryName(path, ".xz"),
+		Size:  0,
+		IsDir: false,
+	}}, nil
+}
+
+func extractSingleStreamArchive(reader io.Reader, entryName, innerPath, destination string) error {
+	relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
+	if !ok || relPath == "" {
+		return nil
+	}
+
+	target, err := safeArchiveTargetPath(destination, relPath, entryName)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+
+	out, err := os.Create(target)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, reader)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return nil
+}
+
+func extractGzipArchive(archivePath, innerPath, destination string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gr.Close()
+
+	entryName := gzipArchiveEntryName(archivePath, gr.Name)
+	return extractSingleStreamArchive(gr, entryName, innerPath, destination)
+}
+
+func extractXzArchive(archivePath, innerPath, destination string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	xzr, err := xz.NewReader(f)
+	if err != nil {
+		return err
+	}
+
+	entryName := defaultSingleStreamArchiveEntryName(archivePath, ".xz")
+	return extractSingleStreamArchive(xzr, entryName, innerPath, destination)
+}
+
 func extractTarArchive(archivePath, innerPath, destination string, gzipped bool) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
@@ -7165,6 +7371,34 @@ func extractTarArchive(archivePath, innerPath, destination string, gzipped bool)
 	}
 	defer closeFn()
 
+	return extractTarFromReader(reader, innerPath, destination)
+}
+
+func extractTarXzArchive(archivePath, innerPath, destination string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	xzr, err := xz.NewReader(f)
+	if err != nil {
+		return err
+	}
+	return extractTarFromReader(xzr, innerPath, destination)
+}
+
+func extractTarBzip2Archive(archivePath, innerPath, destination string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return extractTarFromReader(bzip2.NewReader(f), innerPath, destination)
+}
+
+func extractTarFromReader(reader io.Reader, innerPath, destination string) error {
 	tr := tar.NewReader(reader)
 	for {
 		hdr, err := tr.Next()
