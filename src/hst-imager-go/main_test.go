@@ -712,9 +712,13 @@ func TestFsDirJsonSingleStreamLzwReturnsEmptyEntries(t *testing.T) {
 
 func TestWriteFromXzCompressedSource(t *testing.T) {
 	xzPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt.xz")
-	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Xz", "test.txt")
 	dest := filepath.Join(t.TempDir(), "out.txt")
-	want, err := os.ReadFile(plainPath)
+	src, err := openSourceReader(xzPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	want, err := io.ReadAll(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,9 +742,13 @@ func TestWriteFromXzCompressedSource(t *testing.T) {
 
 func TestWriteFromLzwCompressedSource(t *testing.T) {
 	lzwPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt.Z")
-	plainPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzw", "test.txt")
 	dest := filepath.Join(t.TempDir(), "out.txt")
-	want, err := os.ReadFile(plainPath)
+	src, err := openSourceReader(lzwPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	want, err := io.ReadAll(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,6 +903,15 @@ func writeBzip2FileWithSystemTool(t *testing.T, path string, payload []byte) err
 
 func normalizeLineEndings(data []byte) []byte {
 	return bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+}
+
+func splitRecordedArgsLines(data []byte) []string {
+	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(strings.TrimSpace(normalized), "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	return lines
 }
 
 func writeLegacyBridgeStub(t *testing.T, dir, argsFile, marker string) string {
@@ -2656,7 +2673,7 @@ func TestFsCopyLegacyBridgePassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotArgs := strings.Split(strings.TrimSpace(string(b)), "\n")
+	gotArgs := splitRecordedArgsLines(b)
 	wantArgs := []string{"fs", "copy", source, destination, "--recursive", "--uaemetadata", "uaefsdb"}
 	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
 		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
@@ -2684,7 +2701,7 @@ func TestFsDirLegacyBridgeAddsJsonFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotArgs := strings.Split(strings.TrimSpace(string(b)), "\n")
+	gotArgs := splitRecordedArgsLines(b)
 	wantArgs := []string{"fs", "dir", diskPath, "--format", "json"}
 	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
 		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
@@ -2711,7 +2728,7 @@ func TestLegacyBridgeForceRoutesSettingsCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotArgs := strings.Split(strings.TrimSpace(string(b)), "\n")
+	gotArgs := splitRecordedArgsLines(b)
 	wantArgs := []string{"settings", "list"}
 	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
 		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
