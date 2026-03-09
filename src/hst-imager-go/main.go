@@ -675,11 +675,7 @@ func parseWindowsDiskSize(raw json.RawMessage) (uint64, error) {
 }
 
 func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
-		return errors.New("usage: fs dir <path> [--recursive|-r [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
-	}
-	path := args[0]
-	fsOpts, err := parseFsOptions(args[1:])
+	path, fsOpts, outputFormat, err := parseFsDirInvocationArgs(args, opts.Format)
 	if err != nil {
 		return err
 	}
@@ -690,7 +686,7 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 				return mediaErr
 			}
 			if mediaOK {
-				if opts.Format == "json" {
+				if outputFormat == "json" {
 					return writeJSON(stdout, map[string]any{"path": archivePath, "entries": mediaItems})
 				}
 				for _, i := range mediaItems {
@@ -699,17 +695,21 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 				return nil
 			}
 			if isSingleStreamCompressedPath(archivePath) {
-				if opts.Format == "json" {
+				if outputFormat == "json" {
 					return writeJSON(stdout, map[string]any{"path": archivePath, "entries": []fsDirLegacyStyleItem{}})
 				}
 				fmt.Fprintln(stdout, "No entries.")
 				return nil
 			}
 		}
-		return handleFsDirArchive(archivePath, innerPath, stdout, opts)
+		localOpts := opts
+		localOpts.Format = outputFormat
+		return handleFsDirArchive(archivePath, innerPath, stdout, localOpts)
 	}
 	if basePath, table, ok := parsePartitionContainerPath(path); ok {
-		return handleFsDirPartitionContainer(basePath, table, stdout, opts)
+		localOpts := opts
+		localOpts.Format = outputFormat
+		return handleFsDirPartitionContainer(basePath, table, stdout, localOpts)
 	}
 	if fsOpts.uaeMetadata != "none" {
 		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(path, fsOpts.uaeMetadata); resolveErr == nil {
@@ -720,13 +720,46 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if err != nil {
 		return err
 	}
-	if opts.Format == "json" {
+	if outputFormat == "json" {
 		return writeJSON(stdout, map[string]any{"path": path, "entries": items})
 	}
 	for _, i := range items {
 		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
 	}
 	return nil
+}
+
+func parseFsDirInvocationArgs(args []string, defaultFormat string) (path string, fsOpts fsPathOptions, outputFormat string, err error) {
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return "", fsPathOptions{}, "", errors.New("usage: fs dir <path> [--recursive|-r [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>] [--format|-f <table|json>]")
+	}
+	path = args[0]
+	outputFormat = strings.ToLower(strings.TrimSpace(defaultFormat))
+	if outputFormat == "" {
+		outputFormat = "table"
+	}
+	filtered := make([]string, 0, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--format", "-f":
+			if i+1 >= len(args) {
+				return "", fsPathOptions{}, "", fmt.Errorf("missing value for option: %s", args[i])
+			}
+			format := strings.ToLower(strings.TrimSpace(args[i+1]))
+			if format != "table" && format != "json" {
+				return "", fsPathOptions{}, "", fmt.Errorf("unsupported format '%s' (supported: table, json)", args[i+1])
+			}
+			outputFormat = format
+			i++
+		default:
+			filtered = append(filtered, args[i])
+		}
+	}
+	fsOpts, err = parseFsOptions(filtered)
+	if err != nil {
+		return "", fsPathOptions{}, "", err
+	}
+	return path, fsOpts, outputFormat, nil
 }
 
 type fsDirItem struct {

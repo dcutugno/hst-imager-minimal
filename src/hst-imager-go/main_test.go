@@ -422,6 +422,44 @@ func TestFsExtractAndDirAcceptLegacyOptionFlags(t *testing.T) {
 	}
 }
 
+func TestFsDirAcceptsInlineFormatOptionInPureGoMode(t *testing.T) {
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "off")
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "dir", tmp, "--format", "json", "-uae", "none"}, &out); err != nil {
+		t.Fatalf("fs dir with inline --format failed: %v", err)
+	}
+
+	var payload struct {
+		Path    string `json:"path"`
+		Entries []struct {
+			Name string `json:"name"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("expected json output for inline --format: %v", err)
+	}
+	if payload.Path != tmp {
+		t.Fatalf("unexpected path in json output: %q", payload.Path)
+	}
+	if len(payload.Entries) != 1 || payload.Entries[0].Name != "a.txt" {
+		t.Fatalf("unexpected entries in json output: %#v", payload.Entries)
+	}
+
+	out.Reset()
+	if err := run([]string{"fs", "dir", tmp, "-f", "json", "-uae", "none"}, &out); err != nil {
+		t.Fatalf("fs dir with inline -f json failed: %v", err)
+	}
+	if !json.Valid(out.Bytes()) {
+		t.Fatalf("expected valid json output for inline -f json, got: %q", out.String())
+	}
+}
+
 func TestFsOptionsAcceptEqualsSyntax(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src")
