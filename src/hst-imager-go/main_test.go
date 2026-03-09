@@ -53,6 +53,21 @@ func TestRunListJsonOutput(t *testing.T) {
 	}
 }
 
+func TestRunListJsonOutputShortFormatFlag(t *testing.T) {
+	var out bytes.Buffer
+	err := run([]string{"-f", "json", "list"}, &out)
+	if err != nil {
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "operation not permitted") || strings.Contains(lower, "permission denied") || strings.Contains(lower, "exit status") {
+			t.Skipf("list command unavailable in this environment: %v", err)
+		}
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !strings.Contains(out.String(), "\"drives\"") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
 func TestSettingsUpdateAndList(t *testing.T) {
 	configRoot := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configRoot)
@@ -132,6 +147,114 @@ func TestFsDirAndArchiveListAndScript(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Created blank image") || !strings.Contains(out.String(), "Path:") {
 		t.Fatalf("unexpected script output: %q", out.String())
+	}
+}
+
+func TestFsAndArchiveCommandAliases(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "d", src}, &out); err != nil {
+		t.Fatalf("fs d alias failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "a.txt") {
+		t.Fatalf("unexpected fs d output: %q", out.String())
+	}
+
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "c", filepath.Join(src, "a.txt"), dst}, &out); err != nil {
+		t.Fatalf("fs c alias failed: %v", err)
+	}
+	copied, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil {
+		t.Fatalf("expected copied file from fs c alias: %v", err)
+	}
+	if string(copied) != "aaa" {
+		t.Fatalf("unexpected fs c copied content: %q", copied)
+	}
+
+	zipPath := filepath.Join(tmp, "sample.zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	w, err := zw.Create("inner.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("inner-data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"arc", "l", zipPath}, &out); err != nil {
+		t.Fatalf("arc l aliases failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "inner.txt") {
+		t.Fatalf("unexpected arc l output: %q", out.String())
+	}
+
+	extractDst := filepath.Join(tmp, "extract")
+	out.Reset()
+	if err := run([]string{"fs", "x", zipPath, extractDst}, &out); err != nil {
+		t.Fatalf("fs x alias failed: %v", err)
+	}
+	extracted, err := os.ReadFile(filepath.Join(extractDst, "inner.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file from fs x alias: %v", err)
+	}
+	if string(extracted) != "inner-data" {
+		t.Fatalf("unexpected fs x extracted content: %q", extracted)
+	}
+}
+
+func TestCommandNormalizationDoesNotRewriteArguments(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(wd) }()
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "mkdir", "init"}, &out); err != nil {
+		t.Fatalf("fs mkdir init failed: %v", err)
+	}
+	if err := run([]string{"fs", "mkdir", "del"}, &out); err != nil {
+		t.Fatalf("fs mkdir del failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "init")); err != nil {
+		t.Fatalf("expected directory init to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "del")); err != nil {
+		t.Fatalf("expected directory del to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "initialize")); err == nil {
+		t.Fatal("did not expect directory initialize to be created")
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "delete")); err == nil {
+		t.Fatal("did not expect directory delete to be created")
 	}
 }
 
@@ -1663,6 +1786,28 @@ func TestTransferSupportsStartOffsetsAndVerify(t *testing.T) {
 	}
 }
 
+func TestTransferSupportsSourceDestinationAliasOffsets(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"transfer", src, dst, "--size", "4", "--source-start", "2", "--destination-start", "5"}, &out); err != nil {
+		t.Fatalf("transfer with source/destination aliases failed: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(make([]byte, 5), []byte("2345")...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected transfer output bytes: got=%v want=%v", got, want)
+	}
+}
+
 func TestReadWriteStartAlias(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.bin")
@@ -1701,6 +1846,44 @@ func TestReadWriteStartAlias(t *testing.T) {
 	}
 }
 
+func TestReadWriteStartShortAlias(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	outFile := filepath.Join(tmp, "out.bin")
+	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("xxxxxxxxxx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"write", src, dst, "--size", "3", "-st", "4"}, &out); err != nil {
+		t.Fatalf("write with -st failed: %v", err)
+	}
+	gotDst, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDst := []byte("xxxx012xxx")
+	if !bytes.Equal(gotDst, wantDst) {
+		t.Fatalf("unexpected destination content after write -st: got=%q want=%q", gotDst, wantDst)
+	}
+
+	out.Reset()
+	if err := run([]string{"read", dst, outFile, "--size", "3", "-st", "4"}, &out); err != nil {
+		t.Fatalf("read with -st failed: %v", err)
+	}
+	gotOut, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotOut, []byte("012")) {
+		t.Fatalf("unexpected output after read -st: %q", gotOut)
+	}
+}
+
 func TestCompareSupportsOffsets(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.bin")
@@ -1715,6 +1898,28 @@ func TestCompareSupportsOffsets(t *testing.T) {
 	var out bytes.Buffer
 	if err := run([]string{"compare", src, dst, "--size", "4", "--source-start", "0", "--destination-start", "2"}, &out); err != nil {
 		t.Fatalf("compare with offsets failed: %v", err)
+	}
+}
+
+func TestCompareSupportsTransferStyleOffsetAliases(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("ABCDzz"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("xxABCDyy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"compare", src, dst, "--size", "4", "--src-start", "0", "--dest-start", "2"}, &out); err != nil {
+		t.Fatalf("compare with transfer-style aliases failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"compare", src, dst, "--size", "4", "-ss", "0", "-ds", "2"}, &out); err != nil {
+		t.Fatalf("compare with short offset aliases failed: %v", err)
 	}
 }
 
@@ -1738,6 +1943,27 @@ func TestTransferAcceptsLegacyNoopFlags(t *testing.T) {
 	}
 }
 
+func TestTransferAcceptsVerifyBoolValue(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"transfer", src, dst, "--verify", "false"}, &out); err != nil {
+		t.Fatalf("transfer with --verify false failed: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("abcdefgh")) {
+		t.Fatalf("unexpected transfer output: %q", got)
+	}
+}
+
 func TestCompareAcceptsLegacyNoopFlags(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.bin")
@@ -1751,6 +1977,23 @@ func TestCompareAcceptsLegacyNoopFlags(t *testing.T) {
 	var out bytes.Buffer
 	if err := run([]string{"compare", src, dst, "--retries", "3", "--force", "true", "--skip-unused-sectors"}, &out); err != nil {
 		t.Fatalf("compare with legacy noop flags failed: %v", err)
+	}
+}
+
+func TestTransferCompareAcceptShortFlags(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"transfer", src, dst, "--size", "8", "-r", "1", "-f", "-v"}, &out); err != nil {
+		t.Fatalf("transfer with short flags failed: %v", err)
+	}
+	if err := run([]string{"compare", src, dst, "--size", "8", "-r", "1", "-f"}, &out); err != nil {
+		t.Fatalf("compare with short flags failed: %v", err)
 	}
 }
 
@@ -1894,6 +2137,35 @@ func TestFsBlockOptimizeAndAdfCommands(t *testing.T) {
 	}
 	if adfInfo.Size() != 901120 {
 		t.Fatalf("unexpected adf size: %d", adfInfo.Size())
+	}
+}
+
+func TestBlockReadViewOptionSyntaxCompatibility(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "block.bin")
+	outPath := filepath.Join(tmp, "slice.bin")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"block", "read", path, outPath, "--start", "2", "--end", "6", "--block-size", "2"}, &out); err != nil {
+		t.Fatalf("block read option syntax failed: %v", err)
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("2345")) {
+		t.Fatalf("unexpected block read option output: %q", got)
+	}
+
+	out.Reset()
+	if err := run([]string{"block", "view", path, "--start", "1", "--block-size", "4"}, &out); err != nil {
+		t.Fatalf("block view option syntax failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "31 32 33 34") {
+		t.Fatalf("unexpected block view option output: %q", out.String())
 	}
 }
 

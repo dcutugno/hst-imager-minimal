@@ -171,7 +171,7 @@ func run(args []string, stdout io.Writer) error {
 	if commandArgs == nil {
 		return nil
 	}
-	commandArgs = normalizeCommandTokens(commandArgs)
+	commandArgs = normalizeCommandTokens(commandArgs, root)
 
 	cmd, remaining := ResolveCommand(root, commandArgs)
 	consumedLen := len(commandArgs) - len(remaining)
@@ -486,7 +486,7 @@ func parseGlobalArgs(args []string, stdout io.Writer, root *Command) (GlobalOpti
 			opts.LogFile = args[i+1]
 			i++
 			continue
-		case "--format":
+		case "--format", "-f":
 			if i+1 >= len(args) {
 				return opts, nil, fmt.Errorf("missing value for global option: %s", arg)
 			}
@@ -510,7 +510,7 @@ func printGlobalHelp(stdout io.Writer, root *Command) {
 	fmt.Fprintln(stdout, "Global options:")
 	fmt.Fprintln(stdout, "  --verbose          Verbose output")
 	fmt.Fprintln(stdout, "  --log-file <path>  Write log file")
-	fmt.Fprintln(stdout, "  --format <type>    Output format (table|json)")
+	fmt.Fprintln(stdout, "  --format|-f <type> Output format (table|json)")
 	fmt.Fprintln(stdout, "  --version          Show version")
 	fmt.Fprintln(stdout)
 	PrintHelp(stdout, root, "")
@@ -1557,7 +1557,7 @@ func tryReadRdb(path string) (rdbState, bool) {
 
 func handleTransfer(args []string, stdout io.Writer, command string, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>|-s <bytes>] [--src-start <offset>|-ss <offset>] [--dest-start <offset>|-ds <offset>] [--start <offset>] [--verify|-v] [--retries <n>] [--force [bool]] [--skip-unused-sectors [bool]]", command)
+		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>|-s <bytes>] [--src-start|--source-start <offset>|-ss <offset>] [--dest-start|--destination-start <offset>|-ds <offset>] [--start|-st <offset>] [--verify|-v] [--retries|-r <n>] [--force|-f [bool]] [--skip-unused-sectors [bool]]", command)
 	}
 	source := args[0]
 	destination := args[1]
@@ -1606,7 +1606,7 @@ func handleTransfer(args []string, stdout io.Writer, command string, opts Global
 
 func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: compare <source> <destination> [--size <bytes>|-s <bytes>] [--source-start <offset>] [--destination-start <offset>] [--retries <n>] [--force [bool]] [--skip-unused-sectors [bool]]")
+		return errors.New("usage: compare <source> <destination> [--size <bytes>|-s <bytes>] [--source-start|--src-start <offset>|-ss <offset>] [--destination-start|--dest-start <offset>|-ds <offset>] [--retries|-r <n>] [--force|-f [bool]] [--skip-unused-sectors [bool]]")
 	}
 	source := args[0]
 	destination := args[1]
@@ -1666,7 +1666,7 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 			opts.size = size
 			opts.hasSize = true
 			i++
-		case "--src-start", "-ss":
+		case "--src-start", "--source-start", "-ss":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --src-start")
 			}
@@ -1676,7 +1676,7 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 			}
 			opts.srcStart = offset
 			i++
-		case "--dest-start", "-ds":
+		case "--dest-start", "--destination-start", "-ds":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --dest-start")
 			}
@@ -1686,7 +1686,7 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 			}
 			opts.dstStart = offset
 			i++
-		case "--start":
+		case "--start", "-st":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --start")
 			}
@@ -1704,8 +1704,13 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 			}
 			i++
 		case "--verify", "-v":
-			opts.verify = true
-		case "--retries":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--verify")
+			if err != nil {
+				return opts, err
+			}
+			opts.verify = value
+			i += consumed
+		case "--retries", "-r":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --retries")
 			}
@@ -1715,7 +1720,7 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 			}
 			opts.retries = retries
 			i++
-		case "--force":
+		case "--force", "-f":
 			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
 			if err != nil {
 				return opts, err
@@ -1761,7 +1766,7 @@ func parseCompareOptions(args []string) (compareOptions, error) {
 			opts.size = size
 			opts.hasSize = true
 			i++
-		case "--source-start":
+		case "--source-start", "--src-start", "-ss":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --source-start")
 			}
@@ -1771,7 +1776,7 @@ func parseCompareOptions(args []string) (compareOptions, error) {
 			}
 			opts.srcStart = offset
 			i++
-		case "--destination-start":
+		case "--destination-start", "--dest-start", "-ds":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --destination-start")
 			}
@@ -1781,7 +1786,7 @@ func parseCompareOptions(args []string) (compareOptions, error) {
 			}
 			opts.dstStart = offset
 			i++
-		case "--retries":
+		case "--retries", "-r":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --retries")
 			}
@@ -1791,7 +1796,7 @@ func parseCompareOptions(args []string) (compareOptions, error) {
 			}
 			opts.retries = retries
 			i++
-		case "--force":
+		case "--force", "-f":
 			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
 			if err != nil {
 				return opts, err
@@ -2214,21 +2219,64 @@ func fileType(info os.FileInfo) string {
 	return "File"
 }
 
-func normalizeCommandTokens(args []string) []string {
+func normalizeCommandTokens(args []string, root *Command) []string {
 	out := append([]string(nil), args...)
-	for i, tok := range out {
-		switch strings.ToLower(tok) {
-		case "init":
-			out[i] = "initialize"
-		case "del":
-			out[i] = "delete"
-		case "fs":
-			if i > 0 && strings.EqualFold(out[i-1], "rdb") {
-				out[i] = "filesystem"
+	current := root
+	for i := 0; i < len(out); i++ {
+		lower := strings.ToLower(out[i])
+		normalized := normalizeCommandTokenAlias(current, lower)
+		if normalized != lower {
+			out[i] = normalized
+		}
+		next := current.Find(strings.ToLower(out[i]))
+		if next == nil {
+			break
+		}
+		current = next
+	}
+	return out
+}
+
+func normalizeCommandTokenAlias(parent *Command, token string) string {
+	if parent == nil {
+		return token
+	}
+	switch token {
+	case "init":
+		if parent.Find("initialize") != nil {
+			return "initialize"
+		}
+	case "del":
+		if parent.Find("delete") != nil {
+			return "delete"
+		}
+	}
+	if strings.EqualFold(parent.Name, "rdb") && token == "fs" && parent.Find("filesystem") != nil {
+		return "filesystem"
+	}
+	if strings.EqualFold(parent.Name, "fs") {
+		switch token {
+		case "d":
+			if parent.Find("dir") != nil {
+				return "dir"
+			}
+		case "c":
+			if parent.Find("copy") != nil {
+				return "copy"
+			}
+		case "x":
+			if parent.Find("extract") != nil {
+				return "extract"
 			}
 		}
 	}
-	return out
+	if strings.EqualFold(parent.Name, "archive") && token == "l" && parent.Find("list") != nil {
+		return "list"
+	}
+	if strings.EqualFold(parent.Name, "hst-imager") && token == "arc" && parent.Find("archive") != nil {
+		return "archive"
+	}
+	return token
 }
 
 func handleOptimize(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -2762,72 +2810,55 @@ func runWithinPartitionImage(partitionPath string, fn func(tempPath string) erro
 }
 
 func handleBlockRead(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 4 {
-		return errors.New("usage: block read <path> <offset> <size> <output>")
-	}
-	offset, err := strconv.ParseInt(args[1], 10, 64)
-	if err != nil || offset < 0 {
-		return fmt.Errorf("invalid offset: %s", args[1])
-	}
-	size, err := parseSize(args[2])
+	path, output, offset, size, err := parseBlockReadInvocation(args)
 	if err != nil {
 		return err
 	}
 	if size < 0 {
 		return errors.New("size must be >= 0")
 	}
-	src, err := os.Open(args[0])
+	src, err := openSourceReaderAt(path, offset)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	if err := os.MkdirAll(filepath.Dir(args[3]), 0o755); err != nil && filepath.Dir(args[3]) != "." {
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil && filepath.Dir(output) != "." {
 		return err
 	}
-	dst, err := os.Create(args[3])
+	dst, err := os.Create(output)
 	if err != nil {
 		return err
 	}
 	defer dst.Close()
-	if _, err := src.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
 	written, err := io.CopyN(dst, src, size)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": args[0], "offset": offset, "size": written, "output": args[3]})
+		return writeJSON(stdout, map[string]any{"path": path, "offset": offset, "size": written, "output": output})
 	}
-	fmt.Fprintf(stdout, "Read %d bytes from %s at offset %d to %s.\n", written, args[0], offset, args[3])
+	fmt.Fprintf(stdout, "Read %d bytes from %s at offset %d to %s.\n", written, path, offset, output)
 	return nil
 }
 
 func handleBlockView(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 3 {
-		return errors.New("usage: block view <path> <offset> <size>")
-	}
-	offset, err := strconv.ParseInt(args[1], 10, 64)
-	if err != nil || offset < 0 {
-		return fmt.Errorf("invalid offset: %s", args[1])
-	}
-	size, err := parseSize(args[2])
+	path, offset, size, err := parseBlockViewInvocation(args)
 	if err != nil {
 		return err
 	}
 	data := make([]byte, size)
-	f, err := os.Open(args[0])
+	r, err := openSourceReaderAt(path, offset)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	n, err := f.ReadAt(data, offset)
-	if err != nil && !errors.Is(err, io.EOF) {
+	defer r.Close()
+	n, err := io.ReadFull(r, data)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return err
 	}
 	data = data[:n]
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": args[0], "offset": offset, "size": n, "hex": fmt.Sprintf("%x", data)})
+		return writeJSON(stdout, map[string]any{"path": path, "offset": offset, "size": n, "hex": fmt.Sprintf("%x", data)})
 	}
 	for i := 0; i < len(data); i += 16 {
 		end := i + 16
@@ -2837,6 +2868,132 @@ func handleBlockView(args []string, stdout io.Writer, opts GlobalOptions) error 
 		fmt.Fprintf(stdout, "%08x  % x\n", offset+int64(i), data[i:end])
 	}
 	return nil
+}
+
+func parseBlockReadInvocation(args []string) (path string, output string, offset int64, size int64, err error) {
+	if len(args) < 2 {
+		return "", "", 0, 0, errors.New("usage: block read <path> <output> [--block-size|-bs <size>] [--used|-u] [--start|-s <offset>] [--end|-e <offset>] OR block read <path> <offset> <size> <output>")
+	}
+	// Backward-compatible positional syntax: block read <path> <offset> <size> <output>
+	if len(args) >= 4 &&
+		!strings.HasPrefix(args[1], "-") &&
+		!strings.HasPrefix(args[2], "-") &&
+		!strings.HasPrefix(args[3], "-") {
+		offset, err = parseNonNegativeOffset(args[1], "offset")
+		if err != nil {
+			return "", "", 0, 0, err
+		}
+		size, err = parseSize(args[2])
+		if err != nil {
+			return "", "", 0, 0, err
+		}
+		return args[0], args[3], offset, size, nil
+	}
+
+	path = args[0]
+	output = args[1]
+	blockSize := int64(512)
+	start := int64(0)
+	hasEnd := false
+	end := int64(0)
+	for i := 2; i < len(args); i++ {
+		switch args[i] {
+		case "--block-size", "-bs":
+			if i+1 >= len(args) {
+				return "", "", 0, 0, errors.New("missing value for --block-size")
+			}
+			v, convErr := strconv.ParseInt(strings.TrimSpace(args[i+1]), 10, 64)
+			if convErr != nil || v <= 0 {
+				return "", "", 0, 0, fmt.Errorf("invalid value for --block-size: %s", args[i+1])
+			}
+			blockSize = v
+			i++
+		case "--used", "-u":
+			_, consumed, boolErr := parseOptionalBoolFlag(args, i, "--used")
+			if boolErr != nil {
+				return "", "", 0, 0, boolErr
+			}
+			i += consumed
+		case "--start", "-s":
+			if i+1 >= len(args) {
+				return "", "", 0, 0, errors.New("missing value for --start")
+			}
+			start, err = parseNonNegativeOffset(args[i+1], "--start")
+			if err != nil {
+				return "", "", 0, 0, err
+			}
+			i++
+		case "--end", "-e":
+			if i+1 >= len(args) {
+				return "", "", 0, 0, errors.New("missing value for --end")
+			}
+			end, err = parseNonNegativeOffset(args[i+1], "--end")
+			if err != nil {
+				return "", "", 0, 0, err
+			}
+			hasEnd = true
+			i++
+		default:
+			return "", "", 0, 0, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	if hasEnd {
+		if end < start {
+			return "", "", 0, 0, errors.New("end must be >= start")
+		}
+		return path, output, start, end - start, nil
+	}
+	return path, output, start, blockSize, nil
+}
+
+func parseBlockViewInvocation(args []string) (path string, offset int64, size int64, err error) {
+	if len(args) < 1 {
+		return "", 0, 0, errors.New("usage: block view <path> [--block-size|-bs <size>] [--start|-s <offset>] OR block view <path> <offset> <size>")
+	}
+	// Backward-compatible positional syntax: block view <path> <offset> <size>
+	if len(args) >= 3 &&
+		!strings.HasPrefix(args[1], "-") &&
+		!strings.HasPrefix(args[2], "-") {
+		offset, err = parseNonNegativeOffset(args[1], "offset")
+		if err != nil {
+			return "", 0, 0, err
+		}
+		size, err = parseSize(args[2])
+		if err != nil {
+			return "", 0, 0, err
+		}
+		return args[0], offset, size, nil
+	}
+
+	path = args[0]
+	offset = 0
+	size = 512
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--block-size", "-bs":
+			if i+1 >= len(args) {
+				return "", 0, 0, errors.New("missing value for --block-size")
+			}
+			v, convErr := strconv.ParseInt(strings.TrimSpace(args[i+1]), 10, 64)
+			if convErr != nil || v <= 0 {
+				return "", 0, 0, fmt.Errorf("invalid value for --block-size: %s", args[i+1])
+			}
+			size = v
+			i++
+		case "--start", "-s":
+			if i+1 >= len(args) {
+				return "", 0, 0, errors.New("missing value for --start")
+			}
+			offset, err = parseNonNegativeOffset(args[i+1], "--start")
+			if err != nil {
+				return "", 0, 0, err
+			}
+			i++
+		default:
+			return "", 0, 0, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	return path, offset, size, nil
 }
 
 func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
