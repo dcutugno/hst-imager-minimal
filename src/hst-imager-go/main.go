@@ -3220,21 +3220,22 @@ func handleMbrInitialize(args []string, stdout io.Writer, opts GlobalOptions) er
 }
 
 func handleMbrPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 3 {
-		return errors.New("usage: mbr part add <media> <type> <size|*>")
+	mediaPath, typeArg, sizeArg, startSectorOpt, active, err := parseMbrPartAddArgs(args)
+	if err != nil {
+		return err
 	}
-	parts, err := readMbrPartitions(args[0])
+	parts, err := readMbrPartitions(mediaPath)
 	if err != nil {
 		return err
 	}
 	if len(parts) >= 4 {
 		return errors.New("mbr supports maximum 4 primary partitions")
 	}
-	sizeBytes, err := resolveMbrPartSize(args[0], args[2], parts)
+	sizeBytes, err := resolveMbrPartSize(mediaPath, sizeArg, parts)
 	if err != nil {
 		return err
 	}
-	typeCode, err := parseMbrPartitionType(args[1])
+	typeCode, err := parseMbrPartitionType(typeArg)
 	if err != nil {
 		return err
 	}
@@ -3246,11 +3247,19 @@ func handleMbrPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 			nextStart = end
 		}
 	}
+	if startSectorOpt != nil {
+		nextStart = *startSectorOpt
+	}
 	sizeSectors := uint32(sizeBytes / mbrSectorSize)
 	if sizeSectors == 0 {
 		return errors.New("partition size must be at least 512 bytes")
 	}
-	capacitySectors, err := mediaCapacitySectors(args[0])
+	for _, existing := range parts {
+		if mbrSectorRangesOverlap(nextStart, sizeSectors, existing.StartLBA, existing.SectorCount) {
+			return errors.New("partition overlaps existing partition")
+		}
+	}
+	capacitySectors, err := mediaCapacitySectors(mediaPath)
 	if err != nil {
 		return err
 	}
@@ -3259,16 +3268,70 @@ func handleMbrPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 	}
 	p := mbrPartition{
 		Index:       nextMbrPartitionIndex(parts),
-		Bootable:    false,
+		Bootable:    active,
 		TypeCode:    typeCode,
 		StartLBA:    nextStart,
 		SectorCount: sizeSectors,
 	}
 	parts = append(parts, p)
-	if err := writeMbrPartitions(args[0], parts); err != nil {
+	if err := writeMbrPartitions(mediaPath, parts); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "mbr partition added", mbrPartitionToPart(p))
+}
+
+func parseMbrPartAddArgs(args []string) (mediaPath string, typeArg string, sizeArg string, startSector *uint32, active bool, err error) {
+	const usage = "usage: mbr part add <media> <type> <size|*> [--start-sector|-s <sector>] [--active|-a [bool]]"
+	if len(args) < 3 {
+		return "", "", "", nil, false, errors.New(usage)
+	}
+	positionals := make([]string, 0, 3)
+	active = false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--start-sector", "-s":
+			if i+1 >= len(args) {
+				return "", "", "", nil, false, errors.New("missing value for --start-sector")
+			}
+			n, convErr := parseNonNegativeOffset(args[i+1], "--start-sector")
+			if convErr != nil {
+				return "", "", "", nil, false, convErr
+			}
+			if n > int64(^uint32(0)) {
+				return "", "", "", nil, false, fmt.Errorf("invalid value for --start-sector: %s", args[i+1])
+			}
+			v := uint32(n)
+			startSector = &v
+			i++
+		case "--active", "-a":
+			value, consumed, boolErr := parseOptionalBoolFlag(args, i, "--active")
+			if boolErr != nil {
+				return "", "", "", nil, false, boolErr
+			}
+			active = value
+			i += consumed
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", "", "", nil, false, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 3 {
+		return "", "", "", nil, false, errors.New(usage)
+	}
+	return positionals[0], positionals[1], positionals[2], startSector, active, nil
+}
+
+func mbrSectorRangesOverlap(startA, sizeA, startB, sizeB uint32) bool {
+	if sizeA == 0 || sizeB == 0 {
+		return false
+	}
+	aStart := uint64(startA)
+	aEnd := aStart + uint64(sizeA)
+	bStart := uint64(startB)
+	bEnd := bStart + uint64(sizeB)
+	return aStart < bEnd && bStart < aEnd
 }
 
 func handleMbrPartDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -3748,28 +3811,19 @@ func handleGptInitialize(args []string, stdout io.Writer, opts GlobalOptions) er
 }
 
 func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 3 {
-		return errors.New("usage: gpt part add <media> <type> <size|*> OR gpt part add <media> <type> <name> <size|*>")
-	}
-	if len(args) > 4 {
-		return errors.New("usage: gpt part add <media> <type> <size|*> OR gpt part add <media> <type> <name> <size|*>")
-	}
-	header, parts, err := readGpt(args[0])
+	mediaPath, typeArg, partName, sizeArg, startSectorOpt, err := parseGptPartAddArgs(args)
 	if err != nil {
 		return err
 	}
-	partType, err := parseGptTypeGUID(args[1])
+	header, parts, err := readGpt(mediaPath)
 	if err != nil {
 		return err
 	}
-	partName := args[1]
-	sizeArg := args[2]
-	if len(args) == 4 {
-		// Compatibility with legacy backend argument order: <type> <name> <size>.
-		partName = args[2]
-		sizeArg = args[3]
+	partType, err := parseGptTypeGUID(typeArg)
+	if err != nil {
+		return err
 	}
-	sizeBytes, err := resolveGptPartSize(args[0], sizeArg, header, parts)
+	sizeBytes, err := resolveGptPartSize(mediaPath, sizeArg, header, parts)
 	if err != nil {
 		return err
 	}
@@ -3783,9 +3837,20 @@ func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 			startLBA = p.LastLBA + 1
 		}
 	}
+	if startSectorOpt != nil {
+		startLBA = *startSectorOpt
+	}
+	if startLBA < header.FirstUsable || startLBA > header.LastUsable {
+		return errors.New("partition start sector is outside GPT usable space")
+	}
 	endLBA := startLBA + sizeSectors - 1
 	if endLBA > header.LastUsable {
 		return errors.New("partition does not fit in GPT usable space")
+	}
+	for _, existing := range parts {
+		if gptLbaRangesOverlap(startLBA, endLBA, existing.FirstLBA, existing.LastLBA) {
+			return errors.New("partition overlaps existing partition")
+		}
 	}
 	index := nextGptPartitionIndex(header.NumEntries, parts)
 	if index == 0 {
@@ -3804,7 +3869,7 @@ func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 		Name:       partName,
 	}
 	parts = append(parts, entry)
-	if err := writeGpt(args[0], header, parts); err != nil {
+	if err := writeGpt(mediaPath, header, parts); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "gpt partition added", Part{
@@ -3814,6 +3879,50 @@ func handleGptPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error
 		Start: int64(entry.FirstLBA) * mbrSectorSize,
 		Size:  int64(entry.LastLBA-entry.FirstLBA+1) * mbrSectorSize,
 	})
+}
+
+func parseGptPartAddArgs(args []string) (mediaPath string, typeArg string, partName string, sizeArg string, startSector *uint64, err error) {
+	const usage = "usage: gpt part add <media> <type> <size|*> OR gpt part add <media> <type> <name> <size|*> [--start-sector|-s <sector>]"
+	if len(args) < 3 {
+		return "", "", "", "", nil, errors.New(usage)
+	}
+	positionals := make([]string, 0, 4)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--start-sector", "-s":
+			if i+1 >= len(args) {
+				return "", "", "", "", nil, errors.New("missing value for --start-sector")
+			}
+			n, convErr := strconv.ParseUint(strings.TrimSpace(args[i+1]), 10, 64)
+			if convErr != nil {
+				return "", "", "", "", nil, fmt.Errorf("invalid value for --start-sector: %s", args[i+1])
+			}
+			startSector = &n
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", "", "", "", nil, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) < 3 || len(positionals) > 4 {
+		return "", "", "", "", nil, errors.New(usage)
+	}
+	mediaPath = positionals[0]
+	typeArg = positionals[1]
+	partName = typeArg
+	sizeArg = positionals[2]
+	if len(positionals) == 4 {
+		// Compatibility with legacy backend argument order: <type> <name> <size>.
+		partName = positionals[2]
+		sizeArg = positionals[3]
+	}
+	return mediaPath, typeArg, partName, sizeArg, startSector, nil
+}
+
+func gptLbaRangesOverlap(firstA, lastA, firstB, lastB uint64) bool {
+	return firstA <= lastB && firstB <= lastA
 }
 
 func handleGptPartDelete(args []string, stdout io.Writer, opts GlobalOptions) error {

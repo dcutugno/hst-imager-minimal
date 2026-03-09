@@ -2626,6 +2626,90 @@ func TestGptPartAddSupportsLegacyNameArgumentOrder(t *testing.T) {
 	}
 }
 
+func TestMbrPartAddSupportsStartSectorAndActiveOptions(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "mbr-part-add-options.img")
+
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "32MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatalf("mbr initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "1MB", "--start-sector", "2048", "--active"}, &out); err != nil {
+		t.Fatalf("mbr part add with long options failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"mbr", "part", "add", media, "ntfs", "1MB", "-s", "4096", "-a", "false"}, &out); err != nil {
+		t.Fatalf("mbr part add with short options failed: %v", err)
+	}
+
+	parts, err := readMbrPartitions(media)
+	if err != nil {
+		t.Fatalf("read mbr partitions failed: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 mbr partitions, got %d", len(parts))
+	}
+	if parts[0].StartLBA != 2048 {
+		t.Fatalf("expected mbr part 1 start lba 2048, got %d", parts[0].StartLBA)
+	}
+	if !parts[0].Bootable {
+		t.Fatal("expected mbr part 1 to be bootable")
+	}
+	if parts[1].StartLBA != 4096 {
+		t.Fatalf("expected mbr part 2 start lba 4096, got %d", parts[1].StartLBA)
+	}
+	if parts[1].Bootable {
+		t.Fatal("expected mbr part 2 not bootable")
+	}
+}
+
+func TestGptPartAddSupportsStartSectorOption(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "gpt-part-add-options.img")
+
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "64MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"gpt", "initialize", media}, &out); err != nil {
+		t.Fatalf("gpt initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"gpt", "part", "add", media, "linux", "DATA", "1MB", "--start-sector", "2048"}, &out); err != nil {
+		t.Fatalf("gpt part add with --start-sector failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"gpt", "part", "add", media, "linux", "MORE", "1MB", "-s", "4096"}, &out); err != nil {
+		t.Fatalf("gpt part add with -s failed: %v", err)
+	}
+
+	_, parts, err := readGpt(media)
+	if err != nil {
+		t.Fatalf("read gpt failed: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 gpt partitions, got %d", len(parts))
+	}
+	if parts[0].FirstLBA != 2048 {
+		t.Fatalf("expected gpt part 1 first lba 2048, got %d", parts[0].FirstLBA)
+	}
+	if parts[0].Name != "DATA" {
+		t.Fatalf("expected gpt part 1 name DATA, got %q", parts[0].Name)
+	}
+	if parts[1].FirstLBA != 4096 {
+		t.Fatalf("expected gpt part 2 first lba 4096, got %d", parts[1].FirstLBA)
+	}
+	if parts[1].Name != "MORE" {
+		t.Fatalf("expected gpt part 2 name MORE, got %q", parts[1].Name)
+	}
+}
+
 func TestMbrPartFormatFat32RequiresMinimumSectors(t *testing.T) {
 	tmp := t.TempDir()
 	media := filepath.Join(tmp, "mbr-fat32-min.img")
