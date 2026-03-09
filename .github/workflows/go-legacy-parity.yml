@@ -73,6 +73,7 @@ jobs:
           mkdir -p "${GOCACHE}"
           cd src/hst-imager-go
           go test -count=1 ./...
+          ./scripts/verify-go-cli-shape-matrix.sh
           ./scripts/verify-go-prototype.sh
           HST_IMAGER_LEGACY_BIN="${HST_IMAGER_LEGACY_BIN}" ./scripts/verify-go-legacy-parity.sh
 
@@ -97,6 +98,7 @@ jobs:
           mkdir -p "${GOCACHE}"
           cd src/hst-imager-go
           go test -count=1 ./...
+          ./scripts/verify-go-cli-shape-matrix.sh
           ./scripts/verify-go-prototype.sh
 
   deep-parity:

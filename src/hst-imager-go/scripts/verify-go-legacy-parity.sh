@@ -33,6 +33,9 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 PASS=0
 FAIL=0
 SKIP=0
+CURRENT_FUZZ_CASE=""
+CURRENT_FUZZ_SEED=""
+CURRENT_FUZZ_TABLE=""
 
 DATA_ROOT="$ROOT_DIR/../Hst.Imager.Core.Tests/TestData"
 LHA_AMIGA="$DATA_ROOT/Lha/amiga.lha"
@@ -118,12 +121,69 @@ fail_case() {
   FAIL=$((FAIL + 1))
   echo "FAIL: $1"
   echo "  $2"
+  if is_fuzz_case_name "$1"; then
+    write_fuzz_repro_script "$1"
+  fi
 }
 
 skip_case() {
   SKIP=$((SKIP + 1))
   echo "SKIP: $1"
   echo "  $2"
+}
+
+is_fuzz_case_name() {
+  [[ "$1" == fuzz-seq-* ]]
+}
+
+record_fuzz_case_metadata() {
+  local case_name="$1"
+  local seed="$2"
+  local table="$3"
+  printf '%s seed=%s table=%s\n' "$case_name" "$seed" "$table" >>"$TMP_DIR/fuzz-seeds.txt"
+}
+
+record_step_for_repro() {
+  local case_name="$1"
+  local mode="$2"
+  shift 2
+  local step_file="$TMP_DIR/${case_name}.${mode}.steps.sh"
+  {
+    printf 'HST_IMAGER_LEGACY_MODE=%q HST_IMAGER_LEGACY_BIN=%q %q' "$mode" "$LEGACY_BIN" "$GO_BIN"
+    for arg in "$@"; do
+      printf ' %q' "$arg"
+    done
+    printf '\n'
+  } >>"$step_file"
+}
+
+write_fuzz_repro_script() {
+  local case_name="$1"
+  local off_steps="$TMP_DIR/${case_name}.off.steps.sh"
+  local force_steps="$TMP_DIR/${case_name}.force.steps.sh"
+  local repro_script="$TMP_DIR/repro-${case_name}.sh"
+  if [[ ! -f "$off_steps" && ! -f "$force_steps" ]]; then
+    return
+  fi
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    printf 'cd %q\n' "$ROOT_DIR"
+    printf 'echo %q\n' "Repro case: ${case_name} seed=${CURRENT_FUZZ_SEED} table=${CURRENT_FUZZ_TABLE}"
+    if [[ -f "$off_steps" ]]; then
+      echo "echo '--- OFF MODE STEPS ---'"
+      cat "$off_steps"
+    fi
+    if [[ -f "$force_steps" ]]; then
+      echo "echo '--- FORCE MODE STEPS ---'"
+      cat "$force_steps"
+    fi
+    if [[ -f "$TMP_DIR/fuzz-seeds.txt" ]]; then
+      printf 'echo %q\n' "Seed map: $TMP_DIR/fuzz-seeds.txt"
+    fi
+  } >"$repro_script"
+  chmod +x "$repro_script"
+  echo "  repro: $repro_script"
 }
 
 compare_output_case() {
@@ -377,6 +437,9 @@ run_step_pair() {
   local force_err="$TMP_DIR/${case_name}.${step_name}.force.err"
   local force_rc="$TMP_DIR/${case_name}.${step_name}.force.rc"
 
+  record_step_for_repro "$case_name" off "${off_args[@]}"
+  record_step_for_repro "$case_name" force "${force_args[@]}"
+
   run_mode off "$off_out" "$off_err" "$off_rc" "${off_args[@]}"
   run_mode force "$force_out" "$force_err" "$force_rc" "${force_args[@]}"
 
@@ -554,6 +617,9 @@ run_fuzz_workflow_cases() {
     seed=$((base_seed + i))
     RANDOM=$seed
     name="fuzz-seq-${i}"
+    CURRENT_FUZZ_CASE="$name"
+    CURRENT_FUZZ_SEED="$seed"
+    CURRENT_FUZZ_TABLE="unknown"
     # Use identical media basenames for both modes to avoid path-derived RDB label/checksum noise.
     off_dir="$TMP_DIR/${name}.off"
     force_dir="$TMP_DIR/${name}.force"
@@ -566,6 +632,8 @@ run_fuzz_workflow_cases() {
 
     table=$((RANDOM % 3))
     if [[ "$table" -eq 0 ]]; then
+      CURRENT_FUZZ_TABLE="mbr"
+      record_fuzz_case_metadata "$name" "$seed" "$CURRENT_FUZZ_TABLE"
       run_step_pair "$name" "mbr-init" "$off_media" "$force_media" mbr initialize "__MEDIA__"; rc=$?
       if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
       add_count=$((RANDOM % 3 + 1))
@@ -586,6 +654,8 @@ run_fuzz_workflow_cases() {
         if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
       fi
     elif [[ "$table" -eq 1 ]]; then
+      CURRENT_FUZZ_TABLE="gpt"
+      record_fuzz_case_metadata "$name" "$seed" "$CURRENT_FUZZ_TABLE"
       run_step_pair "$name" "gpt-init" "$off_media" "$force_media" gpt initialize "__MEDIA__"; rc=$?
       if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
       add_count=$((RANDOM % 2 + 1))
@@ -606,6 +676,8 @@ run_fuzz_workflow_cases() {
         if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
       fi
     else
+      CURRENT_FUZZ_TABLE="rdb"
+      record_fuzz_case_metadata "$name" "$seed" "$CURRENT_FUZZ_TABLE"
       run_step_pair "$name" "rdb-init" "$off_media" "$force_media" rdb initialize "__MEDIA__"; rc=$?
       if [[ "$rc" -eq 2 ]]; then return; elif [[ "$rc" -ne 0 ]]; then return; fi
       run_step_pair "$name" "rdb-fs-add" "$off_media" "$force_media" rdb filesystem add "__MEDIA__" "$PFS3_AIO" PDS3; rc=$?
@@ -632,6 +704,9 @@ run_fuzz_workflow_cases() {
       compare_media_hash_case "$name" "$off_media" "$force_media"
     fi
   done
+  CURRENT_FUZZ_CASE=""
+  CURRENT_FUZZ_SEED=""
+  CURRENT_FUZZ_TABLE=""
 }
 
 run_partition_workflow_cases() {

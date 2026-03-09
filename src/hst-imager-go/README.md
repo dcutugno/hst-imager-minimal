@@ -50,6 +50,16 @@ Strict byte-level parity pack (deep fixtures + strict hash + zero skips):
 ./scripts/verify-go-byte-parity-pack.sh
 ```
 
+CLI shape matrix parity (auto-generated from .NET command factories):
+```bash
+./scripts/verify-go-cli-shape-matrix.sh
+```
+
+Nightly long-haul parity (with artifact capture):
+```bash
+./scripts/run-nightly-parity.sh
+```
+
 Notes:
 - Set `HST_IMAGER_LEGACY_BIN` to override legacy binary location.
 - Set `HST_PARITY_HEAVY=1` to include heavy large-image write parity cases.
@@ -57,6 +67,7 @@ Notes:
 - Set `HST_PARITY_FUZZ_ROUNDS=<N>` and optional `HST_PARITY_FUZZ_SEED=<seed>` to run deterministic randomized workflow differential checks (default `0` rounds).
 - Set `HST_PARITY_FUZZ_STRICT_HASH=1` to enable raw media hash checks in fuzz workflows (disabled by default; semantic fuzz parity is still validated).
 - Set `HST_PARITY_DEEP_FS=1` to enable deep archive/filesystem fixtures (special chars and nested trees).
+- Set `HST_PARITY_ARTIFACT_DIR=<path>` to collect logs and failure artifacts for nightly runs.
 - On failures, the script prints a temp directory containing `.diff` artifacts for each failed case.
 
 Cross-platform automation:
