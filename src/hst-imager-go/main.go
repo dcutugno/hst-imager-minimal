@@ -28,7 +28,9 @@ import (
 	"time"
 	"unicode/utf16"
 
+	jlhago "github.com/jeromelesaux/lha"
 	lhago "github.com/koron-go/lha"
+	lhalzhuff "github.com/koron-go/lha/lzhuff"
 	rardecode "github.com/nwaples/rardecode"
 	"github.com/ulikunitz/xz"
 )
@@ -1555,25 +1557,45 @@ func tryReadRdb(path string) (rdbState, bool) {
 
 func handleTransfer(args []string, stdout io.Writer, command string, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>]", command)
+		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>|-s <bytes>] [--src-start <offset>|-ss <offset>] [--dest-start <offset>|-ds <offset>] [--start <offset>] [--verify|-v]", command)
 	}
 	source := args[0]
 	destination := args[1]
-	copySize, err := parseOptionalSize(args[2:])
+	transferOpts, err := parseTransferOptions(args[2:], command)
 	if err != nil {
 		return err
+	}
+	copySize := int64(-1)
+	if transferOpts.hasSize {
+		copySize = transferOpts.size
 	}
 	copyOpts := copyFileOptions{}
 	if strings.EqualFold(command, "write") {
 		copyOpts.requireExistingDestination = true
 		copyOpts.preserveDestinationSize = true
 	}
-	written, err := copyFileWithOptions(source, destination, copySize, copyOpts)
+	written, err := copyFileSegmentWithOptions(source, destination, copySize, transferOpts.srcStart, transferOpts.dstStart, copyOpts)
 	if err != nil {
 		return err
 	}
+	if transferOpts.verify {
+		ok, checked, err := compareFilesWithOffsets(source, destination, transferOpts.srcStart, transferOpts.dstStart, written)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("verify failed: files differ within first %d bytes", checked)
+		}
+	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"source": source, "destination": destination, "bytes": written})
+		return writeJSON(stdout, map[string]any{
+			"source":      source,
+			"destination": destination,
+			"bytes":       written,
+			"srcStart":    transferOpts.srcStart,
+			"destStart":   transferOpts.dstStart,
+			"verify":      transferOpts.verify,
+		})
 	}
 	fmt.Fprintf(stdout, "Transferred %d bytes from '%s' to '%s'.\n", written, source, destination)
 	return nil
@@ -1581,15 +1603,19 @@ func handleTransfer(args []string, stdout io.Writer, command string, opts Global
 
 func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: compare <source> <destination> [--size <bytes>]")
+		return errors.New("usage: compare <source> <destination> [--size <bytes>|-s <bytes>] [--source-start <offset>] [--destination-start <offset>]")
 	}
 	source := args[0]
 	destination := args[1]
-	compareSize, err := parseOptionalSize(args[2:])
+	compareOpts, err := parseCompareOptions(args[2:])
 	if err != nil {
 		return err
 	}
-	ok, checked, err := compareFiles(source, destination, compareSize)
+	compareSize := int64(-1)
+	if compareOpts.hasSize {
+		compareSize = compareOpts.size
+	}
+	ok, checked, err := compareFilesWithOffsets(source, destination, compareOpts.srcStart, compareOpts.dstStart, compareSize)
 	if err != nil {
 		return err
 	}
@@ -1597,10 +1623,144 @@ func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return fmt.Errorf("compare failed: files differ within first %d bytes", checked)
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"equal": true, "bytesChecked": checked})
+		return writeJSON(stdout, map[string]any{
+			"equal":            true,
+			"bytesChecked":     checked,
+			"sourceStart":      compareOpts.srcStart,
+			"destinationStart": compareOpts.dstStart,
+		})
 	}
 	fmt.Fprintf(stdout, "Compare successful: %d bytes are identical.\n", checked)
 	return nil
+}
+
+type transferOptions struct {
+	size     int64
+	hasSize  bool
+	srcStart int64
+	dstStart int64
+	verify   bool
+}
+
+func parseTransferOptions(args []string, command string) (transferOptions, error) {
+	opts := transferOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--size", "-s":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --size")
+			}
+			size, err := parseSize(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.size = size
+			opts.hasSize = true
+			i++
+		case "--src-start", "-ss":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --src-start")
+			}
+			offset, err := parseNonNegativeOffset(args[i+1], "--src-start")
+			if err != nil {
+				return opts, err
+			}
+			opts.srcStart = offset
+			i++
+		case "--dest-start", "-ds":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --dest-start")
+			}
+			offset, err := parseNonNegativeOffset(args[i+1], "--dest-start")
+			if err != nil {
+				return opts, err
+			}
+			opts.dstStart = offset
+			i++
+		case "--start":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --start")
+			}
+			offset, err := parseNonNegativeOffset(args[i+1], "--start")
+			if err != nil {
+				return opts, err
+			}
+			switch strings.ToLower(command) {
+			case "read":
+				opts.srcStart = offset
+			case "write":
+				opts.dstStart = offset
+			default:
+				return opts, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			i++
+		case "--verify", "-v":
+			opts.verify = true
+		default:
+			return opts, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	return opts, nil
+}
+
+type compareOptions struct {
+	size     int64
+	hasSize  bool
+	srcStart int64
+	dstStart int64
+}
+
+func parseCompareOptions(args []string) (compareOptions, error) {
+	opts := compareOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--size", "-s":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --size")
+			}
+			size, err := parseSize(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.size = size
+			opts.hasSize = true
+			i++
+		case "--source-start":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --source-start")
+			}
+			offset, err := parseNonNegativeOffset(args[i+1], "--source-start")
+			if err != nil {
+				return opts, err
+			}
+			opts.srcStart = offset
+			i++
+		case "--destination-start":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --destination-start")
+			}
+			offset, err := parseNonNegativeOffset(args[i+1], "--destination-start")
+			if err != nil {
+				return opts, err
+			}
+			opts.dstStart = offset
+			i++
+		default:
+			return opts, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	return opts, nil
+}
+
+func parseNonNegativeOffset(value string, name string) (int64, error) {
+	offset, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid value for %s: %s", name, value)
+	}
+	if offset < 0 {
+		return 0, fmt.Errorf("invalid value for %s: %s", name, value)
+	}
+	return offset, nil
 }
 
 func writeJSON(stdout io.Writer, value any) error {
@@ -1616,7 +1776,7 @@ func parseOptionalSize(args []string) (int64, error) {
 	if len(args) == 0 {
 		return 0, nil
 	}
-	if len(args) != 2 || args[0] != "--size" {
+	if len(args) != 2 || (args[0] != "--size" && args[0] != "-s") {
 		return 0, fmt.Errorf("unsupported arguments: %s", strings.Join(args, " "))
 	}
 	return parseSize(args[1])
@@ -1665,36 +1825,48 @@ func copyFile(source, destination string, size int64) (int64, error) {
 }
 
 func copyFileWithOptions(source, destination string, size int64, opts copyFileOptions) (int64, error) {
+	return copyFileSegmentWithOptions(source, destination, size, 0, 0, opts)
+}
+
+func copyFileSegmentWithOptions(source, destination string, size int64, srcStart int64, dstStart int64, opts copyFileOptions) (int64, error) {
+	if srcStart < 0 || dstStart < 0 {
+		return 0, errors.New("offset must be >= 0")
+	}
 	if opts.requireExistingDestination && opts.preserveDestinationSize {
 		capacity, hasCapacity, err := resolveDestinationCapacity(destination)
 		if err != nil {
 			return 0, err
 		}
 		if hasCapacity {
+			available := capacity - dstStart
+			if available < 0 {
+				return 0, errors.New("destination partition too small")
+			}
 			if size > 0 {
-				if size > capacity {
+				if size > available {
 					return 0, errors.New("destination partition too small")
 				}
 			} else if sourceSize, hasSourceSize, err := resolveSourceStreamSize(source); err != nil {
 				return 0, err
-			} else if hasSourceSize && sourceSize > capacity {
-				return 0, errors.New("destination partition too small")
+			} else if hasSourceSize {
+				remainingSource := sourceSize - srcStart
+				if remainingSource < 0 {
+					remainingSource = 0
+				}
+				if remainingSource > available {
+					return 0, errors.New("destination partition too small")
+				}
 			}
 		}
 	}
 
-	src, err := openSourceReader(source)
+	src, err := openSourceReaderAt(source, srcStart)
 	if err != nil {
 		return 0, err
 	}
 	defer src.Close()
 
-	if !opts.requireExistingDestination {
-		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil && filepath.Dir(destination) != "." {
-			return 0, err
-		}
-	}
-	dst, err := openDestinationWriterWithOptions(destination, opts.requireExistingDestination, opts.preserveDestinationSize)
+	dst, err := openDestinationWriterAtWithOptions(destination, dstStart, opts.requireExistingDestination, opts.preserveDestinationSize)
 	if err != nil {
 		return 0, err
 	}
@@ -1712,6 +1884,123 @@ func copyFileWithOptions(source, destination string, size int64, opts copyFileOp
 		return written, errors.New("destination partition too small")
 	}
 	return written, err
+}
+
+func openSourceReaderAt(path string, offset int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, errors.New("offset must be >= 0")
+	}
+	if offset == 0 {
+		return openSourceReader(path)
+	}
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return nil, err
+	} else if ok {
+		if offset > region.Size {
+			return nil, errors.New("source offset out of range")
+		}
+		f, err := os.Open(region.BasePath)
+		if err != nil {
+			return nil, err
+		}
+		section := io.NewSectionReader(f, region.Offset+offset, region.Size-offset)
+		return &readCloser{reader: section, closer: f}, nil
+	}
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".gz", ".xz", ".bz2", ".z", ".zip", ".rar":
+		rc, err := openSourceReader(path)
+		if err != nil {
+			return nil, err
+		}
+		skipped, err := io.CopyN(io.Discard, rc, offset)
+		if err != nil {
+			_ = rc.Close()
+			if errors.Is(err, io.EOF) && skipped < offset {
+				return nil, errors.New("source offset out of range")
+			}
+			return nil, err
+		}
+		return rc, nil
+	default:
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return f, nil
+	}
+}
+
+func openDestinationWriterAtWithOptions(path string, offset int64, requireExisting bool, preserveSize bool) (io.WriteCloser, error) {
+	if offset < 0 {
+		return nil, errors.New("offset must be >= 0")
+	}
+	if offset == 0 {
+		return openDestinationWriterWithOptions(path, requireExisting, preserveSize)
+	}
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return nil, err
+	} else if ok {
+		if offset > region.Size {
+			return nil, errors.New("destination partition too small")
+		}
+		f, err := os.OpenFile(region.BasePath, os.O_RDWR, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.Seek(region.Offset+offset, io.SeekStart); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &partitionWriteCloser{f: f, remaining: region.Size - offset}, nil
+	}
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".gz", ".xz", ".zip":
+		return nil, errors.New("destination start offset is unsupported for compressed output")
+	default:
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
+			return nil, err
+		}
+		if requireExisting {
+			info, err := os.Stat(path)
+			if err != nil {
+				return nil, err
+			}
+			if preserveSize && offset > info.Size() {
+				return nil, errors.New("destination partition too small")
+			}
+			f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := f.Seek(offset, io.SeekStart); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			if preserveSize {
+				return &partitionWriteCloser{f: f, remaining: info.Size() - offset}, nil
+			}
+			return f, nil
+		}
+		flags := os.O_WRONLY | os.O_CREATE
+		if !preserveSize {
+			flags |= os.O_TRUNC
+		}
+		f, err := os.OpenFile(path, flags, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return f, nil
+	}
 }
 
 func resolveDestinationCapacity(path string) (int64, bool, error) {
@@ -1756,7 +2045,7 @@ func resolveSourceStreamSize(path string) (int64, bool, error) {
 		}
 		return 0, false, errors.New("zip archive has no file entries")
 	case ".rar":
-		rr, err := rardecode.OpenReader(path, "")
+		rr, err := openRarReadCloser(path)
 		if err != nil {
 			return 0, false, err
 		}
@@ -1786,17 +2075,24 @@ func resolveSourceStreamSize(path string) (int64, bool, error) {
 }
 
 func compareFiles(source, destination string, size int64) (bool, int64, error) {
-	a, err := openSourceReader(source)
+	return compareFilesWithOffsets(source, destination, 0, 0, size)
+}
+
+func compareFilesWithOffsets(source, destination string, sourceStart int64, destinationStart int64, size int64) (bool, int64, error) {
+	a, err := openSourceReaderAt(source, sourceStart)
 	if err != nil {
 		return false, 0, err
 	}
 	defer a.Close()
-	b, err := openSourceReader(destination)
+	b, err := openSourceReaderAt(destination, destinationStart)
 	if err != nil {
 		return false, 0, err
 	}
 	defer b.Close()
+	return compareReaders(a, b, size)
+}
 
+func compareReaders(a io.Reader, b io.Reader, size int64) (bool, int64, error) {
 	const bufSize = 64 * 1024
 	ab := make([]byte, bufSize)
 	bb := make([]byte, bufSize)
@@ -1811,6 +2107,9 @@ func compareFiles(source, destination string, size int64) (bool, int64, error) {
 			if remaining < int64(maxRead) {
 				maxRead = int(remaining)
 			}
+		}
+		if maxRead == 0 {
+			return true, compared, nil
 		}
 		an, aerr := a.Read(ab[:maxRead])
 		if aerr != nil && !errors.Is(aerr, io.EOF) {
@@ -1863,11 +2162,13 @@ func normalizeCommandTokens(args []string) []string {
 
 func handleOptimize(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
-		return errors.New("usage: optimize <path> [--size <size>|-s <size>|--rdb]")
+		return errors.New("usage: optimize <path> [--size <size>|-s <size>] [--partition-table <none|gpt|mbr|rdb>|-pt <none|gpt|mbr|rdb>] [--rdb]")
 	}
 	path := args[0]
-	var explicitSize int64 = -1
-	useRdb := false
+	explicitSize := int64(0)
+	hasExplicitSize := false
+	partitionTable := ""
+	hasPartitionTable := false
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--size", "-s":
@@ -1879,31 +2180,46 @@ func handleOptimize(args []string, stdout io.Writer, opts GlobalOptions) error {
 				return err
 			}
 			explicitSize = size
+			hasExplicitSize = true
+			i++
+		case "--partition-table", "-pt":
+			if i+1 >= len(args) {
+				return errors.New("missing value for --partition-table")
+			}
+			parsed, err := parseOptimizePartitionTable(args[i+1])
+			if err != nil {
+				return err
+			}
+			partitionTable = parsed
+			hasPartitionTable = true
 			i++
 		case "--rdb":
-			useRdb = true
+			partitionTable = "rdb"
+			hasPartitionTable = true
 		default:
 			return fmt.Errorf("unsupported argument: %s", args[i])
 		}
 	}
-	target := explicitSize
-	if useRdb {
-		state, err := readRdbState(path)
-		if err != nil {
-			return err
+
+	var target int64
+	if hasExplicitSize && explicitSize > 0 {
+		target = explicitSize
+	} else {
+		selectedPartitionTable := ""
+		if hasPartitionTable {
+			selectedPartitionTable = partitionTable
 		}
-		if state.RdbSize <= 0 {
-			return errors.New("no RDB size present for media")
-		}
-		target = state.RdbSize
-	}
-	if target < 0 {
-		size, err := trimTrailingZeros(path)
+		size, err := resolveOptimizeSize(path, selectedPartitionTable)
 		if err != nil {
 			return err
 		}
 		target = size
-	} else if err := os.Truncate(path, target); err != nil {
+	}
+
+	if target <= 0 {
+		return fmt.Errorf("Invalid optimized size '%d'", target)
+	}
+	if err := os.Truncate(path, target); err != nil {
 		return err
 	}
 	if opts.Format == "json" {
@@ -1911,6 +2227,110 @@ func handleOptimize(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	fmt.Fprintf(stdout, "Optimized '%s' to %d bytes.\n", path, target)
 	return nil
+}
+
+func parseOptimizePartitionTable(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "none":
+		return "", nil
+	case "gpt", "mbr", "rdb":
+		return strings.ToLower(strings.TrimSpace(value)), nil
+	default:
+		return "", fmt.Errorf("unsupported partition table '%s' (supported: none, gpt, mbr, rdb)", value)
+	}
+}
+
+func resolveOptimizeSize(path string, partitionTable string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	mediaSize := info.Size()
+
+	mbrParts, hasMbr := tryReadMbr(path)
+	gptHeader, gptParts, hasGpt := tryReadGpt(path)
+	rdbStateValue, hasRdb := tryReadRdb(path)
+
+	mbrSize := int64(0)
+	if hasMbr {
+		mbrSize = estimateMbrOptimizeSize(mbrParts)
+		if mbrSize <= 0 {
+			mbrSize = mediaSize
+		}
+	}
+	gptSize := int64(0)
+	if hasGpt {
+		gptSize = estimateGptOptimizeSize(gptHeader, gptParts)
+		if gptSize <= 0 {
+			gptSize = mediaSize
+		}
+	}
+	rdbSize := int64(0)
+	if hasRdb {
+		rdbSize = rdbStateValue.RdbSize
+		if rdbSize <= 0 {
+			rdbSize = mediaSize
+		}
+	}
+
+	switch partitionTable {
+	case "gpt":
+		if !hasGpt {
+			return 0, errors.New("Guid Partition Table not found")
+		}
+		return gptSize, nil
+	case "mbr":
+		if !hasMbr {
+			return 0, errors.New("Master Boot Record not found")
+		}
+		return mbrSize, nil
+	case "rdb":
+		if !hasRdb {
+			return 0, errors.New("Rigid Disk Block not found")
+		}
+		return rdbSize, nil
+	}
+
+	if hasGpt {
+		return gptSize, nil
+	}
+	if hasMbr && !hasRdb {
+		return mbrSize, nil
+	}
+	if hasRdb {
+		if hasMbr && mbrSize > rdbSize {
+			return mbrSize, nil
+		}
+		return rdbSize, nil
+	}
+	return 0, errors.New("Unable to optimize size of image file when no partition table are found")
+}
+
+func estimateMbrOptimizeSize(parts []mbrPartition) int64 {
+	maxEnd := int64(0)
+	for _, part := range parts {
+		end := int64(part.StartLBA) + int64(part.SectorCount)
+		if end > maxEnd {
+			maxEnd = end
+		}
+	}
+	return maxEnd * mbrSectorSize
+}
+
+func estimateGptOptimizeSize(header gptHeader, parts []gptPartitionEntry) int64 {
+	maxEndLba := uint64(0)
+	for _, part := range parts {
+		if part.LastLBA+1 > maxEndLba {
+			maxEndLba = part.LastLBA + 1
+		}
+	}
+	if maxEndLba == 0 && header.LastUsable > 0 {
+		maxEndLba = header.LastUsable + 1
+	}
+	if maxEndLba > uint64((^uint64(0))/mbrSectorSize) {
+		return 0
+	}
+	return int64(maxEndLba) * mbrSectorSize
 }
 
 func trimTrailingZeros(path string) (int64, error) {
@@ -6617,7 +7037,7 @@ func openSourceReader(path string) (io.ReadCloser, error) {
 			}),
 		}, nil
 	case ".rar":
-		rr, err := rardecode.OpenReader(path, "")
+		rr, err := openRarReadCloser(path)
 		if err != nil {
 			return nil, err
 		}
@@ -7744,21 +8164,17 @@ func extractLzxArchive(archivePath, innerPath, destination string) error {
 		return err
 	}
 
-	group := make([]lzxEntry, 0)
-	for _, entry := range entries {
-		group = append(group, entry)
-		if entry.PackedSize == 0 {
-			continue
+	for i := 0; i < len(entries); {
+		groupEnd := i + 1
+		if entries[i].Flags&lzxMergedFlag != 0 {
+			for groupEnd < len(entries) && entries[groupEnd].Flags&lzxMergedFlag != 0 {
+				groupEnd++
+			}
 		}
-		if err := extractLzxGroup(b, group, innerPath, destination); err != nil {
+		if err := extractLzxGroup(b, entries[i:groupEnd], innerPath, destination); err != nil {
 			return err
 		}
-		group = group[:0]
-	}
-	if len(group) > 0 {
-		if err := extractLzxGroup(b, group, innerPath, destination); err != nil {
-			return err
-		}
+		i = groupEnd
 	}
 	return nil
 }
@@ -7875,9 +8291,21 @@ func extractLzxGroup(data []byte, group []lzxEntry, innerPath, destination strin
 	}
 
 	if cursor != len(mergedData) {
+		if canIgnoreTrailingLzxData(mergedData[cursor:]) {
+			return nil
+		}
 		return fmt.Errorf("invalid lzx payload split: consumed %d of %d", cursor, len(mergedData))
 	}
 	return nil
+}
+
+func canIgnoreTrailingLzxData(data []byte) bool {
+	for _, b := range data {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func parseLzxEntries(data []byte) ([]lzxEntry, error) {
@@ -7963,7 +8391,7 @@ func normalizeLzxEntryName(name string) string {
 }
 
 func listRarArchiveEntries(path string) ([]archiveEntry, error) {
-	rr, err := rardecode.OpenReader(path, "")
+	rr, err := openRarReadCloser(path)
 	if err != nil {
 		if isRarUnsupportedFeatureError(err) {
 			return nil, errUnsupportedRarFeature
@@ -8001,7 +8429,7 @@ func listRarArchiveEntries(path string) ([]archiveEntry, error) {
 }
 
 func extractRarArchive(archivePath, innerPath, destination string) error {
-	rr, err := rardecode.OpenReader(archivePath, "")
+	rr, err := openRarReadCloser(archivePath)
 	if err != nil {
 		if isRarUnsupportedFeatureError(err) {
 			return errUnsupportedRarFeature
@@ -8042,6 +8470,7 @@ func extractRarArchive(archivePath, innerPath, destination string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			applyExtractedArchiveMetadata(target, h.Mode(), h.ModificationTime)
 			continue
 		}
 
@@ -8064,6 +8493,79 @@ func extractRarArchive(archivePath, innerPath, destination string) error {
 		if closeErr != nil {
 			return closeErr
 		}
+		applyExtractedArchiveMetadata(target, mode, h.ModificationTime)
+	}
+}
+
+func openRarReadCloser(path string) (*rardecode.ReadCloser, error) {
+	password := rarPasswordFromEnv()
+	candidates := []string{resolveRarPrimaryVolumePath(path)}
+	if candidates[0] != path {
+		candidates = append(candidates, path)
+	}
+
+	var firstErr error
+	for _, candidate := range candidates {
+		rr, err := rardecode.OpenReader(candidate, password)
+		if err == nil {
+			return rr, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if password != "" {
+			rr, err = rardecode.OpenReader(candidate, "")
+			if err == nil {
+				return rr, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if firstErr == nil {
+		firstErr = errUnsupportedRarFeature
+	}
+	return nil, firstErr
+}
+
+func rarPasswordFromEnv() string {
+	if password := strings.TrimSpace(os.Getenv("HST_IMAGER_RAR_PASSWORD")); password != "" {
+		return password
+	}
+	return strings.TrimSpace(os.Getenv("HST_RAR_PASSWORD"))
+}
+
+func resolveRarPrimaryVolumePath(path string) string {
+	base := path
+	lower := strings.ToLower(path)
+
+	if matched, _ := regexp.MatchString(`\.r\d{2}$`, lower); matched {
+		base = path[:len(path)-4] + ".rar"
+		if fileExists(base) {
+			return base
+		}
+	}
+
+	re := regexp.MustCompile(`(?i)\.part(\d+)\.rar$`)
+	m := re.FindStringSubmatch(path)
+	if len(m) == 2 && m[1] != "1" {
+		base = re.ReplaceAllString(path, ".part1.rar")
+		if fileExists(base) {
+			return base
+		}
+	}
+
+	return path
+}
+
+func applyExtractedArchiveMetadata(path string, mode os.FileMode, modTime time.Time) {
+	if !modTime.IsZero() {
+		_ = os.Chtimes(path, modTime, modTime)
+	}
+	perm := mode.Perm()
+	if perm != 0 {
+		_ = os.Chmod(path, perm)
 	}
 }
 
@@ -8633,6 +9135,13 @@ func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
 	if !errors.Is(err, errUnsupportedLhaFeature) {
 		return nil, err
 	}
+	items, err = listLhaArchiveEntriesJerom(path)
+	if err == nil {
+		return items, nil
+	}
+	if !errors.Is(err, errUnsupportedLhaFeature) {
+		return nil, err
+	}
 
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -8651,6 +9160,29 @@ func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
 			IsDir:          e.IsDir || strings.EqualFold(e.Method, "-lhd-"),
 			ProtectionBits: &protectionBits,
 			Comment:        e.Comment,
+		})
+	}
+	return items, nil
+}
+
+func listLhaArchiveEntriesJerom(path string) ([]archiveEntry, error) {
+	headers, err := lhaHeadersJerom(path)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]archiveEntry, 0, len(headers))
+	for _, header := range headers {
+		entryName, comment, isDir := lhaJeromHeaderEntry(header)
+		if entryName == "" {
+			continue
+		}
+		protectionBits := int(header.Attribute)
+		items = append(items, archiveEntry{
+			Name:           entryName,
+			Size:           int64(header.OriginalSize),
+			IsDir:          isDir,
+			ProtectionBits: &protectionBits,
+			Comment:        comment,
 		})
 	}
 	return items, nil
@@ -8693,6 +9225,13 @@ func listLhaArchiveEntriesNative(path string) ([]archiveEntry, error) {
 
 func extractLhaArchive(archivePath, innerPath, destination string) error {
 	err := extractLhaArchiveNative(archivePath, innerPath, destination)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errUnsupportedLhaFeature) {
+		return err
+	}
+	err = extractLhaArchiveJerom(archivePath, innerPath, destination)
 	if err == nil {
 		return nil
 	}
@@ -8764,6 +9303,53 @@ func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
 	return nil
 }
 
+func extractLhaArchiveJerom(archivePath, innerPath, destination string) error {
+	headers, err := lhaHeadersJerom(archivePath)
+	if err != nil {
+		return err
+	}
+
+	lha := jlhago.NewLha(archivePath)
+	for _, header := range headers {
+		entryName, _, isDir := lhaJeromHeaderEntry(header)
+		if entryName == "" {
+			continue
+		}
+		relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
+		if !ok || relPath == "" {
+			continue
+		}
+
+		target, err := safeArchiveTargetPath(destination, relPath, entryName)
+		if err != nil {
+			return err
+		}
+		if isDir {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		content, err := lhaDecompressBytesJerom(lha, header)
+		if err != nil {
+			if isLhaJeromUnsupportedFeatureError(err) {
+				return errUnsupportedLhaFeature
+			}
+			return err
+		}
+		if header.OriginalSize > 0 && len(content) == 0 {
+			return errUnsupportedLhaFeature
+		}
+		if err := os.WriteFile(target, content, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) error {
 	b, err := os.ReadFile(archivePath)
 	if err != nil {
@@ -8790,9 +9376,6 @@ func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) err
 			}
 			continue
 		}
-		if !strings.EqualFold(e.Method, "-lh0-") {
-			return errUnsupportedLhaFeature
-		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
@@ -8800,7 +9383,11 @@ func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) err
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(target, payload, 0o644); err != nil {
+		decoded, err := decodeLhaEntryPayload(e.Method, payload, e.OriginalSize)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, decoded, 0o644); err != nil {
 			return err
 		}
 	}
@@ -8819,6 +9406,69 @@ func lhaNextHeaderSafe(r *lhago.Reader) (h *lhago.Header, err error) {
 		return nil, errUnsupportedLhaFeature
 	}
 	return h, err
+}
+
+func lhaHeadersJerom(path string) (headers []*jlhago.LzHeader, err error) {
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			headers = nil
+			err = errUnsupportedLhaFeature
+		}
+	}()
+	lha := jlhago.NewLha(path)
+	lha.Noexec = true
+	lha.ExtractBrokenArchive = true
+	if err := withSuppressedProcessOutput(func() error {
+		var headersErr error
+		headers, headersErr = lha.Headers()
+		return headersErr
+	}); err != nil {
+		if isLhaJeromUnsupportedFeatureError(err) {
+			return nil, errUnsupportedLhaFeature
+		}
+		return nil, err
+	}
+	return headers, nil
+}
+
+func lhaDecompressBytesJerom(lha *jlhago.Lha, header *jlhago.LzHeader) (content []byte, err error) {
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			content = nil
+			err = errUnsupportedLhaFeature
+		}
+	}()
+	lha.ExtractBrokenArchive = true
+	if err := withSuppressedProcessOutput(func() error {
+		var decodeErr error
+		content, decodeErr = lha.DecompresBytes(header)
+		return decodeErr
+	}); err != nil {
+		if isLhaJeromCrcError(err) && len(content) > 0 {
+			return content, nil
+		}
+		return nil, err
+	}
+	return content, nil
+}
+
+func withSuppressedProcessOutput(run func() error) error {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer devNull.Close()
+
+	originalStdout := os.Stdout
+	originalStderr := os.Stderr
+	os.Stdout = devNull
+	os.Stderr = devNull
+	defer func() {
+		os.Stdout = originalStdout
+		os.Stderr = originalStderr
+	}()
+
+	return run()
 }
 
 func lhaDecodeSafe(r *lhago.Reader, w io.Writer) (n int, err error) {
@@ -8844,6 +9494,34 @@ func isLhaUnsupportedFeatureError(err error) bool {
 		strings.Contains(msg, "unknown header level") ||
 		strings.Contains(msg, "unsupported header level") ||
 		strings.Contains(msg, "invalid nil header")
+}
+
+func lhaJeromHeaderEntry(header *jlhago.LzHeader) (entryName string, comment string, isDir bool) {
+	method := decodeLatin1CString(header.Method)
+	rawName := strings.ReplaceAll(decodeLatin1CString(header.Name), string(os.PathSeparator), "/")
+	rawName = strings.ReplaceAll(rawName, "\\", "/")
+	namePart, comment := splitLhaNameAndComment(rawName)
+	isDir = strings.EqualFold(method, "-lhd-") || strings.HasSuffix(namePart, "/")
+	entryName = normalizeLhaEntryName(namePart, isDir)
+	return entryName, comment, isDir
+}
+
+func isLhaJeromUnsupportedFeatureError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown method") ||
+		strings.Contains(msg, "unknown level header") ||
+		strings.Contains(msg, "unsupported") ||
+		strings.Contains(msg, "invalid header")
+}
+
+func isLhaJeromCrcError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "crc error")
 }
 
 func lhaHeaderEntryName(h *lhago.Header) string {
@@ -8900,6 +9578,101 @@ func lhaEntryPayload(data []byte, entry lhaEntry) ([]byte, error) {
 	return payload, nil
 }
 
+func decodeLhaEntryPayload(method string, payload []byte, originalSize uint32) ([]byte, error) {
+	size := int(originalSize)
+	switch strings.ToLower(method) {
+	case "-lh0-", "-lz4-":
+		if len(payload) < size {
+			return nil, errUnsupportedLhaFeature
+		}
+		return payload[:size], nil
+	case "-lh4-":
+		return decodeLhaStaticPayload(payload, size, 12, 4, 14)
+	case "-lh5-":
+		return decodeLhaStaticPayload(payload, size, 13, 4, 14)
+	case "-lh6-":
+		return decodeLhaStaticPayload(payload, size, 15, 5, 16)
+	case "-lh7-":
+		return decodeLhaStaticPayload(payload, size, 16, 5, 17)
+	case "-lh1-", "-lh2-", "-lh3-", "-lzs-", "-lz5-", "-pm0-", "-pm2-":
+		return decodeLhaPayloadJerom(method, payload, size)
+	default:
+		return nil, errUnsupportedLhaFeature
+	}
+}
+
+func decodeLhaStaticPayload(payload []byte, size int, dictBits uint, pBits int, pNum int) ([]byte, error) {
+	reader := bytes.NewReader(payload)
+	decoder := lhalzhuff.NewStaticDecoder(reader, pBits, pNum)
+	out := bytes.NewBuffer(make([]byte, 0, size))
+	decoded, _, err := lhalzhuff.Decode(decoder, out, dictBits, 253, size)
+	if err != nil {
+		return nil, errUnsupportedLhaFeature
+	}
+	if decoded != size || out.Len() != size {
+		return nil, errUnsupportedLhaFeature
+	}
+	return out.Bytes(), nil
+}
+
+func decodeLhaPayloadJerom(method string, payload []byte, size int) (decoded []byte, err error) {
+	methodNum, ok := lhaJeromMethodNumber(method)
+	if !ok {
+		return nil, errUnsupportedLhaFeature
+	}
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			decoded = nil
+			err = errUnsupportedLhaFeature
+		}
+	}()
+
+	in := bytes.NewReader(payload)
+	out := bytes.NewBuffer(make([]byte, 0, size))
+	lha := jlhago.NewLha("")
+	lha.ExtractBrokenArchive = true
+	var readSize int
+	if err := withSuppressedProcessOutput(func() error {
+		_ = lha.DecodeLzhuf(in, out, size, len(payload), "", methodNum, &readSize)
+		return nil
+	}); err != nil {
+		return nil, errUnsupportedLhaFeature
+	}
+	if readSize > len(payload) || out.Len() != size {
+		return nil, errUnsupportedLhaFeature
+	}
+	return out.Bytes(), nil
+}
+
+func lhaJeromMethodNumber(method string) (int, bool) {
+	switch strings.ToLower(method) {
+	case "-lh1-":
+		return jlhago.Lzhuff1MethodNum, true
+	case "-lh2-":
+		return jlhago.Lzhuff2MethodNum, true
+	case "-lh3-":
+		return jlhago.Lzhuff3MethodNum, true
+	case "-lh4-":
+		return jlhago.Lzhuff4MethodNum, true
+	case "-lh5-":
+		return jlhago.Lzhuff5MethodNum, true
+	case "-lh6-":
+		return jlhago.Lzhuff6MethodNum, true
+	case "-lh7-":
+		return jlhago.Lzhuff7MethodNum, true
+	case "-lzs-":
+		return jlhago.LarcMethodNum, true
+	case "-lz5-":
+		return jlhago.Larc5MethodNum, true
+	case "-pm0-":
+		return jlhago.Pmarc0MethodNum, true
+	case "-pm2-":
+		return jlhago.Pmarc2MethodNum, true
+	default:
+		return 0, false
+	}
+}
+
 func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 	entries := make([]lhaEntry, 0)
 	offset := 0
@@ -8912,35 +9685,132 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 			break
 		}
 
-		headerEnd := offset + 2 + headerSize
-		if headerEnd > len(data) {
-			return nil, fmt.Errorf("invalid lha header at offset %d", offset)
-		}
 		if offset+22 > len(data) {
 			return nil, fmt.Errorf("invalid lha header fields at offset %d", offset)
 		}
 
 		level := data[offset+20]
-		if level != 0 {
+		method := ""
+		originalSize := uint32(0)
+		attribute := byte(0)
+		namePart := ""
+		comment := ""
+		dirPrefix := ""
+		dataOffset := 0
+		compressedSize := uint32(0)
+
+		switch level {
+		case 0, 1:
+			headerEnd := offset + 2 + headerSize
+			if level == 1 {
+				// Level-1 header size includes checksum and fixed header bytes.
+				headerEnd = offset + headerSize
+			}
+			if headerEnd > len(data) {
+				return nil, fmt.Errorf("invalid lha header at offset %d", offset)
+			}
+			method = string(data[offset+2 : offset+7])
+			compressedSize = binary.LittleEndian.Uint32(data[offset+7 : offset+11])
+			originalSize = binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+			attribute = data[offset+19]
+			nameLen := int(data[offset+21])
+			nameStart := offset + 22
+			nameEnd := nameStart + nameLen
+			if nameEnd > headerEnd {
+				return nil, fmt.Errorf("invalid lha entry name length at offset %d", offset)
+			}
+			rawName := latin1Decode(data[nameStart:nameEnd])
+			namePart, comment = splitLhaNameAndComment(rawName)
+			dataOffset = headerEnd
+
+			if level == 1 {
+				if headerEnd+2 > len(data) {
+					return nil, fmt.Errorf("invalid lha level-1 extension header size at offset %d", offset)
+				}
+				nextExtSize := int(binary.LittleEndian.Uint16(data[headerEnd : headerEnd+2]))
+				extCursor, totalExtendedSize, extName, extComment, extDir, err := parseLhaExtendedHeaders(data, headerEnd+2, nextExtSize, 2)
+				if err != nil {
+					return nil, err
+				}
+				if extName != "" {
+					namePart = extName
+				}
+				if extComment != "" {
+					comment = extComment
+				}
+				dirPrefix = extDir
+				if compressedSize < uint32(totalExtendedSize) {
+					return nil, fmt.Errorf("invalid lha level-1 packed size at offset %d", offset)
+				}
+				compressedSize -= uint32(totalExtendedSize)
+				dataOffset = extCursor
+			}
+		case 2:
+			if offset+26 > len(data) {
+				return nil, fmt.Errorf("invalid lha level-2 header at offset %d", offset)
+			}
+			headerEnd := offset + int(binary.LittleEndian.Uint16(data[offset:offset+2]))
+			if headerEnd < offset+26 || headerEnd > len(data) {
+				return nil, fmt.Errorf("invalid lha level-2 header size at offset %d", offset)
+			}
+			method = string(data[offset+2 : offset+7])
+			compressedSize = binary.LittleEndian.Uint32(data[offset+7 : offset+11])
+			originalSize = binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+			attribute = data[offset+19]
+			nextExtSize := int(binary.LittleEndian.Uint16(data[offset+24 : offset+26]))
+			extCursor, _, extName, extComment, extDir, err := parseLhaExtendedHeaders(data, offset+26, nextExtSize, 2)
+			if err != nil {
+				return nil, err
+			}
+			namePart = extName
+			comment = extComment
+			dirPrefix = extDir
+			if extCursor > headerEnd {
+				return nil, fmt.Errorf("invalid lha level-2 header extension size at offset %d", offset)
+			}
+			dataOffset = headerEnd
+		case 3:
+			if offset+32 > len(data) {
+				return nil, fmt.Errorf("invalid lha level-3 header at offset %d", offset)
+			}
+			headerEnd := offset + int(binary.LittleEndian.Uint32(data[offset+24:offset+28]))
+			if headerEnd < offset+32 || headerEnd > len(data) {
+				return nil, fmt.Errorf("invalid lha level-3 header size at offset %d", offset)
+			}
+			method = string(data[offset+2 : offset+7])
+			compressedSize = binary.LittleEndian.Uint32(data[offset+7 : offset+11])
+			originalSize = binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+			attribute = data[offset+19]
+			nextExtSize := int(binary.LittleEndian.Uint32(data[offset+28 : offset+32]))
+			extCursor, _, extName, extComment, extDir, err := parseLhaExtendedHeaders(data, offset+32, nextExtSize, 4)
+			if err != nil {
+				return nil, err
+			}
+			namePart = extName
+			comment = extComment
+			dirPrefix = extDir
+			if extCursor > headerEnd {
+				return nil, fmt.Errorf("invalid lha level-3 header extension size at offset %d", offset)
+			}
+			dataOffset = headerEnd
+		default:
 			return nil, errUnsupportedLhaFeature
 		}
 
-		method := string(data[offset+2 : offset+7])
-		compressedSize := binary.LittleEndian.Uint32(data[offset+7 : offset+11])
-		originalSize := binary.LittleEndian.Uint32(data[offset+11 : offset+15])
-		attribute := data[offset+19]
-		nameLen := int(data[offset+21])
-		nameStart := offset + 22
-		nameEnd := nameStart + nameLen
-		if nameEnd > headerEnd {
-			return nil, fmt.Errorf("invalid lha entry name length at offset %d", offset)
+		if dirPrefix != "" {
+			baseName := strings.TrimLeft(strings.ReplaceAll(namePart, "\\", "/"), "/")
+			prefix := strings.TrimRight(strings.TrimLeft(dirPrefix, "/"), "/")
+			if prefix != "" {
+				if baseName != "" {
+					namePart = prefix + "/" + baseName
+				} else {
+					namePart = prefix + "/"
+				}
+			}
 		}
 
-		rawName := latin1Decode(data[nameStart:nameEnd])
-		namePart, comment := splitLhaNameAndComment(rawName)
-		isDir := strings.HasSuffix(namePart, "\\") || strings.HasSuffix(namePart, "/")
+		isDir := strings.HasSuffix(namePart, "\\") || strings.HasSuffix(namePart, "/") || strings.EqualFold(method, "-lhd-")
 		name := normalizeLhaEntryName(namePart, isDir)
-		dataOffset := headerEnd
 		nextOffset := dataOffset + int(compressedSize)
 		if nextOffset > len(data) {
 			return nil, fmt.Errorf("invalid lha entry data size at offset %d", offset)
@@ -8960,6 +9830,55 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 		offset = nextOffset
 	}
 	return entries, nil
+}
+
+func parseLhaExtendedHeaders(data []byte, cursor int, nextSize int, nextSizeBytes int) (endCursor int, totalSize int, namePart string, comment string, dirPrefix string, err error) {
+	namePart = ""
+	comment = ""
+	dirPrefix = ""
+	for nextSize > 0 {
+		minSize := 1 + nextSizeBytes
+		if nextSize < minSize {
+			return 0, 0, "", "", "", fmt.Errorf("invalid lha extension header at offset %d", cursor)
+		}
+		extEnd := cursor + nextSize
+		if extEnd > len(data) {
+			return 0, 0, "", "", "", fmt.Errorf("invalid lha extension header size at offset %d", cursor)
+		}
+		extType := data[cursor]
+		extPayload := data[cursor+1 : extEnd-nextSizeBytes]
+		switch extType {
+		case 0x01:
+			extName, extComment := splitLhaNameAndComment(latin1Decode(extPayload))
+			if extName != "" {
+				namePart = extName
+			}
+			if extComment != "" {
+				comment = extComment
+			}
+		case 0x02:
+			dirBytes := append([]byte(nil), extPayload...)
+			for i, b := range dirBytes {
+				if b == 0xff || b == '\\' {
+					dirBytes[i] = '/'
+				}
+			}
+			dirPrefix = strings.Trim(latin1Decode(dirBytes), "\x00")
+		case 0x3f:
+			extComment := strings.TrimRight(latin1Decode(extPayload), "\x00")
+			if extComment != "" {
+				comment = extComment
+			}
+		}
+		totalSize += nextSize
+		if nextSizeBytes == 2 {
+			nextSize = int(binary.LittleEndian.Uint16(data[extEnd-2 : extEnd]))
+		} else {
+			nextSize = int(binary.LittleEndian.Uint32(data[extEnd-4 : extEnd]))
+		}
+		cursor = extEnd
+	}
+	return cursor, totalSize, namePart, comment, dirPrefix, nil
 }
 
 func extractZip(archivePath, innerPath, destination string) error {

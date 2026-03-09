@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"os/exec"
@@ -554,6 +555,555 @@ func TestFsExtractLhaCompressedNative(t *testing.T) {
 	}
 }
 
+func TestDecodeLhaEntryPayloadStoredMethod(t *testing.T) {
+	payload := []byte("abc")
+	decoded, err := decodeLhaEntryPayload("-lh0-", payload, uint32(len(payload)))
+	if err != nil {
+		t.Fatalf("decode stored payload failed: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatalf("unexpected decoded payload: %q", decoded)
+	}
+}
+
+func TestDecodeLhaEntryPayloadCompressedFixture(t *testing.T) {
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "amiga.lha")
+	data, err := os.ReadFile(lhaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseLhaEntries(data)
+	if err != nil {
+		t.Fatalf("parseLhaEntries failed: %v", err)
+	}
+	var compressed *lhaEntry
+	for i := range entries {
+		if strings.EqualFold(entries[i].Name, "test1/test2.info") {
+			compressed = &entries[i]
+			break
+		}
+	}
+	if compressed == nil {
+		t.Fatalf("expected compressed entry test1/test2.info in parsed entries, got: %+v", entries)
+	}
+	payload, err := lhaEntryPayload(data, *compressed)
+	if err != nil {
+		t.Fatalf("lhaEntryPayload failed: %v", err)
+	}
+	decoded, err := decodeLhaEntryPayload(compressed.Method, payload, compressed.OriginalSize)
+	if err != nil {
+		t.Fatalf("decodeLhaEntryPayload compressed entry failed: %v", err)
+	}
+	if len(decoded) != int(compressed.OriginalSize) {
+		t.Fatalf("expected decoded size %d, got %d", compressed.OriginalSize, len(decoded))
+	}
+}
+
+func TestDecodeLhaPayloadJeromSupportsKnownMethodMappings(t *testing.T) {
+	cases := []string{"-lh1-", "-lh2-", "-lh3-", "-lh4-", "-lh5-", "-lh6-", "-lh7-", "-lzs-", "-lz5-", "-pm0-", "-pm2-"}
+	for _, method := range cases {
+		if _, ok := lhaJeromMethodNumber(method); !ok {
+			t.Fatalf("expected method mapping for %s", method)
+		}
+	}
+	if _, ok := lhaJeromMethodNumber("-unknown-"); ok {
+		t.Fatal("did not expect mapping for unknown method")
+	}
+}
+
+func TestDecodeLhaPayloadJeromFixtureLh5(t *testing.T) {
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "amiga.lha")
+	data, err := os.ReadFile(lhaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseLhaEntries(data)
+	if err != nil {
+		t.Fatalf("parseLhaEntries failed: %v", err)
+	}
+	var compressed *lhaEntry
+	for i := range entries {
+		if strings.EqualFold(entries[i].Method, "-lh5-") && strings.EqualFold(entries[i].Name, "test1/test2.info") {
+			compressed = &entries[i]
+			break
+		}
+	}
+	if compressed == nil {
+		t.Fatal("expected -lh5- fixture entry")
+	}
+	payload, err := lhaEntryPayload(data, *compressed)
+	if err != nil {
+		t.Fatalf("lhaEntryPayload failed: %v", err)
+	}
+	decoded, err := decodeLhaPayloadJerom(compressed.Method, payload, int(compressed.OriginalSize))
+	if err != nil {
+		t.Fatalf("decodeLhaPayloadJerom failed: %v", err)
+	}
+	if len(decoded) != int(compressed.OriginalSize) {
+		t.Fatalf("expected decoded size %d, got %d", compressed.OriginalSize, len(decoded))
+	}
+}
+
+func TestExtractLhaStoredOnlySupportsCompressedFixture(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "amiga.lha")
+	dest := filepath.Join(tmp, "out")
+	if err := extractLhaArchiveStoredOnly(lhaPath, "TEST1/TEST2.INFO", dest); err != nil {
+		t.Fatalf("extractLhaArchiveStoredOnly compressed fixture failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dest, "test2.info"))
+	if err != nil {
+		t.Fatalf("expected extracted file test2.info: %v", err)
+	}
+	if info.Size() != 900 {
+		t.Fatalf("expected test2.info size 900, got %d", info.Size())
+	}
+}
+
+func TestParseLhaEntriesSupportsLevel1Stored(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv1.lha")
+	content := []byte("abc")
+	if err := writeLhaLevel1StoredFixture(lhaPath, "dir1/file1.txt", content); err != nil {
+		t.Fatalf("failed to create level-1 lha fixture: %v", err)
+	}
+	data, err := os.ReadFile(lhaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseLhaEntries(data)
+	if err != nil {
+		t.Fatalf("parseLhaEntries level-1 failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one level-1 entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if !strings.EqualFold(entry.Name, "dir1/file1.txt") {
+		t.Fatalf("unexpected level-1 entry name: %q", entry.Name)
+	}
+	if entry.CompressedSize != uint32(len(content)) || entry.OriginalSize != uint32(len(content)) {
+		t.Fatalf("unexpected level-1 sizes: compressed=%d original=%d", entry.CompressedSize, entry.OriginalSize)
+	}
+}
+
+func TestExtractLhaStoredOnlySupportsLevel1Stored(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv1.lha")
+	want := []byte("content-level1")
+	if err := writeLhaLevel1StoredFixture(lhaPath, "dir1/file1.txt", want); err != nil {
+		t.Fatalf("failed to create level-1 lha fixture: %v", err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	if err := extractLhaArchiveStoredOnly(lhaPath, "DIR1/FILE1.TXT", dest); err != nil {
+		t.Fatalf("extractLhaArchiveStoredOnly level-1 failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "file1.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted level-1 file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected extracted level-1 content: %q", got)
+	}
+}
+
+func TestParseLhaEntriesSupportsLevel2Stored(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv2.lha")
+	content := []byte("lv2")
+	if err := writeLhaLevel2StoredFixture(lhaPath, "dir2/file2.txt", content); err != nil {
+		t.Fatalf("failed to create level-2 lha fixture: %v", err)
+	}
+	data, err := os.ReadFile(lhaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseLhaEntries(data)
+	if err != nil {
+		t.Fatalf("parseLhaEntries level-2 failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one level-2 entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if !strings.EqualFold(entry.Name, "dir2/file2.txt") {
+		t.Fatalf("unexpected level-2 entry name: %q", entry.Name)
+	}
+	if entry.CompressedSize != uint32(len(content)) || entry.OriginalSize != uint32(len(content)) {
+		t.Fatalf("unexpected level-2 sizes: compressed=%d original=%d", entry.CompressedSize, entry.OriginalSize)
+	}
+}
+
+func TestExtractLhaStoredOnlySupportsLevel2Stored(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv2.lha")
+	want := []byte("content-level2")
+	if err := writeLhaLevel2StoredFixture(lhaPath, "dir2/file2.txt", want); err != nil {
+		t.Fatalf("failed to create level-2 lha fixture: %v", err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	if err := extractLhaArchiveStoredOnly(lhaPath, "DIR2/FILE2.TXT", dest); err != nil {
+		t.Fatalf("extractLhaArchiveStoredOnly level-2 failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "file2.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted level-2 file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected extracted level-2 content: %q", got)
+	}
+}
+
+func TestParseLhaEntriesSupportsLevel3Stored(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv3.lha")
+	content := []byte("lv3")
+	if err := writeLhaLevel3StoredFixture(lhaPath, "dir3/file3.txt", content); err != nil {
+		t.Fatalf("failed to create level-3 lha fixture: %v", err)
+	}
+	data, err := os.ReadFile(lhaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseLhaEntries(data)
+	if err != nil {
+		t.Fatalf("parseLhaEntries level-3 failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one level-3 entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if !strings.EqualFold(entry.Name, "dir3/file3.txt") {
+		t.Fatalf("unexpected level-3 entry name: %q", entry.Name)
+	}
+	if entry.CompressedSize != uint32(len(content)) || entry.OriginalSize != uint32(len(content)) {
+		t.Fatalf("unexpected level-3 sizes: compressed=%d original=%d", entry.CompressedSize, entry.OriginalSize)
+	}
+}
+
+func TestExtractLhaStoredOnlySupportsLevel3Stored(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv3.lha")
+	want := []byte("content-level3")
+	if err := writeLhaLevel3StoredFixture(lhaPath, "dir3/file3.txt", want); err != nil {
+		t.Fatalf("failed to create level-3 lha fixture: %v", err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	if err := extractLhaArchiveStoredOnly(lhaPath, "DIR3/FILE3.TXT", dest); err != nil {
+		t.Fatalf("extractLhaArchiveStoredOnly level-3 failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "file3.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted level-3 file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected extracted level-3 content: %q", got)
+	}
+}
+
+func TestParseLhaEntriesSupportsLevel2DirAndCommentExtensions(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv2-ext.lha")
+	content := []byte("lv2-ext")
+	if err := writeLhaLevel2StoredFixtureWithDirAndComment(lhaPath, "dirA/dirB", "file.txt", "hello-comment", content); err != nil {
+		t.Fatalf("failed to create level-2 extension fixture: %v", err)
+	}
+	data, err := os.ReadFile(lhaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseLhaEntries(data)
+	if err != nil {
+		t.Fatalf("parseLhaEntries level-2 extension failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one level-2 extension entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if !strings.EqualFold(entry.Name, "dirA/dirB/file.txt") {
+		t.Fatalf("unexpected level-2 extension entry name: %q", entry.Name)
+	}
+	if entry.Comment != "hello-comment" {
+		t.Fatalf("unexpected level-2 extension comment: %q", entry.Comment)
+	}
+}
+
+func TestExtractLhaStoredOnlySupportsLevel3DirExtension(t *testing.T) {
+	tmp := t.TempDir()
+	lhaPath := filepath.Join(tmp, "lv3-ext.lha")
+	want := []byte("lv3-ext")
+	if err := writeLhaLevel3StoredFixtureWithDir(lhaPath, "dirX/dirY", "file.bin", want); err != nil {
+		t.Fatalf("failed to create level-3 extension fixture: %v", err)
+	}
+	dest := filepath.Join(tmp, "out")
+	if err := extractLhaArchiveStoredOnly(lhaPath, "DIRX/DIRY/FILE.BIN", dest); err != nil {
+		t.Fatalf("extract level-3 extension failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "file.bin"))
+	if err != nil {
+		t.Fatalf("expected extracted level-3 extension file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected extracted level-3 extension content: %q", got)
+	}
+}
+
+func TestLhaJeromFallbackListAndExtract(t *testing.T) {
+	lhaPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lha", "dirs-files.lha")
+
+	entries, err := listLhaArchiveEntriesJerom(lhaPath)
+	if err != nil {
+		t.Fatalf("jerom list fallback failed: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected non-empty lha entries from jerom fallback")
+	}
+	found := false
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name, "dir1/file1.txt") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected entry dir1/file1.txt in jerom fallback list, got: %+v", entries)
+	}
+}
+
+func writeLhaLevel1StoredFixture(path string, entryName string, content []byte) error {
+	nameBytes := latin1Bytes(strings.ReplaceAll(entryName, "/", "\\"))
+	if len(nameBytes) > 255 {
+		return fmt.Errorf("entry name too long for level-1 fixture")
+	}
+
+	var b bytes.Buffer
+	headerSize := 25 + len(nameBytes)
+	b.WriteByte(byte(headerSize))
+	b.WriteByte(0) // checksum is ignored by parser fallback and mirrors permissive legacy behavior
+	b.WriteString("-lh0-")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0)) // DOS timestamp
+	b.WriteByte(0x20)
+	b.WriteByte(1) // level-1
+	b.WriteByte(byte(len(nameBytes)))
+	b.Write(nameBytes)
+	_ = binary.Write(&b, binary.LittleEndian, crc16IBM(content))
+	b.WriteByte('U') // Unix OSID
+	_ = binary.Write(&b, binary.LittleEndian, uint16(0))
+	b.Write(content)
+	b.WriteByte(0)
+	return os.WriteFile(path, b.Bytes(), 0o644)
+}
+
+func writeLhaLevel2StoredFixture(path string, entryName string, content []byte) error {
+	nameBytes := latin1Bytes(strings.ReplaceAll(entryName, "/", "\\"))
+	extSize := 1 + len(nameBytes) + 2
+	headerSize := 26 + extSize
+
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.LittleEndian, uint16(headerSize))
+	b.WriteString("-lh0-")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	b.WriteByte(0x20)
+	b.WriteByte(2) // level-2
+	_ = binary.Write(&b, binary.LittleEndian, crc16IBM(content))
+	b.WriteByte('U')
+	_ = binary.Write(&b, binary.LittleEndian, uint16(extSize))
+	b.WriteByte(0x01) // filename extension header
+	b.Write(nameBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint16(0))
+	b.Write(content)
+	b.WriteByte(0)
+	return os.WriteFile(path, b.Bytes(), 0o644)
+}
+
+func writeLhaLevel2StoredFixtureWithDirAndComment(path string, dir string, base string, comment string, content []byte) error {
+	nameBytes := latin1Bytes(base)
+	dirBytes := latin1Bytes(strings.ReplaceAll(dir, "/", "\\"))
+	commentBytes := latin1Bytes(comment)
+
+	ext1Size := 1 + len(nameBytes) + 2
+	ext2Size := 1 + len(dirBytes) + 2
+	ext3Size := 1 + len(commentBytes) + 2
+	headerSize := 26 + ext1Size + ext2Size + ext3Size
+
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.LittleEndian, uint16(headerSize))
+	b.WriteString("-lh0-")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	b.WriteByte(0x20)
+	b.WriteByte(2)
+	_ = binary.Write(&b, binary.LittleEndian, crc16IBM(content))
+	b.WriteByte('U')
+	_ = binary.Write(&b, binary.LittleEndian, uint16(ext1Size))
+
+	b.WriteByte(0x01)
+	b.Write(nameBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint16(ext2Size))
+
+	b.WriteByte(0x02)
+	b.Write(dirBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint16(ext3Size))
+
+	b.WriteByte(0x3f)
+	b.Write(commentBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint16(0))
+
+	b.Write(content)
+	b.WriteByte(0)
+	return os.WriteFile(path, b.Bytes(), 0o644)
+}
+
+func writeLhaLevel3StoredFixture(path string, entryName string, content []byte) error {
+	nameBytes := latin1Bytes(strings.ReplaceAll(entryName, "/", "\\"))
+	extSize := 1 + len(nameBytes) + 4
+	headerSize := 32 + extSize
+
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.LittleEndian, uint16(4)) // size-field length
+	b.WriteString("-lh0-")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	b.WriteByte(0x20)
+	b.WriteByte(3) // level-3
+	_ = binary.Write(&b, binary.LittleEndian, crc16IBM(content))
+	b.WriteByte('U')
+	_ = binary.Write(&b, binary.LittleEndian, uint32(headerSize))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(extSize))
+	b.WriteByte(0x01) // filename extension header
+	b.Write(nameBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	b.Write(content)
+	b.WriteByte(0)
+	return os.WriteFile(path, b.Bytes(), 0o644)
+}
+
+func writeLhaLevel3StoredFixtureWithDir(path string, dir string, base string, content []byte) error {
+	nameBytes := latin1Bytes(base)
+	dirBytes := latin1Bytes(strings.ReplaceAll(dir, "/", "\\"))
+	ext1Size := 1 + len(nameBytes) + 4
+	ext2Size := 1 + len(dirBytes) + 4
+	headerSize := 32 + ext1Size + ext2Size
+
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.LittleEndian, uint16(4))
+	b.WriteString("-lh0-")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(len(content)))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	b.WriteByte(0x20)
+	b.WriteByte(3)
+	_ = binary.Write(&b, binary.LittleEndian, crc16IBM(content))
+	b.WriteByte('U')
+	_ = binary.Write(&b, binary.LittleEndian, uint32(headerSize))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(ext1Size))
+
+	b.WriteByte(0x01)
+	b.Write(nameBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint32(ext2Size))
+
+	b.WriteByte(0x02)
+	b.Write(dirBytes)
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+
+	b.Write(content)
+	b.WriteByte(0)
+	return os.WriteFile(path, b.Bytes(), 0o644)
+}
+
+func crc16IBM(data []byte) uint16 {
+	var crc uint16
+	for _, by := range data {
+		crc ^= uint16(by)
+		for i := 0; i < 8; i++ {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ 0xA001
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc
+}
+
+type testLzxEntry struct {
+	Name       string
+	Data       []byte
+	PackedData []byte
+	Flags      byte
+	IsDir      bool
+	Comment    string
+	PackMode   byte
+}
+
+func writeTestLzxArchive(path string, entries []testLzxEntry) error {
+	var b bytes.Buffer
+	info := make([]byte, lzxInfoHeaderSize)
+	copy(info, []byte("LZX"))
+	b.Write(info)
+
+	for _, entry := range entries {
+		name := entry.Name
+		if entry.IsDir && !strings.HasSuffix(name, "/") {
+			name += "/"
+		}
+		nameBytes := []byte(name)
+		if len(nameBytes) > 255 {
+			return fmt.Errorf("lzx test entry name too long: %q", entry.Name)
+		}
+		commentBytes := []byte(entry.Comment)
+		if len(commentBytes) > 255 {
+			return fmt.Errorf("lzx test entry comment too long for %q", entry.Name)
+		}
+
+		unpackedSize := len(entry.Data)
+		if entry.IsDir {
+			unpackedSize = 0
+		}
+		packedSize := len(entry.PackedData)
+		if entry.IsDir {
+			packedSize = 0
+		}
+
+		packMode := entry.PackMode
+		if packMode == 0 {
+			packMode = lzxPackModeStore
+		}
+
+		header := make([]byte, lzxArchiveHeaderSize)
+		header[0] = 0x0f
+		binary.LittleEndian.PutUint32(header[2:6], uint32(unpackedSize))
+		binary.LittleEndian.PutUint32(header[6:10], uint32(packedSize))
+		header[11] = packMode
+		header[12] = entry.Flags
+		header[14] = byte(len(commentBytes))
+		header[30] = byte(len(nameBytes))
+
+		headerHashInput := append([]byte(nil), header...)
+		sum := crc32.ChecksumIEEE(headerHashInput)
+		sum = crc32.Update(sum, crc32.IEEETable, nameBytes)
+		sum = crc32.Update(sum, crc32.IEEETable, commentBytes)
+		binary.LittleEndian.PutUint32(header[26:30], sum)
+
+		b.Write(header)
+		b.Write(nameBytes)
+		b.Write(commentBytes)
+		if packedSize > 0 {
+			b.Write(entry.PackedData)
+		}
+	}
+	return os.WriteFile(path, b.Bytes(), 0o644)
+}
+
 func TestArchiveListLzxStoredWorksWithoutBsdtar(t *testing.T) {
 	t.Setenv("PATH", "")
 	lzxPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "Lzx", "dirs-files.lzx")
@@ -629,6 +1179,82 @@ func TestFsExtractLzxCompressedWorksWithoutBsdtar(t *testing.T) {
 	}
 }
 
+func TestExtractLzxMergedGroupSupportsAnchorFirstStored(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	lzxPath := filepath.Join(tmp, "merged-anchor-first.lzx")
+	file1 := []byte("first")
+	file2 := []byte("second")
+	merged := append(append([]byte{}, file1...), file2...)
+	if err := writeTestLzxArchive(lzxPath, []testLzxEntry{
+		{
+			Name:       "a.bin",
+			Data:       file1,
+			PackedData: merged,
+			Flags:      lzxMergedFlag,
+		},
+		{
+			Name:  "b.bin",
+			Data:  file2,
+			Flags: lzxMergedFlag,
+		},
+	}); err != nil {
+		t.Fatalf("failed to write synthetic lzx archive: %v", err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", lzxPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract synthetic merged lzx failed: %v", err)
+	}
+
+	gotA, err := os.ReadFile(filepath.Join(dest, "a.bin"))
+	if err != nil {
+		t.Fatalf("expected extracted file a.bin: %v", err)
+	}
+	if !bytes.Equal(gotA, file1) {
+		t.Fatalf("unexpected extracted a.bin content: %q", gotA)
+	}
+	gotB, err := os.ReadFile(filepath.Join(dest, "b.bin"))
+	if err != nil {
+		t.Fatalf("expected extracted file b.bin: %v", err)
+	}
+	if !bytes.Equal(gotB, file2) {
+		t.Fatalf("unexpected extracted b.bin content: %q", gotB)
+	}
+}
+
+func TestExtractLzxStoredAllowsTrailingZeroPadding(t *testing.T) {
+	t.Setenv("PATH", "")
+	tmp := t.TempDir()
+	lzxPath := filepath.Join(tmp, "stored-trailing-padding.lzx")
+	content := []byte("hello")
+	padded := append(append([]byte{}, content...), 0, 0, 0, 0)
+	if err := writeTestLzxArchive(lzxPath, []testLzxEntry{
+		{
+			Name:       "file.txt",
+			Data:       content,
+			PackedData: padded,
+		},
+	}); err != nil {
+		t.Fatalf("failed to write synthetic padded lzx archive: %v", err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", lzxPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract synthetic padded lzx failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "file.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file.txt: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("unexpected extracted content: %q", got)
+	}
+}
+
 func TestArchiveListRarWorksWithoutBsdtar(t *testing.T) {
 	t.Setenv("PATH", "")
 	rarPath := filepath.Join("..", "Hst.Imager.Core.Tests", "TestData", "compressed-images", "1gb.img.rar")
@@ -639,6 +1265,46 @@ func TestArchiveListRarWorksWithoutBsdtar(t *testing.T) {
 	got := strings.TrimSpace(out.String())
 	if got == "" || !strings.Contains(strings.ToLower(got), "1gb") {
 		t.Fatalf("unexpected rar list output: %q", got)
+	}
+}
+
+func TestResolveRarPrimaryVolumePathUsesRarForOldStyleVolume(t *testing.T) {
+	tmp := t.TempDir()
+	rarPath := filepath.Join(tmp, "archive.rar")
+	r00Path := filepath.Join(tmp, "archive.r00")
+	if err := os.WriteFile(rarPath, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r00Path, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveRarPrimaryVolumePath(r00Path)
+	if got != rarPath {
+		t.Fatalf("expected %q, got %q", rarPath, got)
+	}
+}
+
+func TestResolveRarPrimaryVolumePathUsesPart1ForPartVolumes(t *testing.T) {
+	tmp := t.TempDir()
+	part1 := filepath.Join(tmp, "archive.part1.rar")
+	part2 := filepath.Join(tmp, "archive.part2.rar")
+	if err := os.WriteFile(part1, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(part2, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveRarPrimaryVolumePath(part2)
+	if got != part1 {
+		t.Fatalf("expected %q, got %q", part1, got)
+	}
+}
+
+func TestRarPasswordFromEnvPrefersImagerVar(t *testing.T) {
+	t.Setenv("HST_IMAGER_RAR_PASSWORD", "pw-a")
+	t.Setenv("HST_RAR_PASSWORD", "pw-b")
+	if got := rarPasswordFromEnv(); got != "pw-a" {
+		t.Fatalf("expected HST_IMAGER_RAR_PASSWORD value, got %q", got)
 	}
 }
 
@@ -975,6 +1641,83 @@ func TestBlankInfoTransferCompareFlow(t *testing.T) {
 	}
 }
 
+func TestTransferSupportsStartOffsetsAndVerify(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"transfer", src, dst, "--size", "4", "--src-start", "2", "--dest-start", "5", "--verify"}, &out); err != nil {
+		t.Fatalf("transfer with offsets and verify failed: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(make([]byte, 5), []byte("2345")...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected transfer output bytes: got=%v want=%v", got, want)
+	}
+}
+
+func TestReadWriteStartAlias(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	outFile := filepath.Join(tmp, "out.bin")
+	if err := os.WriteFile(src, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("xxxxxxxxxx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"write", src, dst, "--size", "3", "--start", "4"}, &out); err != nil {
+		t.Fatalf("write with --start failed: %v", err)
+	}
+	gotDst, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDst := []byte("xxxx012xxx")
+	if !bytes.Equal(gotDst, wantDst) {
+		t.Fatalf("unexpected destination content after write --start: got=%q want=%q", gotDst, wantDst)
+	}
+
+	out.Reset()
+	if err := run([]string{"read", dst, outFile, "--size", "3", "--start", "4"}, &out); err != nil {
+		t.Fatalf("read with --start failed: %v", err)
+	}
+	gotOut, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotOut, []byte("012")) {
+		t.Fatalf("unexpected output after read --start: %q", gotOut)
+	}
+}
+
+func TestCompareSupportsOffsets(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("ABCDzz"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("xxABCDyy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"compare", src, dst, "--size", "4", "--source-start", "0", "--destination-start", "2"}, &out); err != nil {
+		t.Fatalf("compare with offsets failed: %v", err)
+	}
+}
+
 func TestAdvancedCommandFamilies(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
@@ -1072,7 +1815,7 @@ func TestFsBlockOptimizeAndAdfCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if err := run([]string{"optimize", image}, &out); err != nil {
+	if err := run([]string{"optimize", image, "--size", "4"}, &out); err != nil {
 		t.Fatalf("optimize failed: %v", err)
 	}
 	info, err := os.Stat(image)
@@ -1115,6 +1858,85 @@ func TestFsBlockOptimizeAndAdfCommands(t *testing.T) {
 	}
 	if adfInfo.Size() != 901120 {
 		t.Fatalf("unexpected adf size: %d", adfInfo.Size())
+	}
+}
+
+func TestOptimizeWithoutPartitionTableFails(t *testing.T) {
+	tmp := t.TempDir()
+	image := filepath.Join(tmp, "plain.bin")
+	if err := os.WriteFile(image, append([]byte("abcd"), make([]byte, 128)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := run([]string{"optimize", image}, &out)
+	if err == nil {
+		t.Fatal("expected optimize to fail when no partition table is present")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "no partition table") {
+		t.Fatalf("unexpected optimize error: %v", err)
+	}
+}
+
+func TestOptimizeAutoUsesMbrSize(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "disk.img")
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "16MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatalf("mbr initialize failed: %v", err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "fat32", "2MB"}, &out); err != nil {
+		t.Fatalf("mbr part add failed: %v", err)
+	}
+
+	parts, err := readMbrPartitions(media)
+	if err != nil {
+		t.Fatalf("read mbr partitions failed: %v", err)
+	}
+	want := estimateMbrOptimizeSize(parts)
+	if want <= 0 {
+		t.Fatalf("expected positive mbr optimize target, got %d", want)
+	}
+
+	out.Reset()
+	if err := run([]string{"optimize", media}, &out); err != nil {
+		t.Fatalf("optimize failed: %v", err)
+	}
+	info, err := os.Stat(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != want {
+		t.Fatalf("expected optimize size %d, got %d", want, info.Size())
+	}
+}
+
+func TestOptimizePartitionTableOptionRdb(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "rdb.img")
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "16MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"rdb", "initialize", media}, &out); err != nil {
+		t.Fatalf("rdb initialize failed: %v", err)
+	}
+	if err := run([]string{"rdb", "resize", media, "3MB"}, &out); err != nil {
+		t.Fatalf("rdb resize failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"optimize", media, "--partition-table", "rdb"}, &out); err != nil {
+		t.Fatalf("optimize rdb failed: %v", err)
+	}
+	info, err := os.Stat(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 3*1024*1024 {
+		t.Fatalf("expected optimize size %d, got %d", 3*1024*1024, info.Size())
 	}
 }
 
