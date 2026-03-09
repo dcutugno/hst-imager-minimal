@@ -45,6 +45,11 @@ cd /Users/davide/Downloads/Git-Sources/hst-imager-minimal/src/hst-imager-go
 ./scripts/verify-go-legacy-parity.sh
 ```
 
+Strict byte-level parity pack (deep fixtures + strict hash + zero skips):
+```bash
+./scripts/verify-go-byte-parity-pack.sh
+```
+
 Notes:
 - Set `HST_IMAGER_LEGACY_BIN` to override legacy binary location.
 - Set `HST_PARITY_HEAVY=1` to include heavy large-image write parity cases.

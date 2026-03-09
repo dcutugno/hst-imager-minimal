@@ -9,6 +9,7 @@ LEGACY_BIN="${HST_IMAGER_LEGACY_BIN:-}"
 HEAVY="${HST_PARITY_HEAVY:-0}"
 DEEP_FS="${HST_PARITY_DEEP_FS:-0}"
 RUN_ERROR_MATRIX="${HST_PARITY_ERROR_MATRIX:-1}"
+REQUIRE_NO_SKIP="${HST_PARITY_REQUIRE_NO_SKIP:-0}"
 
 if [[ -z "$LEGACY_BIN" ]]; then
   if [[ -x /tmp/hst-imager-legacy/Hst.Imager.ConsoleApp ]]; then
@@ -972,6 +973,12 @@ run_fuzz_workflow_cases
 
 echo "Summary: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 if [[ "$FAIL" -ne 0 ]]; then
+  echo "Detailed artifacts left in: $TMP_DIR"
+  trap - EXIT
+  exit 1
+fi
+if [[ "$REQUIRE_NO_SKIP" == "1" && "$SKIP" -ne 0 ]]; then
+  echo "FAIL: expected zero skipped parity cases but got SKIP=$SKIP"
   echo "Detailed artifacts left in: $TMP_DIR"
   trap - EXIT
   exit 1

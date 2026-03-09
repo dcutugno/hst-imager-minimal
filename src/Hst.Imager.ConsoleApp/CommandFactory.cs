@@ -48,6 +48,7 @@ namespace Hst.Imager.ConsoleApp
             rootCommand.AddCommand(RdbCommandFactory.CreateRdbCommand());
             rootCommand.AddCommand(FsCommandFactory.CreateFsCommand());
             rootCommand.AddCommand(AdfCommandFactory.CreateAdfCommand());
+            rootCommand.AddCommand(ArchiveCommandFactory.CreateArchiveCommand());
             rootCommand.AddCommand(SettingsCommandFactory.CreateSettingsCommand());
 
             return rootCommand;

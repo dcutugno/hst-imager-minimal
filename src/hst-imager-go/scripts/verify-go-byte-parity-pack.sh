@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+HST_PARITY_DEEP_FS="${HST_PARITY_DEEP_FS:-1}" \
+HST_PARITY_HEAVY="${HST_PARITY_HEAVY:-1}" \
+HST_PARITY_FUZZ_ROUNDS="${HST_PARITY_FUZZ_ROUNDS:-4}" \
+HST_PARITY_FUZZ_STRICT_HASH="${HST_PARITY_FUZZ_STRICT_HASH:-1}" \
+HST_PARITY_REQUIRE_NO_SKIP="${HST_PARITY_REQUIRE_NO_SKIP:-1}" \
+./scripts/verify-go-legacy-parity.sh
