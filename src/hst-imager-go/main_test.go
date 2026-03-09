@@ -258,6 +258,83 @@ func TestCommandNormalizationDoesNotRewriteArguments(t *testing.T) {
 	}
 }
 
+func TestFsCopyAcceptsLegacyOptionFlags(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "-r", "-sa", "--quiet", "-md", "--force", "false", "-uae", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs copy with legacy option flags failed: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+	if string(b) != "aaa" {
+		t.Fatalf("unexpected copied content: %q", b)
+	}
+}
+
+func TestFsExtractAndDirAcceptLegacyOptionFlags(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "sample.zip")
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	w, err := zw.Create("sub/b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("bbb")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", zipPath, dest, "-r", "-sa", "-q", "-md", "-f", "-uae", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs extract with legacy option flags failed: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dest, "sub", "b.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file: %v", err)
+	}
+	if string(b) != "bbb" {
+		t.Fatalf("unexpected extracted content: %q", b)
+	}
+
+	out.Reset()
+	if err := run([]string{"fs", "dir", dest, "-r", "-uae", "none"}, &out); err != nil {
+		t.Fatalf("fs dir with short flags failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "sub/b.txt") {
+		t.Fatalf("expected recursive fs dir output to contain sub/b.txt, got: %q", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"fs", "dir", dest, "-r", "false", "-uae", "none"}, &out); err != nil {
+		t.Fatalf("fs dir with -r false failed: %v", err)
+	}
+	if strings.Contains(out.String(), "sub/b.txt") {
+		t.Fatalf("did not expect recursive entries when -r false, got: %q", out.String())
+	}
+}
+
 func TestFsExtractTarGzNative(t *testing.T) {
 	tmp := t.TempDir()
 	tarGzPath := filepath.Join(tmp, "sample.tar.gz")

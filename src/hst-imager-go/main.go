@@ -675,7 +675,7 @@ func parseWindowsDiskSize(raw json.RawMessage) (uint64, error) {
 
 func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
-		return errors.New("usage: fs dir <path> [--recursive] [--uaemetadata <none|uaefsdb|uaemetafile>]")
+		return errors.New("usage: fs dir <path> [--recursive|-r [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
 	}
 	path := args[0]
 	fsOpts, err := parseFsOptions(args[1:])
@@ -2998,7 +2998,7 @@ func parseBlockViewInvocation(args []string) (path string, offset int64, size in
 
 func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: fs copy <source> <destination> [--recursive] [--uaemetadata <none|uaefsdb|uaemetafile>]")
+		return errors.New("usage: fs copy <source> <destination> [--recursive|-r [bool]] [--skip-attributes|-sa [bool]] [--quiet|-q [bool]] [--makedir|-md [bool]] [--force|-f [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
 	}
 	fsOpts, err := parseFsOptions(args[2:])
 	if err != nil {
@@ -3029,7 +3029,7 @@ func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
 
 func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: fs extract <source> <destination> [--recursive] [--uaemetadata <none|uaefsdb|uaemetafile>]")
+		return errors.New("usage: fs extract <source> <destination> [--recursive|-r [bool]] [--skip-attributes|-sa [bool]] [--quiet|-q [bool]] [--makedir|-md [bool]] [--force|-f [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
 	}
 	fsOpts, err := parseFsOptions(args[2:])
 	if err != nil {
@@ -6536,8 +6536,12 @@ func copyPath(source, destination string, recursive bool) (int, error) {
 }
 
 type fsPathOptions struct {
-	recursive   bool
-	uaeMetadata string
+	recursive      bool
+	skipAttributes bool
+	quiet          bool
+	makeDir        bool
+	force          bool
+	uaeMetadata    string
 }
 
 type sourceUaeEntryInfo struct {
@@ -6567,13 +6571,50 @@ const (
 
 func parseFsOptions(args []string) (fsPathOptions, error) {
 	opts := fsPathOptions{
-		recursive:   false,
-		uaeMetadata: "uaefsdb",
+		recursive:      false,
+		skipAttributes: false,
+		quiet:          false,
+		makeDir:        false,
+		force:          false,
+		uaeMetadata:    "uaefsdb",
 	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--recursive":
-			opts.recursive = true
+		case "--recursive", "-r":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--recursive")
+			if err != nil {
+				return opts, err
+			}
+			opts.recursive = value
+			i += consumed
+		case "--skip-attributes", "-sa":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--skip-attributes")
+			if err != nil {
+				return opts, err
+			}
+			opts.skipAttributes = value
+			i += consumed
+		case "--quiet", "-q":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--quiet")
+			if err != nil {
+				return opts, err
+			}
+			opts.quiet = value
+			i += consumed
+		case "--makedir", "-md":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--makedir")
+			if err != nil {
+				return opts, err
+			}
+			opts.makeDir = value
+			i += consumed
+		case "--force", "-f":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
+			if err != nil {
+				return opts, err
+			}
+			opts.force = value
+			i += consumed
 		case "--uaemetadata", "-uae":
 			if i+1 >= len(args) {
 				return opts, errors.New("missing value for --uaemetadata")
