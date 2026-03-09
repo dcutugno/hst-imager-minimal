@@ -158,10 +158,14 @@ jobs:
           export GOCACHE="${RUNNER_TEMP}/go-build-cache"
           mkdir -p "${GOCACHE}"
           cd src/hst-imager-go
-          FUZZ_ROUNDS=6
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            FUZZ_ROUNDS=2
+            HST_IMAGER_LEGACY_BIN="${HST_IMAGER_LEGACY_BIN}" \
+            HST_PARITY_DEEP_FS=1 \
+            HST_PARITY_FUZZ_ROUNDS=2 \
+            ./scripts/verify-go-legacy-parity.sh
+          else
+            FUZZ_ROUNDS=6
+            HST_IMAGER_LEGACY_BIN="${HST_IMAGER_LEGACY_BIN}" \
+            HST_PARITY_FUZZ_ROUNDS="${FUZZ_ROUNDS}" \
+            ./scripts/verify-go-byte-parity-pack.sh
           fi
-          HST_IMAGER_LEGACY_BIN="${HST_IMAGER_LEGACY_BIN}" \
-          HST_PARITY_FUZZ_ROUNDS="${FUZZ_ROUNDS}" \
-          ./scripts/verify-go-byte-parity-pack.sh
