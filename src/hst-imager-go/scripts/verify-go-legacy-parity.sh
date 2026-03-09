@@ -80,6 +80,13 @@ file_size_bytes() {
   wc -c <"$1" | tr -d '[:space:]'
 }
 
+is_windows_shell() {
+  case "$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
+    *mingw*|*msys*|*cygwin*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 normalize_text() {
   local in_file="$1"
   local out_file="$2"
@@ -947,11 +954,23 @@ compare_extract_case "extract-lzx-amiga" "$LZX_AMIGA"
 compare_extract_case "extract-lzw-text" "$LZW_SMALL"
 if [[ "$DEEP_FS" == "1" ]]; then
   compare_extract_case "extract-lha-dirs" "$LHA_DIRS"
-  compare_extract_case "extract-lha-special" "$LHA_SPECIAL"
+  if is_windows_shell; then
+    skip_case "extract-lha-special" "special-character fixture is not portable on Windows filesystem"
+  else
+    compare_extract_case "extract-lha-special" "$LHA_SPECIAL"
+  fi
   compare_extract_case "extract-lzx-dirs" "$LZX_DIRS"
-  compare_extract_case "extract-lzx-special" "$LZX_SPECIAL"
+  if is_windows_shell; then
+    skip_case "extract-lzx-special" "special-character fixture is not portable on Windows filesystem"
+  else
+    compare_extract_case "extract-lzx-special" "$LZX_SPECIAL"
+  fi
   compare_extract_case "extract-zip-dirs" "$ZIP_DIRS"
-  compare_extract_case "extract-zip-special" "$ZIP_SPECIAL"
+  if is_windows_shell; then
+    skip_case "extract-zip-special" "special-character fixture is not portable on Windows filesystem"
+  else
+    compare_extract_case "extract-zip-special" "$ZIP_SPECIAL"
+  fi
 fi
 
 echo "Running write parity checks"
