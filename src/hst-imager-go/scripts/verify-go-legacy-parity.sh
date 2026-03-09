@@ -64,7 +64,15 @@ hash_file() {
     openssl dgst -sha256 "$path" | awk '{print $NF}'
     return
   fi
-  echo "ERROR: no SHA-256 tool available (shasum, sha256sum, or openssl required)" >&2
+  if command -v powershell >/dev/null 2>&1; then
+    FILE_TO_HASH="$path" powershell -NoProfile -Command '$h=(Get-FileHash -Algorithm SHA256 -LiteralPath $env:FILE_TO_HASH).Hash; $h.ToLower()'
+    return
+  fi
+  if command -v pwsh >/dev/null 2>&1; then
+    FILE_TO_HASH="$path" pwsh -NoProfile -Command '$h=(Get-FileHash -Algorithm SHA256 -LiteralPath $env:FILE_TO_HASH).Hash; $h.ToLower()'
+    return
+  fi
+  echo "ERROR: no SHA-256 tool available (shasum, sha256sum, openssl, or powershell required)" >&2
   exit 1
 }
 
