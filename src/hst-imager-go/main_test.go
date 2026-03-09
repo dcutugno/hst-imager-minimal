@@ -1718,6 +1718,42 @@ func TestCompareSupportsOffsets(t *testing.T) {
 	}
 }
 
+func TestTransferAcceptsLegacyNoopFlags(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run([]string{"transfer", src, dst, "--retries", "2", "--force", "--skip-unused-sectors", "false"}, &out); err != nil {
+		t.Fatalf("transfer with legacy noop flags failed: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("abcdefgh")) {
+		t.Fatalf("unexpected transfer output: %q", got)
+	}
+}
+
+func TestCompareAcceptsLegacyNoopFlags(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dst := filepath.Join(tmp, "dst.bin")
+	if err := os.WriteFile(src, []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run([]string{"compare", src, dst, "--retries", "3", "--force", "true", "--skip-unused-sectors"}, &out); err != nil {
+		t.Fatalf("compare with legacy noop flags failed: %v", err)
+	}
+}
+
 func TestAdvancedCommandFamilies(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
@@ -1937,6 +1973,102 @@ func TestOptimizePartitionTableOptionRdb(t *testing.T) {
 	}
 	if info.Size() != 3*1024*1024 {
 		t.Fatalf("expected optimize size %d, got %d", 3*1024*1024, info.Size())
+	}
+}
+
+func TestFormatRootMbrWorkflow(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "mbr-format.img")
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "16MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"format", media, "mbr", "ntfs", "--size", "2MB"}, &out); err != nil {
+		t.Fatalf("format mbr failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "mbr", "info", media}, &out); err != nil {
+		t.Fatalf("mbr info failed: %v", err)
+	}
+	var result struct {
+		Parts []Part `json:"parts"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal mbr info failed: %v", err)
+	}
+	if len(result.Parts) != 1 {
+		t.Fatalf("expected one mbr partition, got %d", len(result.Parts))
+	}
+	if result.Parts[0].Size != 2*1024*1024 {
+		t.Fatalf("expected mbr partition size %d, got %d", 2*1024*1024, result.Parts[0].Size)
+	}
+}
+
+func TestFormatRootGptWorkflow(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "gpt-format.img")
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "16MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"format", media, "gpt", "ntfs", "--size", "2MB"}, &out); err != nil {
+		t.Fatalf("format gpt failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "gpt", "info", media}, &out); err != nil {
+		t.Fatalf("gpt info failed: %v", err)
+	}
+	var result struct {
+		Parts []Part `json:"parts"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal gpt info failed: %v", err)
+	}
+	if len(result.Parts) != 1 {
+		t.Fatalf("expected one gpt partition, got %d", len(result.Parts))
+	}
+	if result.Parts[0].Size != 2*1024*1024 {
+		t.Fatalf("expected gpt partition size %d, got %d", 2*1024*1024, result.Parts[0].Size)
+	}
+}
+
+func TestFormatRootRdbWorkflow(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "rdb-format.img")
+	fsBin := filepath.Join(tmp, "pfs3aio")
+	var out bytes.Buffer
+	if err := os.WriteFile(fsBin, []byte("filesystem-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"blank", media, "16MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"format", media, "rdb", "pds3", "--size", "4MB", "--max-partition-size", "2MB", "--file-system-path", fsBin}, &out); err != nil {
+		t.Fatalf("format rdb failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "rdb", "info", media}, &out); err != nil {
+		t.Fatalf("rdb info failed: %v", err)
+	}
+	var result struct {
+		RdbSize     int64           `json:"rdbSize"`
+		Partitions  []Part          `json:"partitions"`
+		Filesystems []RdbFileSystem `json:"filesystems"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal rdb info failed: %v", err)
+	}
+	if result.RdbSize != 4*1024*1024 {
+		t.Fatalf("expected rdb size %d, got %d", 4*1024*1024, result.RdbSize)
+	}
+	if len(result.Partitions) == 0 {
+		t.Fatal("expected at least one rdb partition")
+	}
+	if len(result.Filesystems) == 0 {
+		t.Fatal("expected at least one rdb filesystem")
 	}
 }
 

@@ -1557,7 +1557,7 @@ func tryReadRdb(path string) (rdbState, bool) {
 
 func handleTransfer(args []string, stdout io.Writer, command string, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>|-s <bytes>] [--src-start <offset>|-ss <offset>] [--dest-start <offset>|-ds <offset>] [--start <offset>] [--verify|-v]", command)
+		return fmt.Errorf("usage: %s <source> <destination> [--size <bytes>|-s <bytes>] [--src-start <offset>|-ss <offset>] [--dest-start <offset>|-ds <offset>] [--start <offset>] [--verify|-v] [--retries <n>] [--force [bool]] [--skip-unused-sectors [bool]]", command)
 	}
 	source := args[0]
 	destination := args[1]
@@ -1589,12 +1589,15 @@ func handleTransfer(args []string, stdout io.Writer, command string, opts Global
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{
-			"source":      source,
-			"destination": destination,
-			"bytes":       written,
-			"srcStart":    transferOpts.srcStart,
-			"destStart":   transferOpts.dstStart,
-			"verify":      transferOpts.verify,
+			"source":            source,
+			"destination":       destination,
+			"bytes":             written,
+			"srcStart":          transferOpts.srcStart,
+			"destStart":         transferOpts.dstStart,
+			"verify":            transferOpts.verify,
+			"retries":           transferOpts.retries,
+			"force":             transferOpts.force,
+			"skipUnusedSectors": transferOpts.skipUnusedSectors,
 		})
 	}
 	fmt.Fprintf(stdout, "Transferred %d bytes from '%s' to '%s'.\n", written, source, destination)
@@ -1603,7 +1606,7 @@ func handleTransfer(args []string, stdout io.Writer, command string, opts Global
 
 func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: compare <source> <destination> [--size <bytes>|-s <bytes>] [--source-start <offset>] [--destination-start <offset>]")
+		return errors.New("usage: compare <source> <destination> [--size <bytes>|-s <bytes>] [--source-start <offset>] [--destination-start <offset>] [--retries <n>] [--force [bool]] [--skip-unused-sectors [bool]]")
 	}
 	source := args[0]
 	destination := args[1]
@@ -1624,10 +1627,13 @@ func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{
-			"equal":            true,
-			"bytesChecked":     checked,
-			"sourceStart":      compareOpts.srcStart,
-			"destinationStart": compareOpts.dstStart,
+			"equal":             true,
+			"bytesChecked":      checked,
+			"sourceStart":       compareOpts.srcStart,
+			"destinationStart":  compareOpts.dstStart,
+			"retries":           compareOpts.retries,
+			"force":             compareOpts.force,
+			"skipUnusedSectors": compareOpts.skipUnusedSectors,
 		})
 	}
 	fmt.Fprintf(stdout, "Compare successful: %d bytes are identical.\n", checked)
@@ -1635,11 +1641,14 @@ func handleCompare(args []string, stdout io.Writer, opts GlobalOptions) error {
 }
 
 type transferOptions struct {
-	size     int64
-	hasSize  bool
-	srcStart int64
-	dstStart int64
-	verify   bool
+	size              int64
+	hasSize           bool
+	srcStart          int64
+	dstStart          int64
+	verify            bool
+	retries           int
+	force             bool
+	skipUnusedSectors bool
 }
 
 func parseTransferOptions(args []string, command string) (transferOptions, error) {
@@ -1696,6 +1705,30 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 			i++
 		case "--verify", "-v":
 			opts.verify = true
+		case "--retries":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --retries")
+			}
+			retries, err := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if err != nil || retries < 0 {
+				return opts, fmt.Errorf("invalid value for --retries: %s", args[i+1])
+			}
+			opts.retries = retries
+			i++
+		case "--force":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
+			if err != nil {
+				return opts, err
+			}
+			opts.force = value
+			i += consumed
+		case "--skip-unused-sectors":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--skip-unused-sectors")
+			if err != nil {
+				return opts, err
+			}
+			opts.skipUnusedSectors = value
+			i += consumed
 		default:
 			return opts, fmt.Errorf("unsupported argument: %s", args[i])
 		}
@@ -1704,10 +1737,13 @@ func parseTransferOptions(args []string, command string) (transferOptions, error
 }
 
 type compareOptions struct {
-	size     int64
-	hasSize  bool
-	srcStart int64
-	dstStart int64
+	size              int64
+	hasSize           bool
+	srcStart          int64
+	dstStart          int64
+	retries           int
+	force             bool
+	skipUnusedSectors bool
 }
 
 func parseCompareOptions(args []string) (compareOptions, error) {
@@ -1745,6 +1781,30 @@ func parseCompareOptions(args []string) (compareOptions, error) {
 			}
 			opts.dstStart = offset
 			i++
+		case "--retries":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --retries")
+			}
+			retries, err := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if err != nil || retries < 0 {
+				return opts, fmt.Errorf("invalid value for --retries: %s", args[i+1])
+			}
+			opts.retries = retries
+			i++
+		case "--force":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
+			if err != nil {
+				return opts, err
+			}
+			opts.force = value
+			i += consumed
+		case "--skip-unused-sectors":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--skip-unused-sectors")
+			if err != nil {
+				return opts, err
+			}
+			opts.skipUnusedSectors = value
+			i += consumed
 		default:
 			return opts, fmt.Errorf("unsupported argument: %s", args[i])
 		}
@@ -1761,6 +1821,17 @@ func parseNonNegativeOffset(value string, name string) (int64, error) {
 		return 0, fmt.Errorf("invalid value for %s: %s", name, value)
 	}
 	return offset, nil
+}
+
+func parseOptionalBoolFlag(args []string, index int, name string) (bool, int, error) {
+	if index+1 < len(args) && !strings.HasPrefix(args[index+1], "-") {
+		value, err := parseBoolArg(args[index+1])
+		if err != nil {
+			return false, 0, fmt.Errorf("invalid value for %s: %s", name, args[index+1])
+		}
+		return value, 1, nil
+	}
+	return true, 0, nil
 }
 
 func writeJSON(stdout io.Writer, value any) error {
@@ -2377,43 +2448,217 @@ func trimTrailingZeros(path string) (int64, error) {
 
 func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
-		return errors.New("usage: format <path> <mbr|gpt|rdb|adf>")
+		return errors.New("usage: format <path> <mbr|gpt|rdb|pistorm|adf> <filesystem> [--size <size>|-s <size>] [--file-system-path <path>] [--max-partition-size <size>] [--use-experimental] [--kickstart31]")
 	}
 	path := args[0]
-	formatType := strings.ToLower(args[1])
-	var err error
-	switch formatType {
-	case "mbr":
-		if err := initializeMbr(path); err != nil {
-			return err
-		}
-	case "gpt":
-		if err := initializeGpt(path); err != nil {
-			return err
-		}
-	case "rdb":
-		if err := initializeRdb(args[0]); err != nil {
-			return err
-		}
-	case "adf":
+	formatType := strings.ToLower(strings.TrimSpace(args[1]))
+
+	if formatType == "adf" {
 		size := int64(901120)
 		if len(args) > 2 {
-			size, err = parseSize(args[2])
+			parsed, err := parseSize(args[2])
 			if err != nil {
 				return err
 			}
+			size = parsed
 		}
 		if err := createBlankFile(path, size); err != nil {
+			return err
+		}
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{"path": path, "type": formatType, "filesystem": "adf", "size": size, "status": "formatted"})
+		}
+		fmt.Fprintf(stdout, "Formatted '%s' with %s.\n", path, formatType)
+		return nil
+	}
+
+	if len(args) < 3 {
+		return errors.New("usage: format <path> <mbr|gpt|rdb|pistorm> <filesystem> [--size <size>|-s <size>] [--file-system-path <path>] [--max-partition-size <size>] [--use-experimental] [--kickstart31]")
+	}
+	fileSystem := strings.TrimSpace(args[2])
+	formatOpts, err := parseFormatCommandOptions(args[3:])
+	if err != nil {
+		return err
+	}
+
+	switch formatType {
+	case "mbr":
+		if err := runMbrFormatWorkflow(path, fileSystem, formatOpts); err != nil {
+			return err
+		}
+	case "gpt":
+		if err := runGptFormatWorkflow(path, fileSystem, formatOpts); err != nil {
+			return err
+		}
+	case "rdb":
+		if err := runRdbFormatWorkflow(path, fileSystem, formatOpts); err != nil {
+			return err
+		}
+	case "pistorm":
+		// Keep pure-Go behavior deterministic: run RDB workflow for now, while PiStorm-specific multi-table
+		// orchestration is still implemented through dedicated partition commands.
+		if err := runRdbFormatWorkflow(path, fileSystem, formatOpts); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("unsupported format type: %s", formatType)
 	}
+
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": path, "type": formatType, "status": "formatted"})
+		result := map[string]any{
+			"path":       path,
+			"type":       formatType,
+			"filesystem": fileSystem,
+			"status":     "formatted",
+		}
+		if formatOpts.hasSize {
+			result["size"] = formatOpts.size
+		}
+		if formatOpts.fileSystemPath != "" {
+			result["fileSystemPath"] = formatOpts.fileSystemPath
+		}
+		return writeJSON(stdout, result)
 	}
-	fmt.Fprintf(stdout, "Formatted '%s' with %s.\n", path, formatType)
+	fmt.Fprintf(stdout, "Formatted '%s' with %s/%s.\n", path, formatType, strings.ToUpper(fileSystem))
 	return nil
+}
+
+type formatCommandOptions struct {
+	fileSystemPath      string
+	size                int64
+	hasSize             bool
+	maxPartitionSize    int64
+	hasMaxPartitionSize bool
+	useExperimental     bool
+	kickstart31         bool
+}
+
+func parseFormatCommandOptions(args []string) (formatCommandOptions, error) {
+	opts := formatCommandOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--file-system-path":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --file-system-path")
+			}
+			opts.fileSystemPath = strings.TrimSpace(args[i+1])
+			i++
+		case "--size", "-s":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --size")
+			}
+			size, err := parseSize(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.size = size
+			opts.hasSize = true
+			i++
+		case "--max-partition-size":
+			if i+1 >= len(args) {
+				return opts, errors.New("missing value for --max-partition-size")
+			}
+			size, err := parseSize(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.maxPartitionSize = size
+			opts.hasMaxPartitionSize = true
+			i++
+		case "--use-experimental":
+			opts.useExperimental = true
+		case "--kickstart31":
+			opts.kickstart31 = true
+		default:
+			return opts, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	return opts, nil
+}
+
+func runMbrFormatWorkflow(path, fileSystem string, opts formatCommandOptions) error {
+	fs := strings.ToLower(strings.TrimSpace(fileSystem))
+	switch fs {
+	case "fat32", "ntfs", "exfat":
+	default:
+		return fmt.Errorf("unsupported Master Boot Record file system '%s'", fileSystem)
+	}
+
+	if err := initializeMbr(path); err != nil {
+		return err
+	}
+	sizeValue := "*"
+	if opts.hasSize {
+		sizeValue = strconv.FormatInt(opts.size, 10)
+	}
+	if err := handleMbrPartAdd([]string{path, fs, sizeValue}, io.Discard, GlobalOptions{}); err != nil {
+		return err
+	}
+	label := strings.ToUpper(fs)
+	return handleMbrPartFormat([]string{path, "1", label}, io.Discard, GlobalOptions{})
+}
+
+func runGptFormatWorkflow(path, fileSystem string, opts formatCommandOptions) error {
+	fs := strings.ToLower(strings.TrimSpace(fileSystem))
+	switch fs {
+	case "fat32", "ntfs", "exfat":
+	default:
+		return fmt.Errorf("unsupported Guid Partition Table file system '%s'", fileSystem)
+	}
+
+	if err := initializeGpt(path); err != nil {
+		return err
+	}
+	sizeValue := "*"
+	if opts.hasSize {
+		sizeValue = strconv.FormatInt(opts.size, 10)
+	}
+	label := strings.ToUpper(fs)
+	if err := handleGptPartAdd([]string{path, fs, label, sizeValue}, io.Discard, GlobalOptions{}); err != nil {
+		return err
+	}
+	return handleGptPartFormat([]string{path, "1", fs, label}, io.Discard, GlobalOptions{})
+}
+
+func runRdbFormatWorkflow(path, fileSystem string, opts formatCommandOptions) error {
+	dosType := strings.ToUpper(strings.TrimSpace(fileSystem))
+	switch dosType {
+	case "DOS3", "DOS7", "PFS3", "PDS3":
+	default:
+		return fmt.Errorf("unsupported Rigid Disk Block file system '%s'", fileSystem)
+	}
+
+	if err := initializeRdb(path); err != nil {
+		return err
+	}
+	if opts.hasSize {
+		if err := handleRdbResize([]string{path, strconv.FormatInt(opts.size, 10)}, io.Discard, GlobalOptions{}); err != nil {
+			return err
+		}
+	}
+	if opts.fileSystemPath != "" {
+		if err := handleRdbFsAdd([]string{path, opts.fileSystemPath, dosType}, io.Discard, GlobalOptions{}); err != nil {
+			return err
+		}
+	}
+
+	partSize := int64(0)
+	if opts.hasSize {
+		partSize = opts.size
+	}
+	if opts.hasMaxPartitionSize && (partSize == 0 || opts.maxPartitionSize < partSize) {
+		partSize = opts.maxPartitionSize
+	}
+	partSizeValue := "*"
+	if partSize > 0 {
+		partSizeValue = strconv.FormatInt(partSize, 10)
+	}
+
+	partName := "Workbench"
+	if err := handleRdbPartAdd([]string{path, partName, dosType, partSizeValue}, io.Discard, GlobalOptions{}); err != nil {
+		return err
+	}
+	return handleRdbPartFormat([]string{path, "1", partName}, io.Discard, GlobalOptions{})
 }
 
 func handleBlockRead(args []string, stdout io.Writer, opts GlobalOptions) error {
