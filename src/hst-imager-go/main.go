@@ -1422,8 +1422,11 @@ func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {
 }
 
 func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 {
-		return errors.New("usage: info <path>")
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return errors.New("usage: info <path> [--unallocated|-u [bool]]")
+	}
+	if _, err := parseInfoOptions(args[1:]); err != nil {
+		return err
 	}
 	path := args[0]
 	region, isPartitionPath, err := resolvePartitionSelection(path)
@@ -1553,6 +1556,28 @@ func tryReadGpt(path string) (gptHeader, []gptPartitionEntry, bool) {
 func tryReadRdb(path string) (rdbState, bool) {
 	state, err := readRdbState(path)
 	return state, err == nil
+}
+
+type infoOptions struct {
+	showUnallocated bool
+}
+
+func parseInfoOptions(args []string) (infoOptions, error) {
+	opts := infoOptions{showUnallocated: true}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--unallocated", "-u":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--unallocated")
+			if err != nil {
+				return opts, err
+			}
+			opts.showUnallocated = value
+			i += consumed
+		default:
+			return opts, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	return opts, nil
 }
 
 func handleTransfer(args []string, stdout io.Writer, command string, opts GlobalOptions) error {
@@ -3134,8 +3159,11 @@ func handleAdfCreate(args []string, stdout io.Writer, opts GlobalOptions) error 
 }
 
 func handleMbrInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 {
-		return errors.New("usage: mbr info <media>")
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return errors.New("usage: mbr info <media> [--unallocated|-u [bool]]")
+	}
+	if _, err := parseInfoOptions(args[1:]); err != nil {
+		return err
 	}
 	parts, err := readMbrPartitions(args[0])
 	if err != nil {
@@ -3649,8 +3677,11 @@ func parseMbrPartitionType(value string) (byte, error) {
 }
 
 func handleGptInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 {
-		return errors.New("usage: gpt info <media>")
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return errors.New("usage: gpt info <media> [--unallocated|-u [bool]]")
+	}
+	if _, err := parseInfoOptions(args[1:]); err != nil {
+		return err
 	}
 	header, parts, err := readGpt(args[0])
 	if err != nil {
@@ -4177,8 +4208,11 @@ func encodeUTF16Name(value string, maxBytes int) []byte {
 }
 
 func handleRdbInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 {
-		return errors.New("usage: rdb info <media>")
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return errors.New("usage: rdb info <media> [--unallocated|-u [bool]]")
+	}
+	if _, err := parseInfoOptions(args[1:]); err != nil {
+		return err
 	}
 	state, err := readRdbState(args[0])
 	if err != nil {

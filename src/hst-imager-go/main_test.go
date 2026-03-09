@@ -1841,6 +1841,75 @@ func TestBlankInfoTransferCompareFlow(t *testing.T) {
 	}
 }
 
+func TestInfoCommandsAcceptUnallocatedOption(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "disk.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "8MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"info", media, "--unallocated", "false"}, &out); err != nil {
+		t.Fatalf("info with --unallocated false failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatalf("mbr initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"mbr", "info", media, "-u", "false"}, &out); err != nil {
+		t.Fatalf("mbr info with -u false failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"gpt", "initialize", media}, &out); err != nil {
+		t.Fatalf("gpt initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"gpt", "info", media, "--unallocated"}, &out); err != nil {
+		t.Fatalf("gpt info with --unallocated failed: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"rdb", "initialize", media}, &out); err != nil {
+		t.Fatalf("rdb initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"rdb", "info", media, "-u"}, &out); err != nil {
+		t.Fatalf("rdb info with -u failed: %v", err)
+	}
+}
+
+func TestInfoCommandsRejectUnsupportedArguments(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "disk.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "1MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+
+	cases := [][]string{
+		{"info", media, "--bogus"},
+		{"mbr", "info", media, "--bogus"},
+		{"gpt", "info", media, "--bogus"},
+		{"rdb", "info", media, "--bogus"},
+	}
+	for _, args := range cases {
+		out.Reset()
+		err := run(args, &out)
+		if err == nil {
+			t.Fatalf("expected unsupported argument error for args=%v", args)
+		}
+		if !strings.Contains(err.Error(), "unsupported argument") {
+			t.Fatalf("unexpected error for args=%v: %v", args, err)
+		}
+	}
+}
+
 func TestTransferSupportsStartOffsetsAndVerify(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.bin")
