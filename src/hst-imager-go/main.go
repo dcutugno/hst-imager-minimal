@@ -163,6 +163,7 @@ func main() {
 
 func run(args []string, stdout io.Writer) error {
 	root := BuildRootCommand()
+	args = normalizeOptionAssignments(args)
 
 	opts, commandArgs, err := parseGlobalArgs(args, stdout, root)
 	if err != nil {
@@ -2302,6 +2303,27 @@ func normalizeCommandTokenAlias(parent *Command, token string) string {
 		return "archive"
 	}
 	return token
+}
+
+func normalizeOptionAssignments(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "--"):
+			if idx := strings.Index(arg, "="); idx > 2 {
+				out = append(out, arg[:idx], arg[idx+1:])
+				continue
+			}
+		case strings.HasPrefix(arg, "-"):
+			// Supports short and multi-character aliases like -f=value and -uae=value.
+			if idx := strings.Index(arg, "="); idx > 1 {
+				out = append(out, arg[:idx], arg[idx+1:])
+				continue
+			}
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func handleOptimize(args []string, stdout io.Writer, opts GlobalOptions) error {

@@ -68,6 +68,21 @@ func TestRunListJsonOutputShortFormatFlag(t *testing.T) {
 	}
 }
 
+func TestRunListJsonOutputEqualsFormatFlag(t *testing.T) {
+	var out bytes.Buffer
+	err := run([]string{"--format=json", "list"}, &out)
+	if err != nil {
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "operation not permitted") || strings.Contains(lower, "permission denied") || strings.Contains(lower, "exit status") {
+			t.Skipf("list command unavailable in this environment: %v", err)
+		}
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !strings.Contains(out.String(), "\"drives\"") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
 func TestSettingsUpdateAndList(t *testing.T) {
 	configRoot := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configRoot)
@@ -332,6 +347,34 @@ func TestFsExtractAndDirAcceptLegacyOptionFlags(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "sub/b.txt") {
 		t.Fatalf("did not expect recursive entries when -r false, got: %q", out.String())
+	}
+}
+
+func TestFsOptionsAcceptEqualsSyntax(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive=true", "--uaemetadata=none"}, &out); err != nil {
+		t.Fatalf("fs copy with equals syntax failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "a.txt")); err != nil {
+		t.Fatalf("expected copied file from equals syntax options: %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"fs", "dir", dst, "-r=true", "-uae=none"}, &out); err != nil {
+		t.Fatalf("fs dir with equals syntax failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "a.txt") {
+		t.Fatalf("unexpected fs dir output: %q", out.String())
 	}
 }
 
@@ -1880,6 +1923,27 @@ func TestInfoCommandsAcceptUnallocatedOption(t *testing.T) {
 	out.Reset()
 	if err := run([]string{"rdb", "info", media, "-u"}, &out); err != nil {
 		t.Fatalf("rdb info with -u failed: %v", err)
+	}
+}
+
+func TestInfoCommandsAcceptUnallocatedEqualsSyntax(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "disk.img")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "2MB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatalf("mbr initialize failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"info", media, "--unallocated=false"}, &out); err != nil {
+		t.Fatalf("info with --unallocated=false failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"mbr", "info", media, "-u=false"}, &out); err != nil {
+		t.Fatalf("mbr info with -u=false failed: %v", err)
 	}
 }
 
