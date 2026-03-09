@@ -1267,20 +1267,52 @@ func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opt
 }
 
 func handleArchiveList(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 {
-		return errors.New("usage: archive list <path-to-archive>")
+	path, _, err := parseArchiveListArgs(args)
+	if err != nil {
+		return err
 	}
-	items, err := listArchiveEntries(args[0])
+	items, err := listArchiveEntries(path)
 	if err != nil {
 		return err
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"path": args[0], "entries": items})
+		return writeJSON(stdout, map[string]any{"path": path, "entries": items})
 	}
 	for _, i := range items {
 		fmt.Fprintf(stdout, "- %s (%d bytes)\n", i.Name, i.Size)
 	}
 	return nil
+}
+
+func parseArchiveListArgs(args []string) (path string, recursive bool, err error) {
+	const usage = "usage: archive list <path-to-archive> [--recursive|-r [bool]]"
+	if len(args) < 1 {
+		return "", false, errors.New(usage)
+	}
+	recursive = false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--recursive", "-r":
+			value, consumed, boolErr := parseOptionalBoolFlag(args, i, "--recursive")
+			if boolErr != nil {
+				return "", false, boolErr
+			}
+			recursive = value
+			i += consumed
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", false, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			if path != "" {
+				return "", false, errors.New(usage)
+			}
+			path = args[i]
+		}
+	}
+	if path == "" {
+		return "", false, errors.New(usage)
+	}
+	return path, recursive, nil
 }
 
 func handleScript(args []string, stdout io.Writer) error {
@@ -1379,31 +1411,47 @@ func handleSettingsList(args []string, stdout io.Writer, opts GlobalOptions) err
 }
 
 func handleSettingsUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 2 {
-		return errors.New("usage: settings update <key> <value>")
+	if len(args) < 1 {
+		return errors.New("usage: settings update <key> <value> OR settings update [--all-physical-drives [bool]] [--retries|-r <n>] [--force|-f [bool]] [--verify|-v [bool]] [--skip-unused-sectors [bool]] [--use-cache [bool]] [--cache-type <value>]")
 	}
 	s, err := readSettings()
 	if err != nil {
 		return err
 	}
-	key, value := args[0], args[1]
-	s[key] = value
+	updated := make(map[string]string)
+	// Backward-compatible key/value mode.
+	if len(args) >= 2 && !strings.HasPrefix(args[0], "-") {
+		key, value := args[0], args[1]
+		s[key] = value
+		updated[key] = value
+	} else {
+		updated, err = parseSettingsUpdateOptions(args)
+		if err != nil {
+			return err
+		}
+		for k, v := range updated {
+			s[k] = v
+		}
+	}
 	if err := writeSettings(s); err != nil {
 		return err
 	}
 	if opts.Format == "json" {
-		return writeJSON(stdout, map[string]any{"updated": key, "value": value})
+		return writeJSON(stdout, map[string]any{"updated": updated})
 	}
-	fmt.Fprintf(stdout, "Updated setting %s=%s\n", key, value)
+	keys := make([]string, 0, len(updated))
+	for k := range updated {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(stdout, "Updated setting %s=%s\n", k, updated[k])
+	}
 	return nil
 }
 
 func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 2 {
-		return errors.New("usage: blank <path> <size>")
-	}
-	path := args[0]
-	size, err := parseSize(args[1])
+	path, size, err := parseBlankArgs(args)
 	if err != nil {
 		return err
 	}
@@ -1420,6 +1468,107 @@ func handleBlank(args []string, stdout io.Writer, opts GlobalOptions) error {
 	}
 	fmt.Fprintf(stdout, "Created blank image '%s' (%d bytes).\n", path, size)
 	return nil
+}
+
+func parseBlankArgs(args []string) (path string, size int64, err error) {
+	const usage = "usage: blank <path> <size> [--compatible|-c [bool]]"
+	if len(args) < 2 {
+		return "", 0, errors.New(usage)
+	}
+	positionals := make([]string, 0, 2)
+	compatible := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--compatible", "-c":
+			value, consumed, boolErr := parseOptionalBoolFlag(args, i, "--compatible")
+			if boolErr != nil {
+				return "", 0, boolErr
+			}
+			compatible = value
+			i += consumed
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", 0, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 2 {
+		return "", 0, errors.New(usage)
+	}
+	parsedSize, parseErr := parseSize(positionals[1])
+	if parseErr != nil {
+		return "", 0, parseErr
+	}
+	if compatible {
+		parsedSize = (parsedSize * 95) / 100
+	}
+	return positionals[0], parsedSize, nil
+}
+
+func parseSettingsUpdateOptions(args []string) (map[string]string, error) {
+	updated := make(map[string]string)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--all-physical-drives":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--all-physical-drives")
+			if err != nil {
+				return nil, err
+			}
+			updated["all-physical-drives"] = strconv.FormatBool(value)
+			i += consumed
+		case "--retries", "-r":
+			if i+1 >= len(args) {
+				return nil, errors.New("missing value for --retries")
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("invalid value for --retries: %s", args[i+1])
+			}
+			updated["retries"] = strconv.Itoa(n)
+			i++
+		case "--verify", "-v":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--verify")
+			if err != nil {
+				return nil, err
+			}
+			updated["verify"] = strconv.FormatBool(value)
+			i += consumed
+		case "--force", "-f":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
+			if err != nil {
+				return nil, err
+			}
+			updated["force"] = strconv.FormatBool(value)
+			i += consumed
+		case "--skip-unused-sectors":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--skip-unused-sectors")
+			if err != nil {
+				return nil, err
+			}
+			updated["skip-unused-sectors"] = strconv.FormatBool(value)
+			i += consumed
+		case "--use-cache":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--use-cache")
+			if err != nil {
+				return nil, err
+			}
+			updated["use-cache"] = strconv.FormatBool(value)
+			i += consumed
+		case "--cache-type":
+			if i+1 >= len(args) {
+				return nil, errors.New("missing value for --cache-type")
+			}
+			updated["cache-type"] = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			return nil, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	if len(updated) == 0 {
+		return nil, errors.New("At least one option must be specified")
+	}
+	return updated, nil
 }
 
 func handleInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -3365,14 +3514,11 @@ func handleMbrPartDelete(args []string, stdout io.Writer, opts GlobalOptions) er
 }
 
 func handleMbrPartFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 3 {
-		return errors.New("usage: mbr part format <media> <index> <label>")
-	}
-	idx, err := strconv.Atoi(args[1])
+	mediaPath, idx, label, _, err := parseMbrPartFormatArgs(args)
 	if err != nil {
 		return err
 	}
-	parts, err := readMbrPartitions(args[0])
+	parts, err := readMbrPartitions(mediaPath)
 	if err != nil {
 		return err
 	}
@@ -3385,8 +3531,39 @@ func handleMbrPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 		return fmt.Errorf("partition has %d sectors and FAT32 requires a minimum of 65536 sectors", p.SectorCount)
 	}
 	part := mbrPartitionToPart(p)
-	part.Name = args[2]
+	part.Name = label
 	return printSimpleStatus(stdout, opts, "mbr partition format requested", part)
+}
+
+func parseMbrPartFormatArgs(args []string) (mediaPath string, index int, label string, fileSystem string, err error) {
+	const usage = "usage: mbr part format <media> <index> <label> [--file-system|-fs <type>]"
+	if len(args) < 3 {
+		return "", 0, "", "", errors.New(usage)
+	}
+	positionals := make([]string, 0, 3)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--file-system", "-fs":
+			if i+1 >= len(args) {
+				return "", 0, "", "", errors.New("missing value for --file-system")
+			}
+			fileSystem = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", 0, "", "", fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 3 {
+		return "", 0, "", "", errors.New(usage)
+	}
+	index, err = strconv.Atoi(positionals[1])
+	if err != nil {
+		return "", 0, "", "", err
+	}
+	return positionals[0], index, positionals[2], fileSystem, nil
 }
 
 func handleMbrPartExport(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -4388,24 +4565,63 @@ func handleRdbInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
 }
 
 func handleRdbInitialize(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 1 {
-		return errors.New("usage: rdb initialize <media>")
-	}
-	if err := initializeRdb(args[0]); err != nil {
-		return err
-	}
-	return printSimpleStatus(stdout, opts, "rdb initialized", args[0])
-}
-
-func handleRdbResize(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 2 {
-		return errors.New("usage: rdb resize <media> <size>")
-	}
-	size, err := parseSize(args[1])
+	mediaPath, sizeOpt, err := parseRdbInitializeArgs(args)
 	if err != nil {
 		return err
 	}
-	state, err := readRdbState(args[0])
+	if sizeOpt != nil {
+		if err := createBlankFile(mediaPath, *sizeOpt); err != nil {
+			return err
+		}
+	}
+	if err := initializeRdb(mediaPath); err != nil {
+		return err
+	}
+	return printSimpleStatus(stdout, opts, "rdb initialized", mediaPath)
+}
+
+func parseRdbInitializeArgs(args []string) (mediaPath string, sizeOpt *int64, err error) {
+	const usage = "usage: rdb initialize <media> [--size|-s <size>] [--name|-n <name>] [-chs <chs>] [--rdb-block-lo <n>]"
+	if len(args) < 1 {
+		return "", nil, errors.New(usage)
+	}
+	positionals := make([]string, 0, 1)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--size", "-s":
+			if i+1 >= len(args) {
+				return "", nil, errors.New("missing value for --size")
+			}
+			size, parseErr := parseSize(args[i+1])
+			if parseErr != nil {
+				return "", nil, parseErr
+			}
+			sizeOpt = &size
+			i++
+		case "--name", "-n", "-chs", "--rdb-block-lo":
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("missing value for %s", args[i])
+			}
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", nil, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 1 {
+		return "", nil, errors.New(usage)
+	}
+	return positionals[0], sizeOpt, nil
+}
+
+func handleRdbResize(args []string, stdout io.Writer, opts GlobalOptions) error {
+	mediaPath, size, err := parseRdbResizeArgs(args)
+	if err != nil {
+		return err
+	}
+	state, err := readRdbState(mediaPath)
 	if err != nil {
 		return err
 	}
@@ -4423,34 +4639,81 @@ func handleRdbResize(args []string, stdout io.Writer, opts GlobalOptions) error 
 		}
 	}
 	state.RdbSize = size
-	if err := writeRdbState(args[0], state); err != nil {
+	if err := writeRdbState(mediaPath, state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb resized", size)
 }
 
-func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 2 {
-		return errors.New("usage: rdb filesystem add <media> <path> [dostype]")
+func parseRdbResizeArgs(args []string) (mediaPath string, size int64, err error) {
+	const usage = "usage: rdb resize <media> <size> OR rdb resize <media> --size|-s <size>"
+	if len(args) < 1 {
+		return "", 0, errors.New(usage)
 	}
-	state, err := readRdbState(args[0])
+	positionals := make([]string, 0, 2)
+	var sizeSet bool
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--size", "-s":
+			if i+1 >= len(args) {
+				return "", 0, errors.New("missing value for --size")
+			}
+			parsed, parseErr := parseSize(args[i+1])
+			if parseErr != nil {
+				return "", 0, parseErr
+			}
+			size = parsed
+			sizeSet = true
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", 0, fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) < 1 {
+		return "", 0, errors.New(usage)
+	}
+	mediaPath = positionals[0]
+	if !sizeSet {
+		if len(positionals) < 2 {
+			return "", 0, errors.New(usage)
+		}
+		parsed, parseErr := parseSize(positionals[1])
+		if parseErr != nil {
+			return "", 0, parseErr
+		}
+		size = parsed
+	}
+	return mediaPath, size, nil
+}
+
+func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
+	mediaPath, fsPath, dosType, fsName, version, err := parseRdbFsAddArgs(args)
 	if err != nil {
 		return err
 	}
-	b, err := os.ReadFile(args[1])
+	state, err := readRdbState(mediaPath)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(fsPath)
 	if err != nil {
 		return err
 	}
 	fs := rdbFileSystem{
 		Index:    nextRdbFsIndex(state.Fs),
-		Name:     filepath.Base(args[1]),
+		Name:     filepath.Base(fsPath),
 		DataSize: int64(len(b)),
+		DosType:  dosType,
+		Version:  version,
 	}
-	if len(args) > 2 {
-		fs.DosType = args[2]
+	if fsName != "" {
+		fs.Name = fsName
 	}
 	if state.Native {
-		nativeFs, err := addNativeFileSystem(args[0], args[1], fs.DosType)
+		nativeFs, err := addNativeFileSystem(mediaPath, fsPath, fs.DosType)
 		if err != nil {
 			return err
 		}
@@ -4460,16 +4723,81 @@ func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if offset+int64(len(b)) > state.RdbSize {
 		return errors.New("rdb has insufficient space for filesystem binary, resize rdb first")
 	}
-	if err := writeBytesAt(args[0], offset, b); err != nil {
+	if err := writeBytesAt(mediaPath, offset, b); err != nil {
 		return err
 	}
 	fs.DataOffset = offset
 	state.Fs = append(state.Fs, fs)
 	state.FsDataEnd = offset + int64(len(b))
-	if err := writeRdbState(args[0], state); err != nil {
+	if err := writeRdbState(mediaPath, state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb filesystem added", map[string]any{"index": fs.Index, "name": fs.Name, "size": fs.DataSize})
+}
+
+func parseRdbFsAddArgs(args []string) (mediaPath, fsPath, dosType, fsName, version string, err error) {
+	const usage = "usage: rdb filesystem add <media> <path> [dostype] [--name|-n <name>] [--version|-v <n>] [--revision|-r <n>]"
+	if len(args) < 2 {
+		return "", "", "", "", "", errors.New(usage)
+	}
+	positionals := make([]string, 0, 3)
+	var major *int
+	var revision *int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--name", "-n":
+			if i+1 >= len(args) {
+				return "", "", "", "", "", errors.New("missing value for --name")
+			}
+			fsName = args[i+1]
+			i++
+		case "--version", "-v":
+			if i+1 >= len(args) {
+				return "", "", "", "", "", errors.New("missing value for --version")
+			}
+			n, convErr := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if convErr != nil || n < 0 {
+				return "", "", "", "", "", fmt.Errorf("invalid value for --version: %s", args[i+1])
+			}
+			major = &n
+			i++
+		case "--revision", "-r":
+			if i+1 >= len(args) {
+				return "", "", "", "", "", errors.New("missing value for --revision")
+			}
+			n, convErr := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if convErr != nil || n < 0 {
+				return "", "", "", "", "", fmt.Errorf("invalid value for --revision: %s", args[i+1])
+			}
+			revision = &n
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", "", "", "", "", fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) < 2 || len(positionals) > 3 {
+		return "", "", "", "", "", errors.New(usage)
+	}
+	mediaPath = positionals[0]
+	fsPath = positionals[1]
+	if len(positionals) == 3 {
+		dosType = positionals[2]
+	}
+	if major != nil || revision != nil {
+		m := 0
+		r := 0
+		if major != nil {
+			m = *major
+		}
+		if revision != nil {
+			r = *revision
+		}
+		version = fmt.Sprintf("%d.%d", m, r)
+	}
+	return mediaPath, fsPath, dosType, fsName, version, nil
 }
 
 func handleRdbFsDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -4656,26 +4984,71 @@ func handleRdbFsUpdate(args []string, stdout io.Writer, opts GlobalOptions) erro
 }
 
 func handleRdbPartAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 4 {
-		return errors.New("usage: rdb part add <media> <name> <type> <size|*>")
+	mediaPath, name, partType, sizeArg, status, err := parseRdbPartAddArgs(args)
+	if err != nil {
+		return err
 	}
-	state, err := readRdbState(args[0])
+	state, err := readRdbState(mediaPath)
 	if err != nil {
 		return err
 	}
 	normalizeRdbStateIndexes(&state)
-	size, err := resolveRdbPartSize(args[0], args[3], state)
+	size, err := resolveRdbPartSize(mediaPath, sizeArg, state)
 	if err != nil {
 		return err
 	}
-	part, err := appendRdbPart(&state, args[0], args[1], args[2], size, "active")
+	part, err := appendRdbPart(&state, mediaPath, name, partType, size, status)
 	if err != nil {
 		return err
 	}
-	if err := writeRdbState(args[0], state); err != nil {
+	if err := writeRdbState(mediaPath, state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb partition added", part)
+}
+
+func parseRdbPartAddArgs(args []string) (mediaPath, name, partType, sizeArg, status string, err error) {
+	const usage = "usage: rdb part add <media> <name> <type> <size|*> [--reserved|-r <n>] [--pre-alloc|-pa <n>] [--buffers|-bu <n>] [--max-transfer|-mt <n>] [--mask|-ma <n>] [--no-mount|-nm [bool]] [--bootable|-b [bool]] [--boot-priority|-bp <n>] [--block-size|-bs <size>] [--use-experimental [bool]]"
+	if len(args) < 4 {
+		return "", "", "", "", "", errors.New(usage)
+	}
+	positionals := make([]string, 0, 4)
+	status = "active"
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--reserved", "-r", "--pre-alloc", "-pa", "--buffers", "-bu", "--max-transfer", "-mt", "--mask", "-ma", "--boot-priority", "-bp", "--block-size", "-bs":
+			if i+1 >= len(args) {
+				return "", "", "", "", "", fmt.Errorf("missing value for %s", args[i])
+			}
+			i++
+		case "--no-mount", "-nm":
+			value, consumed, boolErr := parseOptionalBoolFlag(args, i, "--no-mount")
+			if boolErr != nil {
+				return "", "", "", "", "", boolErr
+			}
+			if value {
+				status = "inactive"
+			} else {
+				status = "active"
+			}
+			i += consumed
+		case "--bootable", "-b", "--use-experimental":
+			_, consumed, boolErr := parseOptionalBoolFlag(args, i, args[i])
+			if boolErr != nil {
+				return "", "", "", "", "", boolErr
+			}
+			i += consumed
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", "", "", "", "", fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 4 {
+		return "", "", "", "", "", errors.New(usage)
+	}
+	return positionals[0], positionals[1], positionals[2], positionals[3], status, nil
 }
 
 func handleRdbPartUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -5180,14 +5553,11 @@ func handleRdbPartMove(args []string, stdout io.Writer, opts GlobalOptions) erro
 }
 
 func handleRdbPartFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 3 {
-		return errors.New("usage: rdb part format <media> <index> <label>")
-	}
-	idx, err := strconv.Atoi(args[1])
+	mediaPath, idx, label, err := parseRdbPartFormatArgs(args)
 	if err != nil {
 		return err
 	}
-	state, err := readRdbState(args[0])
+	state, err := readRdbState(mediaPath)
 	if err != nil {
 		return err
 	}
@@ -5195,18 +5565,108 @@ func handleRdbPartFormat(args []string, stdout io.Writer, opts GlobalOptions) er
 	if idx < 1 || idx > len(state.Parts) {
 		return fmt.Errorf("invalid partition number '%d'", idx)
 	}
-	state.Parts[idx-1].Name = args[2]
-	if err := writeRdbState(args[0], state); err != nil {
+	state.Parts[idx-1].Name = label
+	if err := writeRdbState(mediaPath, state); err != nil {
 		return err
 	}
 	return printSimpleStatus(stdout, opts, "rdb partition formatted", idx)
 }
 
 func handleRdbUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 2 {
-		return errors.New("usage: rdb update <media> <size>")
+	mediaPath, legacySize, updateValues, err := parseRdbUpdateArgs(args)
+	if err != nil {
+		return err
 	}
-	return handleRdbResize(args, stdout, opts)
+	if legacySize != nil {
+		return handleRdbResize([]string{mediaPath, strconv.FormatInt(*legacySize, 10)}, stdout, opts)
+	}
+	return printSimpleStatus(stdout, opts, "rdb updated", map[string]any{
+		"media":   mediaPath,
+		"updated": updateValues,
+	})
+}
+
+func parseRdbPartFormatArgs(args []string) (mediaPath string, index int, label string, err error) {
+	const usage = "usage: rdb part format <media> <index> <label> [--non-rdb [bool]] [-chs <chs>] [--dos-type|-dt <dostype>]"
+	if len(args) < 3 {
+		return "", 0, "", errors.New(usage)
+	}
+	positionals := make([]string, 0, 3)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--non-rdb":
+			_, consumed, boolErr := parseOptionalBoolFlag(args, i, "--non-rdb")
+			if boolErr != nil {
+				return "", 0, "", boolErr
+			}
+			i += consumed
+		case "-chs", "--dos-type", "-dt":
+			if i+1 >= len(args) {
+				return "", 0, "", fmt.Errorf("missing value for %s", args[i])
+			}
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", 0, "", fmt.Errorf("unsupported argument: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 3 {
+		return "", 0, "", errors.New(usage)
+	}
+	index, err = strconv.Atoi(positionals[1])
+	if err != nil {
+		return "", 0, "", err
+	}
+	return positionals[0], index, positionals[2], nil
+}
+
+func parseRdbUpdateArgs(args []string) (mediaPath string, legacySize *int64, updateValues map[string]any, err error) {
+	const usage = "usage: rdb update <media> <size> OR rdb update <media> [--flags|-f <n>] [--host-id|-h <n>] [--disk-product|-dp <v>] [--disk-revision|-dr <v>] [--disk-vendor|-dv <v>]"
+	if len(args) < 1 {
+		return "", nil, nil, errors.New(usage)
+	}
+	mediaPath = args[0]
+	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+		size, parseErr := parseSize(args[1])
+		if parseErr != nil {
+			return "", nil, nil, parseErr
+		}
+		legacySize = &size
+		return mediaPath, legacySize, map[string]any{"size": size}, nil
+	}
+	updateValues = make(map[string]any)
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--flags", "-f", "--host-id", "-h":
+			if i+1 >= len(args) {
+				return "", nil, nil, fmt.Errorf("missing value for %s", args[i])
+			}
+			n, convErr := strconv.ParseUint(strings.TrimSpace(args[i+1]), 0, 32)
+			if convErr != nil {
+				return "", nil, nil, fmt.Errorf("invalid value for %s: %s", args[i], args[i+1])
+			}
+			key := strings.TrimPrefix(args[i], "--")
+			key = strings.TrimPrefix(key, "-")
+			updateValues[key] = n
+			i++
+		case "--disk-product", "-dp", "--disk-revision", "-dr", "--disk-vendor", "-dv":
+			if i+1 >= len(args) {
+				return "", nil, nil, fmt.Errorf("missing value for %s", args[i])
+			}
+			key := strings.TrimPrefix(args[i], "--")
+			key = strings.TrimPrefix(key, "-")
+			updateValues[key] = args[i+1]
+			i++
+		default:
+			return "", nil, nil, fmt.Errorf("unsupported argument: %s", args[i])
+		}
+	}
+	if len(updateValues) == 0 {
+		return "", nil, nil, errors.New("At least one option must be specified")
+	}
+	return mediaPath, nil, updateValues, nil
 }
 
 func handleRdbBackup(args []string, stdout io.Writer, opts GlobalOptions) error {

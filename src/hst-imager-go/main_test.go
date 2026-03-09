@@ -101,6 +101,27 @@ func TestSettingsUpdateAndList(t *testing.T) {
 	}
 }
 
+func TestSettingsUpdateOptionStyle(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+	t.Setenv("APPDATA", configRoot)
+	var out bytes.Buffer
+	if err := run([]string{"settings", "update", "--retries", "3", "--force", "--use-cache", "false", "--cache-type", "disk"}, &out); err != nil {
+		t.Fatalf("settings update option style failed: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"settings", "list"}, &out); err != nil {
+		t.Fatalf("settings list failed: %v", err)
+	}
+	txt := out.String()
+	for _, key := range []string{"retries=3", "force=true", "use-cache=false", "cache-type=disk"} {
+		if !strings.Contains(txt, key) {
+			t.Fatalf("expected settings list to contain %q, got: %q", key, txt)
+		}
+	}
+}
+
 func TestFsDirAndArchiveListAndScript(t *testing.T) {
 	tmp := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello"), 0o644); err != nil {
@@ -241,6 +262,41 @@ func TestFsAndArchiveCommandAliases(t *testing.T) {
 	}
 }
 
+func TestArchiveListAcceptsRecursiveFlags(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "a.zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	w, err := zw.Create("d/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("aaa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"archive", "list", zipPath, "--recursive"}, &out); err != nil {
+		t.Fatalf("archive list --recursive failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "d/a.txt") {
+		t.Fatalf("unexpected archive list output: %q", out.String())
+	}
+	out.Reset()
+	if err := run([]string{"archive", "list", zipPath, "-r=false"}, &out); err != nil {
+		t.Fatalf("archive list -r=false failed: %v", err)
+	}
+}
+
 func TestCommandNormalizationDoesNotRewriteArguments(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -270,6 +326,22 @@ func TestCommandNormalizationDoesNotRewriteArguments(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(tmp, "delete")); err == nil {
 		t.Fatal("did not expect directory delete to be created")
+	}
+}
+
+func TestBlankCompatibleOption(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "compatible.img")
+	var out bytes.Buffer
+	if err := run([]string{"blank", path, "1000", "--compatible"}, &out); err != nil {
+		t.Fatalf("blank --compatible failed: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 950 {
+		t.Fatalf("expected compatible size 950, got %d", info.Size())
 	}
 }
 
@@ -2668,6 +2740,27 @@ func TestMbrPartAddSupportsStartSectorAndActiveOptions(t *testing.T) {
 	}
 }
 
+func TestMbrPartFormatAcceptsFileSystemOption(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "mbr-format-fs-option.img")
+	var out bytes.Buffer
+	if err := run([]string{"blank", media, "32MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "initialize", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "add", media, "ntfs", "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"mbr", "part", "format", media, "1", "PC", "--file-system", "fat32"}, &out); err != nil {
+		t.Fatalf("mbr part format with --file-system failed: %v", err)
+	}
+	if err := run([]string{"mbr", "part", "format", media, "1", "PC", "-fs", "fat32"}, &out); err != nil {
+		t.Fatalf("mbr part format with -fs failed: %v", err)
+	}
+}
+
 func TestGptPartAddSupportsStartSectorOption(t *testing.T) {
 	tmp := t.TempDir()
 	media := filepath.Join(tmp, "gpt-part-add-options.img")
@@ -3598,6 +3691,43 @@ func TestNativeRdbFsUpdatePathMutatesImage(t *testing.T) {
 	after := sha256.Sum256(afterBytes)
 	if before == after {
 		t.Fatal("expected native rdb image to change after filesystem update --path")
+	}
+}
+
+func TestRdbOptionShapeCompatibilityBatch(t *testing.T) {
+	tmp := t.TempDir()
+	mediaInit := filepath.Join(tmp, "rdb-init-options.img")
+	media := filepath.Join(tmp, "rdb-options.img")
+	fsBin := filepath.Join(tmp, "pfs3aio")
+	if err := os.WriteFile(fsBin, []byte("filesystem-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"rdb", "initialize", mediaInit, "--size", "32MB", "--name", "TEST", "-chs", "80,2,11", "--rdb-block-lo", "1"}, &out); err != nil {
+		t.Fatalf("rdb initialize options failed: %v", err)
+	}
+	if err := run([]string{"rdb", "resize", mediaInit, "--size", "32MB"}, &out); err != nil {
+		t.Fatalf("rdb resize --size failed: %v", err)
+	}
+
+	if err := run([]string{"blank", media, "64MB"}, &out); err != nil {
+		t.Fatalf("blank for rdb options failed: %v", err)
+	}
+	if err := run([]string{"rdb", "initialize", media}, &out); err != nil {
+		t.Fatalf("rdb initialize failed: %v", err)
+	}
+	if err := run([]string{"rdb", "filesystem", "add", media, fsBin, "PDS3", "--name", "PFS3AIO", "--version", "1", "--revision", "2"}, &out); err != nil {
+		t.Fatalf("rdb filesystem add options failed: %v", err)
+	}
+	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "1MB", "--reserved", "2", "--pre-alloc", "1", "--buffers", "30", "--max-transfer", "0x1fe00", "--mask", "0x7ffffffe", "--no-mount", "--bootable", "--boot-priority", "1", "--block-size", "512", "--use-experimental"}, &out); err != nil {
+		t.Fatalf("rdb part add options failed: %v", err)
+	}
+	if err := run([]string{"rdb", "part", "format", media, "1", "Workbench", "--non-rdb", "-chs", "80,2,11", "--dos-type", "PDS3"}, &out); err != nil {
+		t.Fatalf("rdb part format options failed: %v", err)
+	}
+	if err := run([]string{"rdb", "update", media, "--flags", "1", "--host-id", "2", "--disk-product", "prod", "--disk-revision", "rev", "--disk-vendor", "ven"}, &out); err != nil {
+		t.Fatalf("rdb update option mode failed: %v", err)
 	}
 }
 
