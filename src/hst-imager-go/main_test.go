@@ -3737,7 +3737,11 @@ func TestRdbOptionShapeCompatibilityBatch(t *testing.T) {
 	mediaInit := filepath.Join(tmp, "rdb-init-options.img")
 	media := filepath.Join(tmp, "rdb-options.img")
 	fsBin := filepath.Join(tmp, "pfs3aio")
+	fsImportBin := filepath.Join(tmp, "ffs.bin")
 	if err := os.WriteFile(fsBin, []byte("filesystem-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fsImportBin, []byte("filesystem-import-data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3758,6 +3762,9 @@ func TestRdbOptionShapeCompatibilityBatch(t *testing.T) {
 	if err := run([]string{"rdb", "filesystem", "add", media, fsBin, "PDS3", "--name", "PFS3AIO", "--version", "1", "--revision", "2"}, &out); err != nil {
 		t.Fatalf("rdb filesystem add options failed: %v", err)
 	}
+	if err := run([]string{"rdb", "filesystem", "import", media, fsImportBin, "--dos-type", "DOS3", "--name", "FastFileSystem"}, &out); err != nil {
+		t.Fatalf("rdb filesystem import option mode failed: %v", err)
+	}
 	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "1MB", "--reserved", "2", "--pre-alloc", "1", "--buffers", "30", "--max-transfer", "0x1fe00", "--mask", "0x7ffffffe", "--no-mount", "--bootable", "--boot-priority", "1", "--block-size", "512", "--use-experimental"}, &out); err != nil {
 		t.Fatalf("rdb part add options failed: %v", err)
 	}
@@ -3766,6 +3773,21 @@ func TestRdbOptionShapeCompatibilityBatch(t *testing.T) {
 	}
 	if err := run([]string{"rdb", "update", media, "--flags", "1", "--host-id", "2", "--disk-product", "prod", "--disk-revision", "rev", "--disk-vendor", "ven"}, &out); err != nil {
 		t.Fatalf("rdb update option mode failed: %v", err)
+	}
+	state, err := readRdbState(media)
+	if err != nil {
+		t.Fatalf("read rdb state after import failed: %v", err)
+	}
+	normalizeRdbStateIndexes(&state)
+	if len(state.Fs) < 2 {
+		t.Fatalf("expected imported filesystem to be added, got %d filesystems", len(state.Fs))
+	}
+	last := state.Fs[len(state.Fs)-1]
+	if last.DosType != "DOS3" {
+		t.Fatalf("expected imported dos type DOS3, got %q", last.DosType)
+	}
+	if last.Name != "FastFileSystem" {
+		t.Fatalf("expected imported fs name FastFileSystem, got %q", last.Name)
 	}
 }
 

@@ -4746,7 +4746,7 @@ func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 		fs.Name = fsName
 	}
 	if state.Native {
-		nativeFs, err := addNativeFileSystem(mediaPath, fsPath, fs.DosType)
+		nativeFs, err := addNativeFileSystem(mediaPath, fsPath, fs.DosType, fs.Name)
 		if err != nil {
 			return err
 		}
@@ -4769,7 +4769,7 @@ func handleRdbFsAdd(args []string, stdout io.Writer, opts GlobalOptions) error {
 }
 
 func parseRdbFsAddArgs(args []string) (mediaPath, fsPath, dosType, fsName, version string, err error) {
-	const usage = "usage: rdb filesystem add <media> <path> [dostype] [--name|-n <name>] [--version|-v <n>] [--revision|-r <n>]"
+	const usage = "usage: rdb filesystem add <media> <path> [dostype|--dos-type|-dt <dostype>] [--name|-n <name>] [--version|-v <n>] [--revision|-r <n>]"
 	if len(args) < 2 {
 		return "", "", "", "", "", errors.New(usage)
 	}
@@ -4783,6 +4783,12 @@ func parseRdbFsAddArgs(args []string) (mediaPath, fsPath, dosType, fsName, versi
 				return "", "", "", "", "", errors.New("missing value for --name")
 			}
 			fsName = args[i+1]
+			i++
+		case "--dos-type", "-dt":
+			if i+1 >= len(args) {
+				return "", "", "", "", "", errors.New("missing value for --dos-type")
+			}
+			dosType = args[i+1]
 			i++
 		case "--version", "-v":
 			if i+1 >= len(args) {
@@ -4816,7 +4822,7 @@ func parseRdbFsAddArgs(args []string) (mediaPath, fsPath, dosType, fsName, versi
 	}
 	mediaPath = positionals[0]
 	fsPath = positionals[1]
-	if len(positionals) == 3 {
+	if len(positionals) == 3 && dosType == "" {
 		dosType = positionals[2]
 	}
 	if major != nil || revision != nil {
@@ -5871,7 +5877,7 @@ func writeNativeRdbState(path string, state rdbState) error {
 	return writeNativeRdbContextCompactToFile(f, ctx)
 }
 
-func addNativeFileSystem(mediaPath, fileSystemPath, dosType string) (rdbFileSystem, error) {
+func addNativeFileSystem(mediaPath, fileSystemPath, dosType, name string) (rdbFileSystem, error) {
 	payload, err := os.ReadFile(fileSystemPath)
 	if err != nil {
 		return rdbFileSystem{}, err
@@ -5892,7 +5898,10 @@ func addNativeFileSystem(mediaPath, fileSystemPath, dosType string) (rdbFileSyst
 	}
 
 	major, minor := parseNativeVersion(payload)
-	fsName := filepath.Base(fileSystemPath)
+	fsName := strings.TrimSpace(name)
+	if fsName == "" {
+		fsName = filepath.Base(fileSystemPath)
+	}
 	if dosType == "" {
 		dosType = "DOS3"
 	}
