@@ -2495,9 +2495,7 @@ func handleFormat(args []string, stdout io.Writer, opts GlobalOptions) error {
 			return err
 		}
 	case "pistorm":
-		// Keep pure-Go behavior deterministic: run RDB workflow for now, while PiStorm-specific multi-table
-		// orchestration is still implemented through dedicated partition commands.
-		if err := runRdbFormatWorkflow(path, fileSystem, formatOpts); err != nil {
+		if err := runPiStormFormatWorkflow(path, fileSystem, formatOpts); err != nil {
 			return err
 		}
 	default:
@@ -2659,6 +2657,108 @@ func runRdbFormatWorkflow(path, fileSystem string, opts formatCommandOptions) er
 		return err
 	}
 	return handleRdbPartFormat([]string{path, "1", partName}, io.Discard, GlobalOptions{})
+}
+
+func runPiStormFormatWorkflow(path, fileSystem string, opts formatCommandOptions) error {
+	mediaBytes := mediaSize(path)
+	if mediaBytes < 2*1024*1024*1024 {
+		return fmt.Errorf("Formatting PiStorm requires disk size of minimum 2GB and disk size is '%d' bytes", mediaBytes)
+	}
+	formatBytes := mediaBytes
+	if opts.hasSize && opts.size > 0 && opts.size < formatBytes {
+		formatBytes = opts.size
+	}
+
+	if err := initializeMbr(path); err != nil {
+		return err
+	}
+
+	bootSize := int64(1024 * 1024 * 1024)
+	if err := handleMbrPartAdd([]string{path, "fat32lba", strconv.FormatInt(bootSize, 10)}, io.Discard, GlobalOptions{}); err != nil {
+		return err
+	}
+	if err := handleMbrPartFormat([]string{path, "1", "Empty"}, io.Discard, GlobalOptions{}); err != nil {
+		return err
+	}
+
+	parts, err := readMbrPartitions(path)
+	if err != nil {
+		return err
+	}
+	bootPart, err := findMbrPart(parts, 1)
+	if err != nil {
+		return err
+	}
+	bootEnd := int64(bootPart.StartLBA+bootPart.SectorCount) * mbrSectorSize
+	remaining := formatBytes - bootEnd
+	if remaining <= 0 {
+		return errors.New("no space left for PiStorm RDB partition")
+	}
+
+	maxRdbPartitionSize := int64(137438953472)
+	if opts.useExperimental {
+		maxRdbPartitionSize = int64(2199023255552)
+	}
+	if opts.hasMaxPartitionSize && opts.maxPartitionSize > 0 && opts.maxPartitionSize < maxRdbPartitionSize {
+		maxRdbPartitionSize = opts.maxPartitionSize
+	}
+	pistormPartSize := remaining
+	if pistormPartSize > maxRdbPartitionSize {
+		pistormPartSize = maxRdbPartitionSize
+	}
+	if err := handleMbrPartAdd([]string{path, "pistormrdb", strconv.FormatInt(pistormPartSize, 10)}, io.Discard, GlobalOptions{}); err != nil {
+		return err
+	}
+
+	rdbOpts := opts
+	rdbOpts.hasSize = false
+	rdbOpts.hasMaxPartitionSize = false
+	partitionPath := path + `\mbr\2`
+	return runWithinPartitionImage(partitionPath, func(tempPath string) error {
+		return runRdbFormatWorkflow(tempPath, fileSystem, rdbOpts)
+	})
+}
+
+func runWithinPartitionImage(partitionPath string, fn func(tempPath string) error) error {
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("path '%s' is not a partition path", partitionPath)
+	}
+	tmpFile, err := os.CreateTemp("", "hst-imager-go-partition-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	defer os.Remove(tmpPath)
+
+	if _, err := copyRange(region.BasePath, tmpPath, region.Offset, 0, region.Size); err != nil {
+		return err
+	}
+	if err := fn(tmpPath); err != nil {
+		return err
+	}
+
+	info, err := os.Stat(tmpPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() > region.Size {
+		return errors.New("partition workflow produced data larger than partition region")
+	}
+	if info.Size() < region.Size {
+		if err := os.Truncate(tmpPath, region.Size); err != nil {
+			return err
+		}
+	}
+	_, err = copyRange(tmpPath, region.BasePath, 0, region.Offset, region.Size)
+	return err
 }
 
 func handleBlockRead(args []string, stdout io.Writer, opts GlobalOptions) error {

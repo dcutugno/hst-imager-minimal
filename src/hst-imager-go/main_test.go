@@ -2072,6 +2072,52 @@ func TestFormatRootRdbWorkflow(t *testing.T) {
 	}
 }
 
+func TestFormatRootPiStormWorkflow(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "pistorm-format.img")
+	fsBin := filepath.Join(tmp, "pfs3aio")
+	var out bytes.Buffer
+	if err := os.WriteFile(fsBin, []byte("filesystem-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"blank", media, "3GB"}, &out); err != nil {
+		t.Fatalf("blank failed: %v", err)
+	}
+	if err := run([]string{"format", media, "pistorm", "pds3", "--max-partition-size", "1GB", "--file-system-path", fsBin}, &out); err != nil {
+		t.Fatalf("format pistorm failed: %v", err)
+	}
+
+	parts, err := readMbrPartitions(media)
+	if err != nil {
+		t.Fatalf("read mbr partitions failed: %v", err)
+	}
+	if len(parts) < 2 {
+		t.Fatalf("expected at least 2 mbr partitions, got %d", len(parts))
+	}
+	p1, err := findMbrPart(parts, 1)
+	if err != nil {
+		t.Fatalf("expected mbr part 1: %v", err)
+	}
+	if p1.TypeCode != 0x0c {
+		t.Fatalf("expected mbr part 1 type 0x0c, got 0x%02x", p1.TypeCode)
+	}
+	p2, err := findMbrPart(parts, 2)
+	if err != nil {
+		t.Fatalf("expected mbr part 2: %v", err)
+	}
+	if p2.TypeCode != 0x76 {
+		t.Fatalf("expected mbr part 2 type 0x76, got 0x%02x", p2.TypeCode)
+	}
+
+	sig, err := readBytesAt(media, int64(p2.StartLBA)*mbrSectorSize, 4)
+	if err != nil {
+		t.Fatalf("read piStorm rdb partition signature failed: %v", err)
+	}
+	if string(sig) != "RDSK" {
+		t.Fatalf("expected RDSK signature in mbr part 2, got %q", string(sig))
+	}
+}
+
 func TestGptPartAddSupportsLegacyNameArgumentOrder(t *testing.T) {
 	tmp := t.TempDir()
 	media := filepath.Join(tmp, "gpt-legacy-args.img")
