@@ -1,8 +1,6 @@
 name: Go Legacy Parity Nightly
 
 on:
-  schedule:
-    - cron: "15 2 * * *"
   workflow_dispatch:
 
 jobs:
