@@ -107,7 +107,7 @@ func TestSettingsUpdateOptionStyle(t *testing.T) {
 	t.Setenv("HOME", configRoot)
 	t.Setenv("APPDATA", configRoot)
 	var out bytes.Buffer
-	if err := run([]string{"settings", "update", "--retries", "3", "--force", "--use-cache", "false", "--cache-type", "disk"}, &out); err != nil {
+	if err := run([]string{"settings", "update", "--retries", "3", "--force", "--use-cache", "false", "--cache-type", "disk", "--sparse-files", "true"}, &out); err != nil {
 		t.Fatalf("settings update option style failed: %v", err)
 	}
 	out.Reset()
@@ -115,7 +115,7 @@ func TestSettingsUpdateOptionStyle(t *testing.T) {
 		t.Fatalf("settings list failed: %v", err)
 	}
 	txt := out.String()
-	for _, key := range []string{"retries=3", "force=true", "use-cache=false", "cache-type=disk"} {
+	for _, key := range []string{"retries=3", "force=true", "use-cache=false", "cache-type=disk", "sparse-files=true"} {
 		if !strings.Contains(txt, key) {
 			t.Fatalf("expected settings list to contain %q, got: %q", key, txt)
 		}

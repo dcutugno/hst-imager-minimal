@@ -1445,7 +1445,7 @@ func handleSettingsList(args []string, stdout io.Writer, opts GlobalOptions) err
 
 func handleSettingsUpdate(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
-		return errors.New("usage: settings update <key> <value> OR settings update [--all-physical-drives [bool]] [--retries|-r <n>] [--force|-f [bool]] [--verify|-v [bool]] [--skip-unused-sectors [bool]] [--use-cache [bool]] [--cache-type <value>]")
+		return errors.New("usage: settings update <key> <value> OR settings update [--all-physical-drives [bool]] [--retries|-r <n>] [--force|-f [bool]] [--verify|-v [bool]] [--skip-unused-sectors [bool]] [--use-cache [bool]] [--cache-type <value>] [--sparse-files [bool]]")
 	}
 	s, err := readSettings()
 	if err != nil {
@@ -1594,6 +1594,13 @@ func parseSettingsUpdateOptions(args []string) (map[string]string, error) {
 			}
 			updated["cache-type"] = strings.TrimSpace(args[i+1])
 			i++
+		case "--sparse-files":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--sparse-files")
+			if err != nil {
+				return nil, err
+			}
+			updated["sparse-files"] = strconv.FormatBool(value)
+			i += consumed
 		default:
 			return nil, fmt.Errorf("unsupported argument: %s", args[i])
 		}
