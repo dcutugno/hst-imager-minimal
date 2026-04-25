@@ -54,7 +54,10 @@ public abstract partial class FsCommandBase : CommandBase
         using var media = mediaResult.Value;
         var stream = media.Stream;
 
-        stream.Seek(0, SeekOrigin.Begin);
+        if (stream.CanSeek)
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+        }
         var sectorBytes = await stream.ReadBytes(512);
 
         if (!MagicBytes.HasMagicNumber(MagicBytes.AdfDosMagicNumber, sectorBytes, 0))
