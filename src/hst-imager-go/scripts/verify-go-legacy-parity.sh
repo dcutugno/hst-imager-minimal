@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-GO_BIN="${GO_BIN:-$ROOT_DIR/hst-imager-go}"
+GO_EXE="$(go env GOEXE 2>/dev/null || true)"
+GO_BIN="${GO_BIN:-$ROOT_DIR/.bin/hst-imager-go${GO_EXE}}"
 LEGACY_BIN="${HST_IMAGER_LEGACY_BIN:-}"
 HEAVY="${HST_PARITY_HEAVY:-0}"
 DEEP_FS="${HST_PARITY_DEEP_FS:-0}"
@@ -25,6 +26,7 @@ if [[ -z "$LEGACY_BIN" ]]; then
 fi
 
 echo "Building go binary at $GO_BIN"
+mkdir -p "$(dirname "$GO_BIN")"
 go build -o "$GO_BIN" .
 
 TMP_DIR="$(mktemp -d)"

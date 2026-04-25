@@ -9,7 +9,7 @@ Initial bootstrap for porting Hst Imager Console to Go.
   - imaging: `list`, `blank`, `convert`, `transfer`, `read`, `write`, `compare`, `info`, `optimize`, `format`
   - block: `block read`, `block view`
   - settings: `settings list`, `settings update`
-  - filesystem: `fs dir`, `fs copy`, `fs extract`, `fs mkdir`
+  - filesystem: `fs dir`, `fs copy`, `fs extract`, `fs mkdir`, `fs delete`, `fs rename`
   - archive/script/adf: `archive list`, `script`, `adf create`
   - partition tables:
     - `mbr info|initialize|part add|delete|format|export|import|clone`
@@ -29,8 +29,10 @@ Initial bootstrap for porting Hst Imager Console to Go.
 
 ## Build
 ```bash
-go build ./...
+make build
 ```
+
+The build output is written to `.bin/hst-imager-go` (or `.bin/hst-imager-go.exe` on Windows) and is intentionally ignored by Git.
 
 ## Test
 ```bash
@@ -101,6 +103,7 @@ Pure-Go parity progress:
 - `fs dir` now reads `_UAEFSDB.___` and `.uaem` metadata in pure Go to resolve Amiga names/protection bits/comments, hides metadata files from listings, and supports recursive metadata-aware path mapping.
 - `fs copy`/`fs extract` now read source UAE metadata in pure Go and propagate metadata properties (protection bits/comments) to destination metadata files, including entries where names do not require remapping.
 - `fs dir`/`fs copy`/`fs extract` now resolve Amiga-style source path components via UAE metadata mappings (e.g. `file1*` -> `__uae___file1_` or `file1%2a`) in pure-Go mode.
+- `fs delete` and `fs rename` support local host filesystem targets in pure Go; virtual Amiga filesystem mutation paths still route to the legacy bridge when configured.
 - archive handling now supports native non-zip tar-family formats in Go (`.tar`, `.tgz`, `.tar.gz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`) for both `archive list` and `fs extract`.
 - single-stream compressed archives now have native pure-Go handling for `archive list` and `fs extract` (`.gz`, `.xz`, `.bz2`, `.z`) with inner-path matching semantics.
 - `fs extract` archive-root behavior now matches legacy semantics: when inner path is empty, extraction is recursive even without `--recursive`.

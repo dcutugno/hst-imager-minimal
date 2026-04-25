@@ -1,0 +1,85 @@
+name: Hst Imager DOpus
+
+on:
+  push:
+    paths:
+      - ".github/workflows/hst-imager-dopus.yml"
+      - "src/hst-imager-dopus/**"
+      - "src/hst-imager-go/**"
+  pull_request:
+    paths:
+      - ".github/workflows/hst-imager-dopus.yml"
+      - "src/hst-imager-dopus/**"
+      - "src/hst-imager-go/**"
+  workflow_dispatch:
+
+jobs:
+  dopus:
+    name: DOpus app checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/hst-imager-go/go.mod
+          cache-dependency-path: src/hst-imager-go/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/hst-imager-dopus/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            wget
+
+      - name: Install frontend dependencies
+        working-directory: src/hst-imager-dopus
+        run: npm ci
+
+      - name: Build Go engine sidecar
+        working-directory: src/hst-imager-dopus
+        run: npm run prepare-engine
+
+      - name: Frontend unit tests
+        working-directory: src/hst-imager-dopus
+        run: npm test
+
+      - name: TypeScript check
+        working-directory: src/hst-imager-dopus
+        run: npm run check
+
+      - name: Frontend build
+        working-directory: src/hst-imager-dopus
+        run: npm run build
+
+      - name: Rust tests
+        working-directory: src/hst-imager-dopus/src-tauri
+        run: cargo test
+
+      - name: Tauri build check
+        working-directory: src/hst-imager-dopus/src-tauri
+        run: cargo check
+
+      - name: Engine smoke tests
+        working-directory: src/hst-imager-dopus
+        env:
+          HST_DOPUS_HEAVY_SMOKE: "1"
+        run: npm run smoke

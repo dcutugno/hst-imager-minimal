@@ -15,7 +15,9 @@ echo "[2/7] Running unit tests"
 go test ./...
 
 echo "[3/7] Building binary"
-go build ./...
+GO_EXE="$(go env GOEXE 2>/dev/null || true)"
+mkdir -p .bin
+go build -o ".bin/hst-imager-go${GO_EXE}" .
 
 echo "[4/7] Running smoke test for list"
 LIST_OUT="$(go run . list)"

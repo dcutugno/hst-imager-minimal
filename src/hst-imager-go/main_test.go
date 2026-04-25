@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -183,6 +184,93 @@ func TestFsDirAndArchiveListAndScript(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Created blank image") || !strings.Contains(out.String(), "Path:") {
 		t.Fatalf("unexpected script output: %q", out.String())
+	}
+}
+
+func TestFsDirJsonIncludesLocalEntryMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	filePath := filepath.Join(tmp, "a.txt")
+	dirPath := filepath.Join(tmp, "dir")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Date(2024, 2, 3, 4, 5, 6, 0, time.Local)
+	if err := os.Chtimes(filePath, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(dirPath, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", tmp}, &out); err != nil {
+		t.Fatalf("fs dir json failed: %v", err)
+	}
+	var result struct {
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]fsDirItem{}
+	for _, entry := range result.Entries {
+		byName[entry.Name] = entry
+	}
+	fileEntry, ok := byName["a.txt"]
+	if !ok {
+		t.Fatalf("expected a.txt entry, got %#v", byName)
+	}
+	if fileEntry.Type != "file" || fileEntry.Size != 5 || fileEntry.RawPath != filePath || fileEntry.Date != formatAmigaDate(stamp) {
+		t.Fatalf("unexpected file metadata: %#v", fileEntry)
+	}
+	dirEntry, ok := byName["dir"]
+	if !ok {
+		t.Fatalf("expected dir entry, got %#v", byName)
+	}
+	if dirEntry.Type != "dir" || dirEntry.Size != 0 || dirEntry.RawPath != dirPath || dirEntry.Date != formatAmigaDate(stamp) {
+		t.Fatalf("unexpected dir metadata: %#v", dirEntry)
+	}
+}
+
+func TestFsDirJsonReportsLocalSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows symlink creation depends on privileges")
+	}
+	tmp := t.TempDir()
+	targetPath := filepath.Join(tmp, "target.txt")
+	if err := os.WriteFile(targetPath, []byte("target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(tmp, "link.txt")
+	if err := os.Symlink("target.txt", linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", tmp}, &out); err != nil {
+		t.Fatalf("fs dir json failed: %v", err)
+	}
+	var result struct {
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	var linkEntry *fsDirItem
+	for i := range result.Entries {
+		if result.Entries[i].Name == "link.txt" {
+			linkEntry = &result.Entries[i]
+			break
+		}
+	}
+	if linkEntry == nil {
+		t.Fatalf("expected link.txt entry, got %#v", result.Entries)
+	}
+	if linkEntry.Type != "softlink" || linkEntry.LinkPath != "target.txt" || linkEntry.RawPath != linkPath {
+		t.Fatalf("unexpected symlink entry: %#v", *linkEntry)
 	}
 }
 
@@ -366,6 +454,192 @@ func TestFsCopyAcceptsLegacyOptionFlags(t *testing.T) {
 	}
 	if string(b) != "aaa" {
 		t.Fatalf("unexpected copied content: %q", b)
+	}
+}
+
+func TestFsCopyMultipleSourcesToDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	srcA := filepath.Join(tmp, "a.txt")
+	srcB := filepath.Join(tmp, "b.txt")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.WriteFile(srcA, []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(srcB, []byte("bbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "copy", srcA, srcB, dst}, &out); err != nil {
+		t.Fatalf("fs copy multiple sources failed: %v", err)
+	}
+	for name, want := range map[string]string{"a.txt": "aaa", "b.txt": "bbb"} {
+		b, err := os.ReadFile(filepath.Join(dst, name))
+		if err != nil {
+			t.Fatalf("expected copied file %s: %v", name, err)
+		}
+		if string(b) != want {
+			t.Fatalf("unexpected content for %s: %q", name, b)
+		}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, out.String())
+	}
+	if payload["destination"] != dst || int(payload["entries"].(float64)) != 2 {
+		t.Fatalf("unexpected copy payload: %+v", payload)
+	}
+}
+
+func TestFsCopyPreservesLocalFileAndDirectoryDates(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	childDir := filepath.Join(src, "dir")
+	childFile := filepath.Join(childDir, "a.txt")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childFile, []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(src, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(childDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(childFile, 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rootStamp := time.Date(2024, 3, 6, 7, 8, 9, 0, time.Local)
+	fileStamp := time.Date(2024, 3, 4, 5, 6, 7, 0, time.Local)
+	dirStamp := time.Date(2024, 3, 5, 6, 7, 8, 0, time.Local)
+	if err := os.Chtimes(childFile, fileStamp, fileStamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(childDir, dirStamp, dirStamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, rootStamp, rootStamp); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "none"}, &out); err != nil {
+		t.Fatalf("fs copy failed: %v", err)
+	}
+	copiedRoot, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(copiedRoot.ModTime()); got != formatAmigaDate(rootStamp) {
+		t.Fatalf("expected copied root dir date %q, got %q", formatAmigaDate(rootStamp), got)
+	}
+	if runtime.GOOS != "windows" && copiedRoot.Mode().Perm() != 0o700 {
+		t.Fatalf("expected copied root mode 700, got %o", copiedRoot.Mode().Perm())
+	}
+	copiedFile, err := os.Stat(filepath.Join(dst, "dir", "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(copiedFile.ModTime()); got != formatAmigaDate(fileStamp) {
+		t.Fatalf("expected copied file date %q, got %q", formatAmigaDate(fileStamp), got)
+	}
+	if runtime.GOOS != "windows" && copiedFile.Mode().Perm() != 0o640 {
+		t.Fatalf("expected copied file mode 640, got %o", copiedFile.Mode().Perm())
+	}
+	copiedDir, err := os.Stat(filepath.Join(dst, "dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(copiedDir.ModTime()); got != formatAmigaDate(dirStamp) {
+		t.Fatalf("expected copied dir date %q, got %q", formatAmigaDate(dirStamp), got)
+	}
+	if runtime.GOOS != "windows" && copiedDir.Mode().Perm() != 0o750 {
+		t.Fatalf("expected copied dir mode 750, got %o", copiedDir.Mode().Perm())
+	}
+
+	singleDst := filepath.Join(tmp, "single.txt")
+	if err := run([]string{"fs", "copy", childFile, singleDst, "--uaemetadata", "none"}, &out); err != nil {
+		t.Fatalf("single fs copy failed: %v", err)
+	}
+	singleInfo, err := os.Stat(singleDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(singleInfo.ModTime()); got != formatAmigaDate(fileStamp) {
+		t.Fatalf("expected single copied file date %q, got %q", formatAmigaDate(fileStamp), got)
+	}
+	if runtime.GOOS != "windows" && singleInfo.Mode().Perm() != 0o640 {
+		t.Fatalf("expected single copied file mode 640, got %o", singleInfo.Mode().Perm())
+	}
+
+	skipDst := filepath.Join(tmp, "skip-attrs.txt")
+	if err := run([]string{"fs", "copy", childFile, skipDst, "--skip-attributes", "--uaemetadata", "none"}, &out); err != nil {
+		t.Fatalf("skip-attributes fs copy failed: %v", err)
+	}
+	skipInfo, err := os.Stat(skipDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && skipInfo.Mode().Perm() == 0o640 {
+		t.Fatalf("did not expect skip-attributes copied mode to preserve 640")
+	}
+}
+
+func TestFsCopyPreservesLocalSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows symlink creation depends on privileges")
+	}
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "target.txt"), []byte("target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target.txt", filepath.Join(src, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", src, dst, "--recursive", "--uaemetadata", "none"}, &out); err != nil {
+		t.Fatalf("fs copy symlink failed: %v", err)
+	}
+	linkInfo, err := os.Lstat(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected copied link to remain symlink, got mode %s", linkInfo.Mode())
+	}
+	target, err := os.Readlink(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "target.txt" {
+		t.Fatalf("expected copied link target target.txt, got %q", target)
+	}
+
+	singleDst := filepath.Join(tmp, "single-link.txt")
+	out.Reset()
+	if err := run([]string{"fs", "copy", filepath.Join(src, "link.txt"), singleDst, "--uaemetadata", "none"}, &out); err != nil {
+		t.Fatalf("single fs copy symlink failed: %v", err)
+	}
+	singleInfo, err := os.Lstat(singleDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if singleInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected single copied link to remain symlink, got mode %s", singleInfo.Mode())
 	}
 }
 
@@ -620,6 +894,383 @@ func TestFsExtractArchiveSingleFileWithoutRecursive(t *testing.T) {
 	}
 	if string(b) != "aaa" {
 		t.Fatalf("unexpected extracted content: %q", string(b))
+	}
+}
+
+func TestFsExtractZipPreservesArchiveDatesInUaeMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "dated.zip")
+	stamp := time.Date(2024, 3, 4, 5, 6, 8, 0, time.Local)
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	header := &zip.FileHeader{Name: "file.txt", Comment: "dated comment", Method: zip.Store}
+	header.SetModTime(stamp)
+	w, err := zw.CreateHeader(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("dated")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := listArchiveEntries(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Date.IsZero() {
+		t.Fatalf("expected dated zip entry, got %#v", entries)
+	}
+	expectedDate := entries[0].Date.Local()
+
+	var out bytes.Buffer
+	metaDst := filepath.Join(tmp, "uaem")
+	if err := run([]string{"fs", "extract", zipPath, metaDst, "--uaemetadata", "uaemetafile"}, &out); err != nil {
+		t.Fatalf("fs extract zip with uaemetafile failed: %v", err)
+	}
+	_, gotDate, gotComment, err := readUaeMetafile(filepath.Join(metaDst, "file.txt.uaem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotComment != "dated comment" {
+		t.Fatalf("expected archive comment in uaemetafile, got %q", gotComment)
+	}
+	if gotDate.IsZero() || formatAmigaDate(gotDate) != formatAmigaDate(expectedDate) {
+		t.Fatalf("expected archive date %q in uaemetafile, got %q", formatAmigaDate(expectedDate), formatAmigaDate(gotDate))
+	}
+
+	fsdbDst := filepath.Join(tmp, "uaefsdb")
+	out.Reset()
+	if err := run([]string{"fs", "extract", zipPath, fsdbDst, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs extract zip with uaefsdb failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(fsdbDst, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(info.ModTime()); got != formatAmigaDate(expectedDate) {
+		t.Fatalf("expected archive date %q as uaefsdb host mtime, got %q", formatAmigaDate(expectedDate), got)
+	}
+}
+
+func TestFsExtractZipPreservesDirectoryDateAfterChildren(t *testing.T) {
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "dated-dir.zip")
+	dirStamp := time.Date(2024, 1, 2, 3, 4, 6, 0, time.Local)
+	fileStamp := time.Date(2024, 1, 3, 4, 5, 8, 0, time.Local)
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	dirHeader := &zip.FileHeader{Name: "dir/"}
+	dirHeader.SetModTime(dirStamp)
+	if _, err := zw.CreateHeader(dirHeader); err != nil {
+		t.Fatal(err)
+	}
+	fileHeader := &zip.FileHeader{Name: "dir/a.txt", Method: zip.Store}
+	fileHeader.SetModTime(fileStamp)
+	w, err := zw.CreateHeader(fileHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("aaa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := listArchiveEntries(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expectedDirDate time.Time
+	for _, entry := range entries {
+		if entry.Name == "dir/" {
+			expectedDirDate = entry.Date.Local()
+		}
+	}
+	if expectedDirDate.IsZero() {
+		t.Fatalf("expected dated dir entry, got %#v", entries)
+	}
+
+	var out bytes.Buffer
+	dst := filepath.Join(tmp, "out")
+	if err := run([]string{"fs", "extract", zipPath, dst}, &out); err != nil {
+		t.Fatalf("fs extract zip failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dst, "dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(info.ModTime()); got != formatAmigaDate(expectedDirDate) {
+		t.Fatalf("expected extracted dir date %q, got %q", formatAmigaDate(expectedDirDate), got)
+	}
+}
+
+func TestFsExtractTarPreservesDirectoryDateAfterChildren(t *testing.T) {
+	tmp := t.TempDir()
+	tarPath := filepath.Join(tmp, "dated-dir.tar")
+	dirStamp := time.Date(2024, 2, 2, 3, 4, 6, 0, time.Local)
+	fileStamp := time.Date(2024, 2, 3, 4, 5, 8, 0, time.Local)
+
+	f, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(f)
+	if err := tw.WriteHeader(&tar.Header{Name: "dir/", Typeflag: tar.TypeDir, Mode: 0o710, ModTime: dirStamp}); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("aaa")
+	if err := tw.WriteHeader(&tar.Header{Name: "dir/a.txt", Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(payload)), ModTime: fileStamp}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	dst := filepath.Join(tmp, "out")
+	if err := run([]string{"fs", "extract", tarPath, dst}, &out); err != nil {
+		t.Fatalf("fs extract tar failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dst, "dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(info.ModTime()); got != formatAmigaDate(dirStamp) {
+		t.Fatalf("expected extracted tar dir date %q, got %q", formatAmigaDate(dirStamp), got)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o710 {
+		t.Fatalf("expected extracted tar dir mode 710, got %o", info.Mode().Perm())
+	}
+	fileInfo, err := os.Stat(filepath.Join(dst, "dir", "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && fileInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("expected extracted tar file mode 600, got %o", fileInfo.Mode().Perm())
+	}
+
+	skipDst := filepath.Join(tmp, "skip")
+	out.Reset()
+	if err := run([]string{"fs", "extract", tarPath, skipDst, "--skip-attributes"}, &out); err != nil {
+		t.Fatalf("fs extract tar with skip-attributes failed: %v", err)
+	}
+	skipFileInfo, err := os.Stat(filepath.Join(skipDst, "dir", "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && skipFileInfo.Mode().Perm() == 0o600 {
+		t.Fatalf("did not expect skip-attributes tar file mode to preserve 600")
+	}
+}
+
+func TestFsExtractTarPreservesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows symlink creation depends on privileges")
+	}
+	tmp := t.TempDir()
+	tarPath := filepath.Join(tmp, "links.tar")
+	f, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(f)
+	payload := []byte("target")
+	if err := tw.WriteHeader(&tar.Header{Name: "target.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(payload))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "link.txt", Typeflag: tar.TypeSymlink, Linkname: "target.txt", Mode: 0o777}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	dst := filepath.Join(tmp, "out")
+	if err := run([]string{"fs", "extract", tarPath, dst}, &out); err != nil {
+		t.Fatalf("fs extract tar symlink failed: %v", err)
+	}
+	linkInfo, err := os.Lstat(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected extracted tar link to be symlink, got %s", linkInfo.Mode())
+	}
+	target, err := os.Readlink(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "target.txt" {
+		t.Fatalf("expected tar symlink target target.txt, got %q", target)
+	}
+}
+
+func TestFsExtractZipPreservesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows symlink creation depends on privileges")
+	}
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "links.zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	targetHeader := &zip.FileHeader{Name: "target.txt", Method: zip.Store}
+	targetHeader.SetMode(0o644)
+	w, err := zw.CreateHeader(targetHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("target")); err != nil {
+		t.Fatal(err)
+	}
+	linkHeader := &zip.FileHeader{Name: "link.txt", Method: zip.Store}
+	linkHeader.SetMode(os.ModeSymlink | 0o777)
+	w, err = zw.CreateHeader(linkHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("target.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	dst := filepath.Join(tmp, "out")
+	if err := run([]string{"fs", "extract", zipPath, dst}, &out); err != nil {
+		t.Fatalf("fs extract zip symlink failed: %v", err)
+	}
+	linkInfo, err := os.Lstat(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected extracted zip link to be symlink, got %s", linkInfo.Mode())
+	}
+	target, err := os.Readlink(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "target.txt" {
+		t.Fatalf("expected zip symlink target target.txt, got %q", target)
+	}
+}
+
+func TestArchiveListReportsTarAndZipSymlinks(t *testing.T) {
+	tmp := t.TempDir()
+	tarPath := filepath.Join(tmp, "links.tar")
+	f, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(f)
+	if err := tw.WriteHeader(&tar.Header{Name: "link.txt", Typeflag: tar.TypeSymlink, Linkname: "target.txt", Mode: 0o777}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "archive", "list", tarPath}, &out); err != nil {
+		t.Fatalf("archive list tar symlink failed: %v", err)
+	}
+	var tarListing struct {
+		Entries []archiveEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &tarListing); err != nil {
+		t.Fatal(err)
+	}
+	if len(tarListing.Entries) != 1 || !tarListing.Entries[0].IsSymlink || tarListing.Entries[0].LinkPath != "target.txt" {
+		t.Fatalf("unexpected tar symlink listing: %#v", tarListing.Entries)
+	}
+
+	zipPath := filepath.Join(tmp, "links.zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	linkHeader := &zip.FileHeader{Name: "link.txt", Method: zip.Store}
+	linkHeader.SetMode(os.ModeSymlink | 0o777)
+	w, err := zw.CreateHeader(linkHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("target.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "archive", "list", zipPath}, &out); err != nil {
+		t.Fatalf("archive list zip symlink failed: %v", err)
+	}
+	var zipListing struct {
+		Entries []archiveEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &zipListing); err != nil {
+		t.Fatal(err)
+	}
+	if len(zipListing.Entries) != 1 || !zipListing.Entries[0].IsSymlink || zipListing.Entries[0].LinkPath != "target.txt" {
+		t.Fatalf("unexpected zip symlink listing: %#v", zipListing.Entries)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "dir", zipPath}, &out); err != nil {
+		t.Fatalf("fs dir zip symlink failed: %v", err)
+	}
+	var fsListing struct {
+		Entries []fsDirLegacyStyleItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &fsListing); err != nil {
+		t.Fatal(err)
+	}
+	if len(fsListing.Entries) != 1 || fsListing.Entries[0].Kind != "softlink" || fsListing.Entries[0].LinkPath != "target.txt" {
+		t.Fatalf("unexpected fs dir zip symlink listing: %#v", fsListing.Entries)
 	}
 }
 
@@ -3508,11 +4159,49 @@ func TestFsDirPartitionContainers(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if err := run([]string{"fs", "dir", media + `\rdb`}, &out); err != nil {
+	if err := run([]string{"--format", "json", "fs", "dir", media + `\rdb`}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "1") {
+	if !strings.Contains(out.String(), `"name": "1"`) || !strings.Contains(out.String(), `"formattedName": "DH0"`) || !strings.Contains(out.String(), `"selector": "DH0"`) {
 		t.Fatalf("expected rdb partition listing, got: %q", out.String())
+	}
+}
+
+func TestNamedPartitionSelectorsResolveForRead(t *testing.T) {
+	tmp := t.TempDir()
+	media := filepath.Join(tmp, "named-parts.img")
+	outFile := filepath.Join(tmp, "part.bin")
+	var out bytes.Buffer
+
+	if err := run([]string{"blank", media, "8MB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"gpt", "part", "add", media, "linux", "DATA", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"read", media + `\gpt\DATA`, outFile, "--size", "512"}, &out); err != nil {
+		t.Fatalf("read named GPT partition failed: %v", err)
+	}
+	if info, err := os.Stat(outFile); err != nil || info.Size() != 512 {
+		t.Fatalf("expected named GPT read output size 512, info=%v err=%v", info, err)
+	}
+
+	if err := run([]string{"rdb", "init", media}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"rdb", "part", "add", media, "DH0", "PDS3", "32KB"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"read", media + `\rdb\dh0`, outFile, "--size", "512"}, &out); err != nil {
+		t.Fatalf("read named RDB partition failed: %v", err)
+	}
+	if info, err := os.Stat(outFile); err != nil || info.Size() != 512 {
+		t.Fatalf("expected named RDB read output size 512, info=%v err=%v", info, err)
 	}
 }
 
@@ -4057,12 +4746,15 @@ func TestFsCopyPropagatesSourceUaeMetafileProperties(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dst, "safe.txt")); err != nil {
 		t.Fatalf("expected copied file safe.txt: %v", err)
 	}
-	gotPb, gotComment, err := readUaeMetafile(filepath.Join(dst, "safe.txt.uaem"))
+	gotPb, gotDate, gotComment, err := readUaeMetafile(filepath.Join(dst, "safe.txt.uaem"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotPb == nil || *gotPb != pb {
 		t.Fatalf("expected uaem protection bits %d, got %#v", pb, gotPb)
+	}
+	if !gotDate.Equal(date) {
+		t.Fatalf("expected uaem date %s, got %s", date, gotDate)
 	}
 	if gotComment != "source comment" {
 		t.Fatalf("expected source comment, got %q", gotComment)
@@ -4275,6 +4967,12 @@ func TestFsDirReadsUaeMetafileMetadata(t *testing.T) {
 	if entry.Comment != "note" {
 		t.Fatalf("expected note comment, got %q", entry.Comment)
 	}
+	if entry.Date != formatAmigaDate(date) {
+		t.Fatalf("expected uaemetafile date %q, got %q", formatAmigaDate(date), entry.Date)
+	}
+	if entry.Attributes != formatAmigaProtectionBits(pb) {
+		t.Fatalf("expected attributes %q, got %q", formatAmigaProtectionBits(pb), entry.Attributes)
+	}
 }
 
 func TestFsDirRecursiveUsesUaeMetadataPathMapping(t *testing.T) {
@@ -4407,6 +5105,79 @@ func TestFsCopyResolvesUaeMetafileSourcePath(t *testing.T) {
 	}
 }
 
+func TestFsDeleteLocalFileJson(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "delete-me.txt")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "delete", path}, &out); err != nil {
+		t.Fatalf("fs delete failed: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected deleted file to be gone, stat err=%v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, out.String())
+	}
+	if payload["status"] != "deleted" || payload["path"] != path {
+		t.Fatalf("unexpected delete payload: %+v", payload)
+	}
+}
+
+func TestFsDeleteRecursiveDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "dir")
+	if err := os.MkdirAll(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "child", "file.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "delete", dir, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs delete --recursive failed: %v", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected deleted directory to be gone, stat err=%v", err)
+	}
+}
+
+func TestFsRenameLocalFileJson(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "old.txt")
+	dst := filepath.Join(tmp, "new.txt")
+	if err := os.WriteFile(src, []byte("renamed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "rename", src, dst}, &out); err != nil {
+		t.Fatalf("fs rename failed: %v", err)
+	}
+	if _, err := os.Lstat(src); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected source to be gone, stat err=%v", err)
+	}
+	b, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("expected destination file: %v", err)
+	}
+	if string(b) != "renamed" {
+		t.Fatalf("unexpected destination content: %q", b)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, out.String())
+	}
+	if payload["status"] != "renamed" || payload["source"] != src || payload["destination"] != dst {
+		t.Fatalf("unexpected rename payload: %+v", payload)
+	}
+}
+
 func TestFsCopyLegacyBridgePassthrough(t *testing.T) {
 	tmp := t.TempDir()
 	source := filepath.Join(tmp, "source")
@@ -4431,6 +5202,120 @@ func TestFsCopyLegacyBridgePassthrough(t *testing.T) {
 	}
 	gotArgs := splitRecordedArgsLines(b)
 	wantArgs := []string{"fs", "copy", source, destination, "--recursive", "--uaemetadata", "uaefsdb"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func TestFsCopyIntoVirtualPathFallsBackToLegacy(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	destination := filepath.Join(tmp, "disk.img") + `\rdb\1\C`
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-copy-in")
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "auto")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", source, destination, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("legacy fs copy fallback failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-copy-in") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := splitRecordedArgsLines(b)
+	wantArgs := []string{"fs", "copy", source, destination, "--uaemetadata", "uaefsdb"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func TestFsDeleteVirtualPathFallsBackToLegacy(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "disk.img") + `\rdb\1\delete-me`
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-delete")
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "auto")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "delete", source, "--recursive"}, &out); err != nil {
+		t.Fatalf("legacy fs delete fallback failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-delete") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := splitRecordedArgsLines(b)
+	wantArgs := []string{"fs", "delete", source, "--recursive"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func TestFsRenameVirtualPathFallsBackToLegacy(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "disk.img") + `\rdb\1\old`
+	destination := filepath.Join(tmp, "disk.img") + `\rdb\1\new`
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-rename")
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "auto")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "rename", source, destination, "--force"}, &out); err != nil {
+		t.Fatalf("legacy fs rename fallback failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-rename") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := splitRecordedArgsLines(b)
+	wantArgs := []string{"fs", "rename", source, destination, "--force"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func TestFsMkLinkLegacyBridgePassthrough(t *testing.T) {
+	tmp := t.TempDir()
+	from := filepath.Join(tmp, "disk.img") + `\rdb\1\link.txt`
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-mklink")
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "force")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "mklink", from, "file.txt"}, &out); err != nil {
+		t.Fatalf("legacy fs mklink failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-mklink") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := splitRecordedArgsLines(b)
+	wantArgs := []string{"fs", "mklink", from, "file.txt"}
 	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
 		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
 	}
@@ -4489,4 +5374,474 @@ func TestLegacyBridgeForceRoutesSettingsCommand(t *testing.T) {
 	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
 		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
 	}
+}
+
+func TestParsePartitionPathWithRemainderUsesDeepestSelector(t *testing.T) {
+	base, table, index, remainder, ok := parsePartitionPathWithRemainder(`/tmp/hybrid.img\mbr\2\rdb\1\C`)
+	if !ok {
+		t.Fatal("expected partition path with remainder")
+	}
+	if base != `/tmp/hybrid.img\mbr\2` || table != "rdb" || index != 1 || remainder != "C" {
+		t.Fatalf("unexpected parse result: base=%q table=%q index=%d remainder=%q", base, table, index, remainder)
+	}
+}
+
+func TestPfs3ReaderListsRootAndSubdirectory(t *testing.T) {
+	tmp := t.TempDir()
+	imagePath := filepath.Join(tmp, "pfs3.img")
+	if err := os.WriteFile(imagePath, buildMinimalPfs3ImageForTest(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	region := partitionRegion{BasePath: imagePath, Offset: 0, Size: int64(len(buildMinimalPfs3ImageForTest()))}
+
+	rootEntries, handled, err := listPfs3PartitionDir(region, nil, imagePath+`\rdb\1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("expected PFS3 reader to handle fixture")
+	}
+	if len(rootEntries) != 3 {
+		t.Fatalf("expected 3 root entries, got %d: %#v", len(rootEntries), rootEntries)
+	}
+	if rootEntries[0].Name != "Dir" || rootEntries[0].Type != "dir" {
+		t.Fatalf("expected first root entry Dir dir, got %#v", rootEntries[0])
+	}
+	if rootEntries[1].Name != "file.txt" || rootEntries[1].Type != "file" || rootEntries[1].Size != 23 || rootEntries[1].Comment != "hello" || rootEntries[1].Attributes != "------E-" || rootEntries[1].Date != "1978-01-02T01:02:03" {
+		t.Fatalf("expected file.txt metadata, got %#v", rootEntries[1])
+	}
+	if rootEntries[2].Name != "link.txt" || rootEntries[2].Type != "linkfile" || rootEntries[2].LinkPath != "file.txt" {
+		t.Fatalf("expected link.txt metadata, got %#v", rootEntries[2])
+	}
+
+	subEntries, handled, err := listPfs3PartitionDir(region, []string{"Dir"}, imagePath+`\rdb\1\Dir`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("expected PFS3 reader to handle subdirectory fixture")
+	}
+	if len(subEntries) != 1 || subEntries[0].Name != "nested" || subEntries[0].Type != "file" || subEntries[0].Size != 7 {
+		t.Fatalf("unexpected subdirectory entries: %#v", subEntries)
+	}
+
+	reader, err := newPfs3Reader(bytes.NewReader(buildMinimalPfs3ImageForTest()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := reader.findPathEntry([]string{"file.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := reader.readFileByAnode(entry.anode, entry.size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello from pfs3 fixture" {
+		t.Fatalf("unexpected file content %q", string(data))
+	}
+	metadataDir := filepath.Join(tmp, "pfs3-meta")
+	if _, err := writePfs3ExtractedFile(metadataDir, entry, data, fsPathOptions{uaeMetadata: "uaemetafile"}); err != nil {
+		t.Fatalf("write PFS3 extracted file with metadata failed: %v", err)
+	}
+	metadataBytes, err := os.ReadFile(filepath.Join(metadataDir, "file.txt.uaem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metadataBytes), "1978-01-02 01:02:03.00") {
+		t.Fatalf("expected PFS3 DateStamp in uaemetafile, got %q", string(metadataBytes))
+	}
+	metadataFileInfo, err := os.Stat(filepath.Join(metadataDir, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(metadataFileInfo.ModTime()); got != "1978-01-02T01:02:03" {
+		t.Fatalf("expected PFS3 extracted file mtime DateStamp, got %q", got)
+	}
+	fsdbDir := filepath.Join(tmp, "pfs3-uaefsdb")
+	if _, err := writePfs3ExtractedFile(fsdbDir, entry, data, fsPathOptions{uaeMetadata: "uaefsdb"}); err != nil {
+		t.Fatalf("write PFS3 extracted file with uaefsdb failed: %v", err)
+	}
+	fsdbFileInfo, err := os.Stat(filepath.Join(fsdbDir, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(fsdbFileInfo.ModTime()); got != "1978-01-02T01:02:03" {
+		t.Fatalf("expected PFS3 uaefsdb host mtime DateStamp, got %q", got)
+	}
+}
+
+func TestAffsReaderListsRootSubdirectoryAndReadsFile(t *testing.T) {
+	image := buildMinimalAffsImageForTest(true)
+	reader, err := newAffsReader(bytes.NewReader(image), int64(len(image)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reader.listPath(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 root entries, got %d: %#v", len(entries), entries)
+	}
+	entry, err := reader.findPathEntry([]string{"file.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := reader.readFile(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello from affs fixture" {
+		t.Fatalf("unexpected file content %q", string(data))
+	}
+	link, err := reader.findPathEntry([]string{"link.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if link.entryType != -4 || link.linkPath != "file.txt" || link.size != 23 {
+		t.Fatalf("unexpected AFFS link entry: %#v", link)
+	}
+	data, err = reader.readFile(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello from affs fixture" {
+		t.Fatalf("unexpected link file content %q", string(data))
+	}
+	subEntries, err := reader.listPath([]string{"Dir"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subEntries) != 1 || subEntries[0].name != "nested" || subEntries[0].size != 6 {
+		t.Fatalf("unexpected subdirectory entries: %#v", subEntries)
+	}
+
+	tmp := t.TempDir()
+	imagePath := filepath.Join(tmp, "affs.img")
+	if err := os.WriteFile(imagePath, image, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items, handled, err := listAffsPartitionDir(partitionRegion{BasePath: imagePath, Size: int64(len(image))}, []string{"Dir"}, imagePath+`\rdb\1\Dir`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("expected AFFS reader to handle fixture")
+	}
+	if len(items) != 1 || items[0].Name != "nested" || items[0].RawPath != imagePath+`\rdb\1\Dir\nested` {
+		t.Fatalf("unexpected AFFS routed items: %#v", items)
+	}
+}
+
+func TestAffsAdfVirtualPathListsReadsAndCopies(t *testing.T) {
+	tmp := t.TempDir()
+	imagePath := filepath.Join(tmp, "disk.adf")
+	if err := os.WriteFile(imagePath, buildMinimalAffsImageForTest(true), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "dir", imagePath}, &out); err != nil {
+		t.Fatalf("fs dir ADF root failed: %v", err)
+	}
+	var rootListing struct {
+		Path    string      `json:"path"`
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &rootListing); err != nil {
+		t.Fatalf("unmarshal ADF root listing failed: %v", err)
+	}
+	byName := map[string]fsDirItem{}
+	for _, entry := range rootListing.Entries {
+		byName[entry.Name] = entry
+	}
+	if byName["Dir"].Type != "dir" || byName["Dir"].RawPath != imagePath+`\Dir` {
+		t.Fatalf("unexpected ADF dir entry: %#v", byName["Dir"])
+	}
+	if byName["file.txt"].Type != "file" || byName["file.txt"].Attributes != "------E-" || byName["file.txt"].Date != "1978-01-03T03:03:40" {
+		t.Fatalf("unexpected ADF file entry: %#v", byName["file.txt"])
+	}
+	if byName["link.txt"].Type != "linkfile" || byName["link.txt"].LinkPath != "file.txt" || byName["link.txt"].Attributes != "--------" {
+		t.Fatalf("unexpected ADF link entry: %#v", byName["link.txt"])
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "dir", imagePath + `\Dir`}, &out); err != nil {
+		t.Fatalf("fs dir ADF subdir failed: %v", err)
+	}
+	var subListing struct {
+		Entries []fsDirItem `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &subListing); err != nil {
+		t.Fatalf("unmarshal ADF subdir listing failed: %v", err)
+	}
+	if len(subListing.Entries) != 1 || subListing.Entries[0].Name != "nested" || subListing.Entries[0].RawPath != imagePath+`\Dir\nested` {
+		t.Fatalf("unexpected ADF subdir listing: %#v", subListing.Entries)
+	}
+
+	readPath := filepath.Join(tmp, "link-copy.txt")
+	out.Reset()
+	if err := run([]string{"read", imagePath + `\link.txt`, readPath}, &out); err != nil {
+		t.Fatalf("read ADF link file failed: %v", err)
+	}
+	readData, err := os.ReadFile(readPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(readData) != "hello from affs fixture" {
+		t.Fatalf("unexpected ADF read data: %q", string(readData))
+	}
+
+	copyDir := filepath.Join(tmp, "copy")
+	if err := os.MkdirAll(copyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "copy", imagePath + `\link.txt`, copyDir, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs copy ADF file failed: %v", err)
+	}
+	copiedData, err := os.ReadFile(filepath.Join(copyDir, "link.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(copiedData) != "hello from affs fixture" {
+		t.Fatalf("unexpected copied ADF data: %q", string(copiedData))
+	}
+	if _, err := os.Stat(filepath.Join(copyDir, "_UAEFSDB.___")); err != nil {
+		t.Fatalf("expected UAE metadata for copied ADF file: %v", err)
+	}
+	fsdbDateDir := filepath.Join(tmp, "uaefsdb-date-copy")
+	if err := os.MkdirAll(fsdbDateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "copy", imagePath + `\file.txt`, fsdbDateDir, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("fs copy ADF file with uaefsdb failed: %v", err)
+	}
+	fsdbFileInfo, err := os.Stat(filepath.Join(fsdbDateDir, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(fsdbFileInfo.ModTime()); got != "1978-01-03T03:03:40" {
+		t.Fatalf("expected AFFS uaefsdb host mtime DateStamp, got %q", got)
+	}
+
+	metafileDir := filepath.Join(tmp, "metafile-copy")
+	if err := os.MkdirAll(metafileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"fs", "copy", imagePath + `\file.txt`, metafileDir, "--uaemetadata", "uaemetafile"}, &out); err != nil {
+		t.Fatalf("fs copy ADF file with uaemetafile failed: %v", err)
+	}
+	metadataBytes, err := os.ReadFile(filepath.Join(metafileDir, "file.txt.uaem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metadataBytes), "1978-01-03 03:03:40.00") {
+		t.Fatalf("expected AFFS DateStamp in uaemetafile, got %q", string(metadataBytes))
+	}
+	metadataFileInfo, err := os.Stat(filepath.Join(metafileDir, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatAmigaDate(metadataFileInfo.ModTime()); got != "1978-01-03T03:03:40" {
+		t.Fatalf("expected AFFS extracted file mtime DateStamp, got %q", got)
+	}
+
+	extractDir := filepath.Join(tmp, "extract")
+	out.Reset()
+	if err := run([]string{"fs", "extract", imagePath + `\Dir`, extractDir, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract ADF directory failed: %v", err)
+	}
+	extractedData, err := os.ReadFile(filepath.Join(extractDir, "nested"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(extractedData) != "inside" {
+		t.Fatalf("unexpected extracted ADF data: %q", string(extractedData))
+	}
+}
+
+func TestFsCopyIntoAdfVirtualPathFallsBackToLegacy(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	destination := filepath.Join(tmp, "disk.adf") + `\C`
+	argsFile := filepath.Join(tmp, "args.txt")
+	legacyScript := writeLegacyBridgeStub(t, tmp, argsFile, "legacy-adf-copy-in")
+
+	t.Setenv("HST_IMAGER_LEGACY_MODE", "auto")
+	t.Setenv("HST_IMAGER_LEGACY_BIN", legacyScript)
+
+	var out bytes.Buffer
+	if err := run([]string{"fs", "copy", source, destination, "--uaemetadata", "uaefsdb"}, &out); err != nil {
+		t.Fatalf("legacy ADF fs copy fallback failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "legacy-adf-copy-in") {
+		t.Fatalf("expected legacy output, got: %q", out.String())
+	}
+
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotArgs := splitRecordedArgsLines(b)
+	wantArgs := []string{"fs", "copy", source, destination, "--uaemetadata", "uaefsdb"}
+	if strings.Join(gotArgs, "\n") != strings.Join(wantArgs, "\n") {
+		t.Fatalf("unexpected passthrough args:\nwant=%q\ngot=%q", wantArgs, gotArgs)
+	}
+}
+
+func buildMinimalPfs3ImageForTest() []byte {
+	image := make([]byte, 16*pfs3BlockSize)
+	root := image[pfs3RootBlock*pfs3BlockSize : (pfs3RootBlock+1)*pfs3BlockSize]
+	writeBeU32(root, 0, pfs3DiskIDPFS1)
+	writeBeU32(root, 4, pfs3ModeDirExtension)
+	root[20] = 4
+	copy(root[21:], []byte("Test"))
+	writeBeU16(root, 64, pfs3BlockSize)
+	writeBeU16(root, 66, 1)
+	writeBeU32(root, 96+5*4, 3)
+
+	index := image[3*pfs3BlockSize : 4*pfs3BlockSize]
+	writeBeU16(index, 0, pfs3IndexBlockID)
+	writeBeU32(index, 12, 4)
+
+	anodes := image[4*pfs3BlockSize : 5*pfs3BlockSize]
+	writeBeU16(anodes, 0, pfs3AnodeBlockID)
+	writePfs3AnodeForTest(anodes, 5, 1, 5, 0)
+	writePfs3AnodeForTest(anodes, 6, 1, 6, 0)
+	writePfs3AnodeForTest(anodes, 7, 1, 7, 0)
+	writePfs3AnodeForTest(anodes, 8, 1, 8, 0)
+
+	rootDir := image[5*pfs3BlockSize : 6*pfs3BlockSize]
+	writeBeU16(rootDir, 0, pfs3DirBlockID)
+	writeBeU32(rootDir, 12, pfs3AnodeRootDir)
+	off := 20
+	off += writePfs3DirEntryForTest(rootDir, off, 2, 6, 0, 0, "Dir", "")
+	off += writePfs3DirEntryForTest(rootDir, off, -3, 7, 23, 2, "file.txt", "hello")
+	off += writePfs3DirEntryWithLinkForTest(rootDir, off, -4, 9, 7, 23, 2, "link.txt", "")
+	rootDir[off] = 0
+
+	subDir := image[6*pfs3BlockSize : 7*pfs3BlockSize]
+	writeBeU16(subDir, 0, pfs3DirBlockID)
+	writeBeU32(subDir, 12, 6)
+	off = 20
+	off += writePfs3DirEntryForTest(subDir, off, -3, 8, 7, 0, "nested", "")
+	subDir[off] = 0
+	copy(image[7*pfs3BlockSize:], []byte("hello from pfs3 fixture"))
+	copy(image[8*pfs3BlockSize:], []byte("nested!"))
+	return image
+}
+
+func writePfs3AnodeForTest(block []byte, index int, clusterSize, blockNr, next uint32) {
+	off := 16 + index*12
+	writeBeU32(block, off, clusterSize)
+	writeBeU32(block, off+4, blockNr)
+	writeBeU32(block, off+8, next)
+}
+
+func writePfs3DirEntryForTest(block []byte, off int, entryType int8, anode uint32, size uint32, protection byte, name, comment string) int {
+	return writePfs3DirEntryWithLinkForTest(block, off, entryType, anode, 0, size, protection, name, comment)
+}
+
+func writePfs3DirEntryWithLinkForTest(block []byte, off int, entryType int8, anode uint32, linkAnode uint32, size uint32, protection byte, name, comment string) int {
+	nameBytes := []byte(name)
+	commentBytes := []byte(comment)
+	extraSize := 2
+	if linkAnode != 0 {
+		extraSize = 4
+	}
+	length := 18 + len(nameBytes) + 1 + len(commentBytes) + extraSize
+	if length%2 != 0 {
+		length++
+	}
+	block[off] = byte(length)
+	block[off+1] = byte(entryType)
+	writeBeU32(block, off+2, anode)
+	writeBeU32(block, off+6, size)
+	writeBeU16(block, off+10, 1)
+	writeBeU16(block, off+12, 62)
+	writeBeU16(block, off+14, 150)
+	block[off+16] = protection
+	block[off+17] = byte(len(nameBytes))
+	copy(block[off+18:], nameBytes)
+	commentOff := off + 18 + len(nameBytes)
+	block[commentOff] = byte(len(commentBytes))
+	copy(block[commentOff+1:], commentBytes)
+	if linkAnode != 0 {
+		writeBeU16(block, off+length-4, uint16(linkAnode))
+		writeBeU16(block, off+length-2, 0x0002)
+	} else {
+		writeBeU16(block, off+length-2, 0)
+	}
+	return length
+}
+
+func buildMinimalAffsImageForTest(ffs bool) []byte {
+	const bs = 512
+	image := make([]byte, 16*bs)
+	copy(image[:3], []byte("DOS"))
+	if ffs {
+		image[3] = 1
+	}
+	root := image[8*bs : 9*bs]
+	writeAffsDirectoryBlockForTest(root, bs, 8, affsSecRoot, "Test")
+	writeBeU32(root, 24, 5)
+	writeBeU32(root, 28, 6)
+	writeBeU32(root, 32, 11)
+
+	file := image[5*bs : 6*bs]
+	writeAffsFileHeaderForTest(file, bs, 5, "file.txt", 9, "hello from affs fixture", "note")
+	dir := image[6*bs : 7*bs]
+	writeAffsDirectoryBlockForTest(dir, bs, 6, affsSecUserDir, "Dir")
+	writeBeU32(dir, 24, 7)
+	nested := image[7*bs : 8*bs]
+	writeAffsFileHeaderForTest(nested, bs, 7, "nested", 10, "inside", "")
+	link := image[11*bs : 12*bs]
+	writeAffsLinkHeaderForTest(link, bs, 11, "link.txt", 5)
+	copy(image[9*bs:10*bs], []byte("hello from affs fixture"))
+	copy(image[10*bs:11*bs], []byte("inside"))
+	return image
+}
+
+func writeAffsDirectoryBlockForTest(block []byte, blockSize int, own uint32, secType int32, name string) {
+	writeBeU32(block, 0, affsTypeHeader)
+	writeBeU32(block, 4, own)
+	writeBeU32(block, 12, uint32(blockSize/4-56))
+	writeAffsNameForTest(block, blockSize, name)
+	writeBeU32(block, blockSize-4, uint32(secType))
+}
+
+func writeAffsFileHeaderForTest(block []byte, blockSize int, own uint32, name string, dataBlock uint32, data string, comment string) {
+	writeBeU32(block, 0, affsTypeHeader)
+	writeBeU32(block, 4, own)
+	writeBeU32(block, 8, 1)
+	writeBeU32(block, 24+(blockSize/4-56-1)*4, dataBlock)
+	writeBeU32(block, blockSize-188, uint32(len(data)))
+	writeBeU32(block, blockSize-192, 2)
+	writeBeU32(block, blockSize-92, 2)
+	writeBeU32(block, blockSize-88, 183)
+	writeBeU32(block, blockSize-84, 2000)
+	writeAffsNameForTest(block, blockSize, name)
+	if comment != "" {
+		block[blockSize-184] = byte(len(comment))
+		copy(block[blockSize-183:], []byte(comment))
+	}
+	writeBeU32(block, blockSize-4, 0xfffffffd)
+}
+
+func writeAffsLinkHeaderForTest(block []byte, blockSize int, own uint32, name string, realEntry uint32) {
+	writeBeU32(block, 0, affsTypeHeader)
+	writeBeU32(block, 4, own)
+	writeBeU32(block, blockSize-44, realEntry)
+	writeBeU32(block, blockSize-12, 8)
+	writeAffsNameForTest(block, blockSize, name)
+	writeBeU32(block, blockSize-4, 0xfffffffc)
+}
+
+func writeAffsNameForTest(block []byte, blockSize int, name string) {
+	block[blockSize-80] = byte(len(name))
+	copy(block[blockSize-79:], []byte(name))
 }

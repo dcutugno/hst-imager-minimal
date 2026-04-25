@@ -127,6 +127,9 @@ func buildFsCommand() *Command {
 		{Name: "copy", Description: "Copy files or subdirectories."},
 		{Name: "extract", Description: "Extract files or subdirectories."},
 		{Name: "mkdir", Description: "Create directory."},
+		{Name: "mklink", Description: "Create Amiga filesystem link."},
+		{Name: "delete", Description: "Delete local files or directories."},
+		{Name: "rename", Description: "Rename local files or directories."},
 	}}
 }
 

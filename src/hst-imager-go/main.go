@@ -233,6 +233,12 @@ func run(args []string, stdout io.Writer) error {
 		return handleFsExtract(remaining, stdout, opts)
 	case "fs mkdir":
 		return handleFsMkdir(remaining, stdout, opts)
+	case "fs mklink":
+		return handleFsMkLink(remaining, stdout, opts)
+	case "fs delete":
+		return handleFsDelete(remaining, stdout, opts)
+	case "fs rename":
+		return handleFsRename(remaining, stdout, opts)
 	case "adf create":
 		return handleAdfCreate(remaining, stdout, opts)
 	case "archive list":
@@ -322,7 +328,7 @@ func isAutoLegacyBridgeCommand(consumedPath string) bool {
 		return true
 	case "settings list", "settings update":
 		return true
-	case "fs copy", "fs extract", "fs dir", "fs mkdir":
+	case "fs copy", "fs extract", "fs dir", "fs mkdir", "fs mklink", "fs delete", "fs rename":
 		return true
 	case "adf create", "archive list", "script":
 		return true
@@ -706,10 +712,30 @@ func handleFsDir(args []string, stdout io.Writer, opts GlobalOptions) error {
 		localOpts.Format = outputFormat
 		return handleFsDirArchive(archivePath, innerPath, stdout, localOpts)
 	}
+	if _, _, ok := parseAdfVirtualPath(path); ok {
+		localOpts := opts
+		localOpts.Format = outputFormat
+		items, handled, err := listAffsAdfDir(path)
+		if err != nil {
+			return err
+		}
+		if !handled {
+			return fmt.Errorf("no supported filesystem found at ADF path: %s", path)
+		}
+		return writeFsDirItems(path, items, stdout, localOpts)
+	}
 	if basePath, table, ok := parsePartitionContainerPath(path); ok {
 		localOpts := opts
 		localOpts.Format = outputFormat
 		return handleFsDirPartitionContainer(basePath, table, stdout, localOpts)
+	}
+	if _, _, _, remainder, ok := parsePartitionPathSelectorWithRemainder(path); ok {
+		localOpts := opts
+		localOpts.Format = outputFormat
+		if remainder != "" {
+			return handleFsDirPartitionFilesystemPath(path, stdout, localOpts)
+		}
+		return handleFsDirPartitionSelection(path, stdout, localOpts)
 	}
 	if fsOpts.uaeMetadata != "none" {
 		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(path, fsOpts.uaeMetadata); resolveErr == nil {
@@ -765,6 +791,11 @@ func parseFsDirInvocationArgs(args []string, defaultFormat string) (path string,
 type fsDirItem struct {
 	Name           string `json:"name"`
 	Type           string `json:"type"`
+	Size           int64  `json:"size,omitempty"`
+	RawPath        string `json:"rawPath,omitempty"`
+	LinkPath       string `json:"link,omitempty"`
+	Date           string `json:"date,omitempty"`
+	Attributes     string `json:"attributes,omitempty"`
 	ProtectionBits *int   `json:"protectionBits,omitempty"`
 	Comment        string `json:"comment,omitempty"`
 }
@@ -774,12 +805,15 @@ type fsDirLegacyStyleItem struct {
 	Type       int    `json:"type"`
 	Size       int64  `json:"size"`
 	Attributes string `json:"attributes,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	LinkPath   string `json:"link,omitempty"`
 }
 
 type uaeMetadataNodeInfo struct {
 	AmigaName      string
 	NormalName     string
 	ProtectionBits *int
+	Date           time.Time
 	Comment        string
 }
 
@@ -863,13 +897,37 @@ func listLocalFsDirLevel(dirPath, prefix, uaeMode string) ([]fsDirItem, error) {
 			continue
 		}
 
+		rawPath := filepath.Join(dirPath, e.Name())
+		info, err := os.Lstat(rawPath)
+		if err != nil {
+			return nil, err
+		}
+		size := int64(0)
+		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			size = info.Size()
+		}
+		linkPath := ""
+		if info.Mode()&os.ModeSymlink != 0 {
+			if target, err := os.Readlink(rawPath); err == nil {
+				linkPath = target
+			}
+		}
+
 		displayName := e.Name()
 		var protectionBits *int
+		entryDate := info.ModTime()
 		comment := ""
 		if node, ok := nodesByNormal[strings.ToLower(e.Name())]; ok {
 			displayName = node.AmigaName
 			protectionBits = node.ProtectionBits
+			if !node.Date.IsZero() {
+				entryDate = node.Date
+			}
 			comment = node.Comment
+		}
+		attributes := ""
+		if protectionBits != nil {
+			attributes = formatAmigaProtectionBits(*protectionBits)
 		}
 
 		if prefix != "" {
@@ -877,12 +935,19 @@ func listLocalFsDirLevel(dirPath, prefix, uaeMode string) ([]fsDirItem, error) {
 		}
 
 		itemType := "file"
-		if e.IsDir() {
+		if info.Mode()&os.ModeSymlink != 0 {
+			itemType = "softlink"
+		} else if info.IsDir() {
 			itemType = "dir"
 		}
 		items = append(items, fsDirItem{
 			Name:           displayName,
 			Type:           itemType,
+			Size:           size,
+			RawPath:        rawPath,
+			LinkPath:       linkPath,
+			Date:           formatAmigaDate(entryDate),
+			Attributes:     attributes,
 			ProtectionBits: protectionBits,
 			Comment:        comment,
 		})
@@ -922,7 +987,7 @@ func readUaeMetadataNodesByNormalName(dirPath, uaeMode string) (map[string]uaeMe
 			}
 			normalName := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
 			amigaName := decodeFilenameForUaeMetafile(normalName)
-			protectionBits, comment, err := readUaeMetafile(filepath.Join(dirPath, e.Name()))
+			protectionBits, date, comment, err := readUaeMetafile(filepath.Join(dirPath, e.Name()))
 			if err != nil {
 				return nil, err
 			}
@@ -930,6 +995,7 @@ func readUaeMetadataNodesByNormalName(dirPath, uaeMode string) (map[string]uaeMe
 				AmigaName:      amigaName,
 				NormalName:     normalName,
 				ProtectionBits: protectionBits,
+				Date:           date,
 				Comment:        comment,
 			}
 		}
@@ -1078,16 +1144,20 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 	type item struct {
 		Name       string
 		IsDir      bool
+		IsSymlink  bool
 		Size       int64
 		Attributes string
+		LinkPath   string
 	}
 	type aggregateItem struct {
-		name           string
-		hasDirect      bool
-		hasChildren    bool
-		directIsDir    bool
-		directSize     int64
-		protectionBits *int
+		name            string
+		hasDirect       bool
+		hasChildren     bool
+		directIsDir     bool
+		directIsSymlink bool
+		directSize      int64
+		protectionBits  *int
+		linkPath        string
 	}
 	aggregates := make(map[string]*aggregateItem)
 	prefix := normalizeArchivePath(innerPath)
@@ -1116,7 +1186,9 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 		if len(parts) == 1 {
 			aggregate.hasDirect = true
 			aggregate.directIsDir = e.IsDir
+			aggregate.directIsSymlink = e.IsSymlink
 			aggregate.directSize = e.Size
+			aggregate.linkPath = e.LinkPath
 			if e.ProtectionBits != nil {
 				bits := *e.ProtectionBits
 				aggregate.protectionBits = &bits
@@ -1139,8 +1211,10 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 		items = append(items, item{
 			Name:       aggregate.name,
 			IsDir:      isDir,
+			IsSymlink:  aggregate.hasDirect && aggregate.directIsSymlink,
 			Size:       size,
 			Attributes: attributes,
+			LinkPath:   aggregate.linkPath,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
@@ -1151,11 +1225,17 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 			if i.IsDir {
 				typeValue = 0
 			}
+			kind := ""
+			if i.IsSymlink {
+				kind = "softlink"
+			}
 			jsonItems = append(jsonItems, fsDirLegacyStyleItem{
 				Name:       i.Name,
 				Type:       typeValue,
 				Size:       i.Size,
 				Attributes: i.Attributes,
+				Kind:       kind,
+				LinkPath:   i.LinkPath,
 			})
 		}
 		return writeJSON(stdout, map[string]any{"path": archivePath, "innerPath": innerPath, "entries": jsonItems})
@@ -1238,9 +1318,16 @@ func isSingleStreamCompressedPath(path string) bool {
 
 func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opts GlobalOptions) error {
 	type entry struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-		Size int64  `json:"size"`
+		Name          string `json:"name"`
+		FormattedName string `json:"formattedName,omitempty"`
+		RawPath       string `json:"rawPath,omitempty"`
+		Index         int    `json:"index,omitempty"`
+		Selector      string `json:"selector,omitempty"`
+		Type          string `json:"type"`
+		Size          int64  `json:"size"`
+		PartitionType string `json:"partitionType,omitempty"`
+		PartitionName string `json:"partitionName,omitempty"`
+		Bootable      bool   `json:"bootable,omitempty"`
 	}
 	items := make([]entry, 0)
 	switch table {
@@ -1250,10 +1337,18 @@ func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opt
 			return err
 		}
 		for _, p := range parts {
+			name := strconv.Itoa(p.Index)
+			typeName := mbrPartitionTypeName(p.TypeCode)
 			items = append(items, entry{
-				Name: strconv.Itoa(p.Index),
-				Type: "part",
-				Size: int64(p.SectorCount) * mbrSectorSize,
+				Name:          name,
+				FormattedName: fmt.Sprintf("%s %s", name, typeName),
+				RawPath:       basePath + `\` + table + `\` + name,
+				Index:         p.Index,
+				Selector:      name,
+				Type:          "part",
+				Size:          int64(p.SectorCount) * mbrSectorSize,
+				PartitionType: typeName,
+				Bootable:      p.Bootable,
 			})
 		}
 	case "gpt":
@@ -1262,22 +1357,50 @@ func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opt
 			return err
 		}
 		for _, p := range parts {
+			name := strconv.Itoa(p.Index)
+			formattedName := name
+			selector := name
+			partitionName := strings.TrimSpace(p.Name)
+			if strings.TrimSpace(p.Name) != "" {
+				formattedName = partitionName
+				selector = partitionName
+			}
 			items = append(items, entry{
-				Name: strconv.Itoa(p.Index),
-				Type: "part",
-				Size: int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
+				Name:          name,
+				FormattedName: formattedName,
+				RawPath:       basePath + `\` + table + `\` + name,
+				Index:         p.Index,
+				Selector:      selector,
+				Type:          "part",
+				Size:          int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
+				PartitionType: gptGUIDToString(p.TypeGUID),
+				PartitionName: partitionName,
 			})
 		}
 	case "rdb":
-		state, err := readRdbState(basePath)
+		state, err := readRdbStateFromPathOrPartition(basePath)
 		if err != nil {
 			return err
 		}
 		for _, p := range state.Parts {
+			name := strconv.Itoa(p.Index)
+			formattedName := name
+			selector := name
+			partitionName := strings.TrimSpace(p.Name)
+			if strings.TrimSpace(p.Name) != "" {
+				formattedName = partitionName
+				selector = partitionName
+			}
 			items = append(items, entry{
-				Name: strconv.Itoa(p.Index),
-				Type: "part",
-				Size: p.Size,
+				Name:          name,
+				FormattedName: formattedName,
+				RawPath:       basePath + `\` + table + `\` + name,
+				Index:         p.Index,
+				Selector:      selector,
+				Type:          "part",
+				Size:          p.Size,
+				PartitionType: p.Type,
+				PartitionName: partitionName,
 			})
 		}
 	default:
@@ -1294,9 +1417,156 @@ func handleFsDirPartitionContainer(basePath, table string, stdout io.Writer, opt
 		return nil
 	}
 	for _, i := range items {
-		fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", i.Type, i.Name, i.Size)
+		name := i.Name
+		if i.FormattedName != "" && i.FormattedName != i.Name {
+			name += " " + i.FormattedName
+		}
+		fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", i.Type, name, i.Size)
 	}
 	return nil
+}
+
+func handleFsDirPartitionSelection(path string, stdout io.Writer, opts GlobalOptions) error {
+	type entry struct {
+		Name          string `json:"name"`
+		FormattedName string `json:"formattedName,omitempty"`
+		RawPath       string `json:"rawPath,omitempty"`
+		Type          string `json:"type"`
+		Size          int64  `json:"size"`
+	}
+	region, ok, err := resolvePartitionSelection(path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("partition path not found: %s", path)
+	}
+	items := make([]entry, 0)
+	if partitionRegionHasRdb(region) {
+		items = append(items, entry{
+			Name:          "RDB",
+			FormattedName: "RDB",
+			RawPath:       path + `\rdb`,
+			Type:          "container",
+			Size:          region.Size,
+		})
+	}
+	if len(items) == 0 {
+		if pfsItems, handled, err := listPfs3PartitionDir(region, nil, path); err != nil {
+			return err
+		} else if handled {
+			return writeFsDirItems(path, pfsItems, stdout, opts)
+		}
+		if affsItems, handled, err := listAffsPartitionDir(region, nil, path); err != nil {
+			return err
+		} else if handled {
+			return writeFsDirItems(path, affsItems, stdout, opts)
+		}
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{
+			"path":    path,
+			"entries": items,
+		})
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(stdout, "No supported filesystem containers.")
+		return nil
+	}
+	for _, i := range items {
+		fmt.Fprintf(stdout, "- %-4s %s (%d bytes)\n", i.Type, firstNonEmpty(i.FormattedName, i.Name), i.Size)
+	}
+	return nil
+}
+
+func handleFsDirPartitionFilesystemPath(fullPath string, stdout io.Writer, opts GlobalOptions) error {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(fullPath)
+	if !ok {
+		return fmt.Errorf("partition path not found: %s", fullPath)
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("partition path not found: %s", partitionPath)
+	}
+	components := splitVirtualPathComponents(remainder)
+	items, handled, err := listPfs3PartitionDir(region, components, fullPath)
+	if err != nil {
+		return err
+	}
+	if !handled {
+		items, handled, err = listAffsPartitionDir(region, components, fullPath)
+		if err != nil {
+			return err
+		}
+	}
+	if !handled {
+		return fmt.Errorf("no supported filesystem found at partition path: %s", partitionPath)
+	}
+	return writeFsDirItems(fullPath, items, stdout, opts)
+}
+
+func writeFsDirItems(path string, items []fsDirItem, stdout io.Writer, opts GlobalOptions) error {
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{"path": path, "entries": items})
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(stdout, "No entries.")
+		return nil
+	}
+	for _, i := range items {
+		fmt.Fprintf(stdout, "- %-4s %s\n", i.Type, i.Name)
+	}
+	return nil
+}
+
+func splitVirtualPathComponents(path string) []string {
+	path = strings.Trim(path, `\/`)
+	if path == "" {
+		return nil
+	}
+	raw := strings.FieldsFunc(path, func(r rune) bool { return r == '\\' || r == '/' })
+	components := make([]string, 0, len(raw))
+	for _, component := range raw {
+		if component == "" || component == "." {
+			continue
+		}
+		components = append(components, component)
+	}
+	return components
+}
+
+func isVirtualFilesystemPath(path string) bool {
+	_, _, _, remainder, ok := parsePartitionPathSelectorWithRemainder(path)
+	if ok && remainder != "" {
+		return true
+	}
+	_, remainder, ok = parseAdfVirtualPath(path)
+	return ok && remainder != ""
+}
+
+func runUnsupportedVirtualMutationOrLegacy(consumedPath string, args []string, stdout io.Writer, opts GlobalOptions, operation string) error {
+	if shouldAttemptLegacyMutationFallback() {
+		if err := runLegacyBridgeCommand(consumedPath, args, stdout, opts); err == nil {
+			return nil
+		} else if !errors.Is(err, errLegacyUnavailable) {
+			return err
+		}
+	}
+	return fmt.Errorf("%s is not implemented in pure Go yet; set HST_IMAGER_LEGACY_MODE=auto and HST_IMAGER_LEGACY_BIN to use the original backend for this mutation", operation)
+}
+
+func shouldAttemptLegacyMutationFallback() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HST_IMAGER_LEGACY_MODE")))
+	switch mode {
+	case "", "auto", "on", "force", "strict":
+		return true
+	default:
+		return false
+	}
 }
 
 func handleArchiveList(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -2183,6 +2453,30 @@ func openSourceReaderAt(path string, offset int64) (io.ReadCloser, error) {
 	}
 	if offset == 0 {
 		return openSourceReader(path)
+	}
+	if data, _, handled, err := readPfs3VirtualFile(path); err != nil {
+		return nil, err
+	} else if handled {
+		if offset > int64(len(data)) {
+			return nil, errors.New("source offset out of range")
+		}
+		return io.NopCloser(bytes.NewReader(data[offset:])), nil
+	}
+	if data, _, handled, err := readAffsVirtualFile(path); err != nil {
+		return nil, err
+	} else if handled {
+		if offset > int64(len(data)) {
+			return nil, errors.New("source offset out of range")
+		}
+		return io.NopCloser(bytes.NewReader(data[offset:])), nil
+	}
+	if data, _, handled, err := readAffsAdfVirtualFile(path); err != nil {
+		return nil, err
+	} else if handled {
+		if offset > int64(len(data)) {
+			return nil, errors.New("source offset out of range")
+		}
+		return io.NopCloser(bytes.NewReader(data[offset:])), nil
 	}
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
 		return nil, err
@@ -3233,34 +3527,164 @@ func parseBlockViewInvocation(args []string) (path string, offset int64, size in
 }
 
 func handleFsCopy(args []string, stdout io.Writer, opts GlobalOptions) error {
-	if len(args) < 2 {
-		return errors.New("usage: fs copy <source> <destination> [--recursive|-r [bool]] [--skip-attributes|-sa [bool]] [--quiet|-q [bool]] [--makedir|-md [bool]] [--force|-f [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
-	}
-	fsOpts, err := parseFsOptions(args[2:])
+	sources, destination, fsOpts, err := parseFsCopyInvocation(args)
 	if err != nil {
 		return err
 	}
-	sourcePath := args[0]
+	if isVirtualFilesystemPath(destination) {
+		return runUnsupportedVirtualMutationOrLegacy("fs copy", args, stdout, opts, "copying into Amiga filesystem images")
+	}
+	if len(sources) > 1 {
+		count, err := copyMultipleSourcesWithOptions(sources, destination, fsOpts)
+		if err != nil {
+			return err
+		}
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"sources":     sources,
+				"destination": destination,
+				"entries":     count,
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Copied %d entries from %d sources to '%s'.\n", count, len(sources), destination)
+		return nil
+	}
+	source := sources[0]
+	if handled, count, err := extractPfs3VirtualPath(source, destination, fsOpts); err != nil {
+		return err
+	} else if handled {
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      source,
+				"destination": destination,
+				"entries":     count,
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Copied %d entries from '%s' to '%s'.\n", count, source, destination)
+		return nil
+	}
+	if handled, count, err := extractAffsVirtualPath(source, destination, fsOpts); err != nil {
+		return err
+	} else if handled {
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      source,
+				"destination": destination,
+				"entries":     count,
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Copied %d entries from '%s' to '%s'.\n", count, source, destination)
+		return nil
+	}
+	if handled, count, err := extractAffsAdfVirtualPath(source, destination, fsOpts); err != nil {
+		return err
+	} else if handled {
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      source,
+				"destination": destination,
+				"entries":     count,
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Copied %d entries from '%s' to '%s'.\n", count, source, destination)
+		return nil
+	}
+	sourcePath := source
 	if fsOpts.uaeMetadata != "none" {
-		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(args[0], fsOpts.uaeMetadata); resolveErr == nil {
+		if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(source, fsOpts.uaeMetadata); resolveErr == nil {
 			sourcePath = resolvedPath
 		}
 	}
 
-	count, err := copyPathWithOptions(sourcePath, args[1], fsOpts)
+	count, err := copyPathWithOptions(sourcePath, destination, fsOpts)
 	if err != nil {
 		return err
 	}
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{
-			"source":      args[0],
-			"destination": args[1],
+			"source":      source,
+			"destination": destination,
 			"entries":     count,
 			"uaemetadata": fsOpts.uaeMetadata,
 		})
 	}
-	fmt.Fprintf(stdout, "Copied %d entries from '%s' to '%s'.\n", count, args[0], args[1])
+	fmt.Fprintf(stdout, "Copied %d entries from '%s' to '%s'.\n", count, source, destination)
 	return nil
+}
+
+func parseFsCopyInvocation(args []string) ([]string, string, fsPathOptions, error) {
+	if len(args) < 2 {
+		return nil, "", fsPathOptions{}, errors.New("usage: fs copy <source> <destination> [--recursive|-r [bool]] [--skip-attributes|-sa [bool]] [--quiet|-q [bool]] [--makedir|-md [bool]] [--force|-f [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
+	}
+	optionStart := len(args)
+	for i, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			optionStart = i
+			break
+		}
+	}
+	paths := args[:optionStart]
+	if len(paths) < 2 {
+		return nil, "", fsPathOptions{}, errors.New("usage: fs copy <source> <destination> [--recursive|-r [bool]] [--skip-attributes|-sa [bool]] [--quiet|-q [bool]] [--makedir|-md [bool]] [--force|-f [bool]] [--uaemetadata|-uae <none|uaefsdb|uaemetafile>]")
+	}
+	fsOpts, err := parseFsOptions(args[optionStart:])
+	if err != nil {
+		return nil, "", fsPathOptions{}, err
+	}
+	destination := paths[len(paths)-1]
+	return append([]string(nil), paths[:len(paths)-1]...), destination, fsOpts, nil
+}
+
+func copyMultipleSourcesWithOptions(sources []string, destination string, opts fsPathOptions) (int, error) {
+	if opts.makeDir {
+		if err := os.MkdirAll(destination, 0o755); err != nil {
+			return 0, err
+		}
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("destination must be a directory when copying multiple sources: %s", destination)
+	}
+	total := 0
+	for _, source := range sources {
+		if handled, count, err := extractPfs3VirtualPath(source, destination, opts); err != nil {
+			return total, err
+		} else if handled {
+			total += count
+			continue
+		}
+		if handled, count, err := extractAffsVirtualPath(source, destination, opts); err != nil {
+			return total, err
+		} else if handled {
+			total += count
+			continue
+		}
+		if handled, count, err := extractAffsAdfVirtualPath(source, destination, opts); err != nil {
+			return total, err
+		} else if handled {
+			total += count
+			continue
+		}
+		sourcePath := source
+		if opts.uaeMetadata != "none" {
+			if resolvedPath, resolveErr := resolveLocalPathWithUaeMetadata(source, opts.uaeMetadata); resolveErr == nil {
+				sourcePath = resolvedPath
+			}
+		}
+		count, err := copyPathWithOptions(sourcePath, destination, opts)
+		if err != nil {
+			return total, err
+		}
+		total += count
+	}
+	return total, nil
 }
 
 func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -3270,6 +3694,54 @@ func handleFsExtract(args []string, stdout io.Writer, opts GlobalOptions) error 
 	fsOpts, err := parseFsOptions(args[2:])
 	if err != nil {
 		return err
+	}
+	if isVirtualFilesystemPath(args[1]) {
+		return runUnsupportedVirtualMutationOrLegacy("fs extract", args, stdout, opts, "extracting into Amiga filesystem images")
+	}
+	if handled, count, err := extractPfs3VirtualPath(args[0], args[1], fsOpts); err != nil {
+		return err
+	} else if handled {
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      args[0],
+				"destination": args[1],
+				"entries":     count,
+				"status":      "extracted",
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
+		return nil
+	}
+	if handled, count, err := extractAffsVirtualPath(args[0], args[1], fsOpts); err != nil {
+		return err
+	} else if handled {
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      args[0],
+				"destination": args[1],
+				"entries":     count,
+				"status":      "extracted",
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
+		return nil
+	}
+	if handled, count, err := extractAffsAdfVirtualPath(args[0], args[1], fsOpts); err != nil {
+		return err
+	} else if handled {
+		if opts.Format == "json" {
+			return writeJSON(stdout, map[string]any{
+				"source":      args[0],
+				"destination": args[1],
+				"entries":     count,
+				"status":      "extracted",
+				"uaemetadata": fsOpts.uaeMetadata,
+			})
+		}
+		fmt.Fprintf(stdout, "Extracted '%s' to '%s'.\n", args[0], args[1])
+		return nil
 	}
 	if archivePath, innerPath, ok := splitArchivePath(args[0]); ok {
 		// Match legacy behavior: extracting archive root implies recursive extraction.
@@ -3337,6 +3809,9 @@ func handleFsMkdir(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 1 {
 		return errors.New("usage: fs mkdir <path>")
 	}
+	if isVirtualFilesystemPath(args[0]) {
+		return runUnsupportedVirtualMutationOrLegacy("fs mkdir", args, stdout, opts, "creating directories inside Amiga filesystem images")
+	}
 	if err := os.MkdirAll(args[0], 0o755); err != nil {
 		return err
 	}
@@ -3344,6 +3819,154 @@ func handleFsMkdir(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return writeJSON(stdout, map[string]any{"path": args[0], "status": "created"})
 	}
 	fmt.Fprintf(stdout, "Created directory '%s'.\n", args[0])
+	return nil
+}
+
+func handleFsMkLink(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) < 2 {
+		return errors.New("usage: fs mklink <from-path> <to-path>")
+	}
+	return runUnsupportedVirtualMutationOrLegacy("fs mklink", args, stdout, opts, "creating links inside Amiga filesystem images")
+}
+
+type fsDeleteOptions struct {
+	recursive bool
+	force     bool
+	quiet     bool
+}
+
+func handleFsDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) < 1 {
+		return errors.New("usage: fs delete <path> [--recursive|-r [bool]] [--force|-f [bool]] [--quiet|-q [bool]]")
+	}
+	deleteOpts, err := parseFsDeleteOptions(args[1:])
+	if err != nil {
+		return err
+	}
+	if isVirtualFilesystemPath(args[0]) {
+		return runUnsupportedVirtualMutationOrLegacy("fs delete", args, stdout, opts, "deleting entries inside Amiga filesystem images")
+	}
+
+	info, err := os.Lstat(args[0])
+	if err != nil {
+		if deleteOpts.force && errors.Is(err, os.ErrNotExist) {
+			return printFsMutationStatus(stdout, opts, deleteOpts.quiet, map[string]any{"path": args[0], "status": "missing"}, "Path '%s' does not exist.\n", args[0])
+		}
+		return err
+	}
+	if info.IsDir() && deleteOpts.recursive {
+		err = os.RemoveAll(args[0])
+	} else {
+		err = os.Remove(args[0])
+	}
+	if err != nil {
+		return err
+	}
+	return printFsMutationStatus(stdout, opts, deleteOpts.quiet, map[string]any{"path": args[0], "status": "deleted"}, "Deleted '%s'.\n", args[0])
+}
+
+type fsRenameOptions struct {
+	force bool
+	quiet bool
+}
+
+func handleFsRename(args []string, stdout io.Writer, opts GlobalOptions) error {
+	if len(args) < 2 {
+		return errors.New("usage: fs rename <source-path> <destination-path> [--force|-f [bool]] [--quiet|-q [bool]]")
+	}
+	renameOpts, err := parseFsRenameOptions(args[2:])
+	if err != nil {
+		return err
+	}
+	if isVirtualFilesystemPath(args[0]) || isVirtualFilesystemPath(args[1]) {
+		return runUnsupportedVirtualMutationOrLegacy("fs rename", args, stdout, opts, "renaming entries inside Amiga filesystem images")
+	}
+	if !renameOpts.force {
+		if _, err := os.Lstat(args[1]); err == nil {
+			return fmt.Errorf("destination already exists: %s", args[1])
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if info, err := os.Lstat(args[1]); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("destination already exists and is a directory: %s", args[1])
+		}
+		if err := os.Remove(args[1]); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(args[0], args[1]); err != nil {
+		return err
+	}
+	return printFsMutationStatus(stdout, opts, renameOpts.quiet, map[string]any{"source": args[0], "destination": args[1], "status": "renamed"}, "Renamed '%s' to '%s'.\n", args[0], args[1])
+}
+
+func parseFsDeleteOptions(args []string) (fsDeleteOptions, error) {
+	opts := fsDeleteOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--recursive", "-r":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--recursive")
+			if err != nil {
+				return opts, err
+			}
+			opts.recursive = value
+			i += consumed
+		case "--force", "-f":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
+			if err != nil {
+				return opts, err
+			}
+			opts.force = value
+			i += consumed
+		case "--quiet", "-q":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--quiet")
+			if err != nil {
+				return opts, err
+			}
+			opts.quiet = value
+			i += consumed
+		default:
+			return opts, fmt.Errorf("unsupported arguments: %s", strings.Join(args[i:], " "))
+		}
+	}
+	return opts, nil
+}
+
+func parseFsRenameOptions(args []string) (fsRenameOptions, error) {
+	opts := fsRenameOptions{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--force", "-f":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--force")
+			if err != nil {
+				return opts, err
+			}
+			opts.force = value
+			i += consumed
+		case "--quiet", "-q":
+			value, consumed, err := parseOptionalBoolFlag(args, i, "--quiet")
+			if err != nil {
+				return opts, err
+			}
+			opts.quiet = value
+			i += consumed
+		default:
+			return opts, fmt.Errorf("unsupported arguments: %s", strings.Join(args[i:], " "))
+		}
+	}
+	return opts, nil
+}
+
+func printFsMutationStatus(stdout io.Writer, opts GlobalOptions, quiet bool, payload map[string]any, format string, values ...any) error {
+	if opts.Format == "json" {
+		return writeJSON(stdout, payload)
+	}
+	if !quiet {
+		fmt.Fprintf(stdout, format, values...)
+	}
 	return nil
 }
 
@@ -3976,6 +4599,1567 @@ func parseMbrPartitionType(value string) (byte, error) {
 	default:
 		return 0, fmt.Errorf("unsupported partition type '%s'", value)
 	}
+}
+
+func mbrPartitionTypeName(typeCode byte) string {
+	switch typeCode {
+	case 0x01:
+		return "FAT12"
+	case 0x04:
+		return "FAT16 Small"
+	case 0x06:
+		return "FAT16"
+	case 0x07:
+		return "NTFS/exFAT"
+	case 0x0b:
+		return "FAT32"
+	case 0x0c:
+		return "FAT32 LBA"
+	case 0x0e:
+		return "FAT16 LBA"
+	case 0x0f:
+		return "Extended LBA"
+	case 0x76:
+		return "PiStorm RDB"
+	default:
+		return fmt.Sprintf("0x%02x", typeCode)
+	}
+}
+
+func partitionRegionHasRdb(region partitionRegion) bool {
+	if region.Size < 4 {
+		return false
+	}
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	header := make([]byte, rdbHeaderSize)
+	n, err := f.ReadAt(header, region.Offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	if n >= 8 && string(header[:8]) == rdbSignature {
+		return true
+	}
+	return n >= 4 && string(header[:4]) == "RDSK"
+}
+
+const (
+	pfs3BlockSize           = 512
+	pfs3RootBlock           = 2
+	pfs3AnodeRootDir        = 5
+	pfs3DiskIDPFS1          = 0x50465301
+	pfs3DiskIDPFS2          = 0x50465302
+	pfs3DirBlockID          = 0x4442
+	pfs3AnodeBlockID        = 0x4142
+	pfs3IndexBlockID        = 0x4942
+	pfs3SuperBlockID        = 0x5342
+	pfs3RootExtensionID     = 0x4558
+	pfs3ModeSplitAnodes     = 0x0002
+	pfs3ModeDirExtension    = 0x0004
+	pfs3ModeSuperIndex      = 0x0080
+	pfs3MaxSmallIndexNumber = 98
+)
+
+type pfs3Reader struct {
+	r                 io.ReaderAt
+	root              pfs3RootBlockInfo
+	reservedBlockSize int
+	resCluster        uint32
+	anodesPerBlock    uint32
+	indexPerBlock     uint32
+	splitAnodes       bool
+	dirExtension      bool
+	superIndex        bool
+	superIndexBlocks  []uint32
+}
+
+type pfs3RootBlockInfo struct {
+	diskType          uint32
+	options           uint32
+	name              string
+	reservedBlockSize uint16
+	rblkCluster       uint16
+	extension         uint32
+	indexBlocks       []uint32
+}
+
+type pfs3Anode struct {
+	clusterSize uint32
+	blockNr     uint32
+	next        uint32
+}
+
+type pfs3DirEntry struct {
+	name       string
+	entryType  int8
+	anode      uint32
+	linkAnode  uint32
+	size       int64
+	protection int
+	date       time.Time
+	comment    string
+	linkPath   string
+}
+
+func listPfs3PartitionDir(region partitionRegion, components []string, displayPath string) ([]fsDirItem, bool, error) {
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newPfs3Reader(section)
+	if err != nil {
+		if errors.Is(err, errNotPfs3) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	entries, err := reader.listPath(components)
+	if err != nil {
+		return nil, true, err
+	}
+	reader.resolvePfs3EntryLinkPaths(entries)
+	items := make([]fsDirItem, 0, len(entries))
+	for _, entry := range entries {
+		itemType := pfs3EntryTypeName(entry.entryType)
+		protection := entry.protection
+		items = append(items, fsDirItem{
+			Name:           entry.name,
+			Type:           itemType,
+			Size:           entry.size,
+			RawPath:        displayPath + `\` + entry.name,
+			LinkPath:       entry.linkPath,
+			Date:           formatAmigaDate(entry.date),
+			Attributes:     formatAmigaProtectionBits(protection),
+			ProtectionBits: &protection,
+			Comment:        entry.comment,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+	return items, true, nil
+}
+
+func openPfs3VirtualFile(fullPath string) (io.ReadCloser, bool, error) {
+	data, _, handled, err := readPfs3VirtualFile(fullPath)
+	if err != nil || !handled {
+		return nil, handled, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), true, nil
+}
+
+func readPfs3VirtualFile(fullPath string) ([]byte, pfs3DirEntry, bool, error) {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(fullPath)
+	if !ok || remainder == "" {
+		return nil, pfs3DirEntry{}, false, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return nil, pfs3DirEntry{}, false, err
+	}
+	if !ok {
+		return nil, pfs3DirEntry{}, false, nil
+	}
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return nil, pfs3DirEntry{}, false, err
+	}
+	defer f.Close()
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newPfs3Reader(section)
+	if err != nil {
+		if errors.Is(err, errNotPfs3) {
+			return nil, pfs3DirEntry{}, false, nil
+		}
+		return nil, pfs3DirEntry{}, true, err
+	}
+	components := splitVirtualPathComponents(remainder)
+	entry, err := reader.findPathEntry(components)
+	if err != nil {
+		return nil, pfs3DirEntry{}, true, err
+	}
+	if pfs3IsDirLike(entry) {
+		return nil, entry, true, fmt.Errorf("source is a directory, use --recursive")
+	}
+	data, err := reader.readFile(entry)
+	if err != nil {
+		return nil, entry, true, err
+	}
+	return data, entry, true, nil
+}
+
+func extractPfs3VirtualPath(source, destination string, opts fsPathOptions) (bool, int, error) {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(source)
+	if !ok || remainder == "" {
+		return false, 0, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return false, 0, err
+	}
+	if !ok {
+		return false, 0, nil
+	}
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return false, 0, err
+	}
+	defer f.Close()
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newPfs3Reader(section)
+	if err != nil {
+		if errors.Is(err, errNotPfs3) {
+			return false, 0, nil
+		}
+		return true, 0, err
+	}
+	components := splitVirtualPathComponents(remainder)
+	entry, err := reader.findPathEntry(components)
+	if err != nil {
+		return true, 0, err
+	}
+	if pfs3IsFileLike(entry) {
+		data, err := reader.readFile(entry)
+		if err != nil {
+			return true, 0, err
+		}
+		target := destination
+		if info, err := os.Stat(destination); err == nil && info.IsDir() {
+			if _, err := writePfs3ExtractedFile(destination, entry, data, opts); err != nil {
+				return true, 0, err
+			}
+			return true, 1, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil && filepath.Dir(target) != "." {
+			return true, 0, err
+		}
+		if err := os.WriteFile(target, data, 0o644); err != nil {
+			return true, 0, err
+		}
+		if err := setPathTimesIfAvailable(target, entry.date); err != nil {
+			return true, 0, err
+		}
+		if opts.uaeMetadata != "none" {
+			protection := entry.protection
+			if err := writeUaeMetadataForEntry(filepath.Dir(target), entry.name, filepath.Base(target), "file", opts.uaeMetadata, &protection, entry.comment, &entry.date); err != nil {
+				return true, 0, err
+			}
+		}
+		return true, 1, nil
+	}
+	if !opts.recursive {
+		return true, 0, errors.New("source is a directory, use --recursive")
+	}
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return true, 0, err
+	}
+	count, err := reader.extractDirectory(entry.anode, destination, opts)
+	return true, count, err
+}
+
+func writePfs3ExtractedFile(destinationDir string, entry pfs3DirEntry, data []byte, opts fsPathOptions) (string, error) {
+	mappedName, changed, _ := mapLocalNameForUae(entry.name, opts.uaeMetadata, destinationDir)
+	target := filepath.Join(destinationDir, mappedName)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil && filepath.Dir(target) != "." {
+		return "", err
+	}
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		return "", err
+	}
+	if err := setPathTimesIfAvailable(target, entry.date); err != nil {
+		return "", err
+	}
+	if changed || opts.uaeMetadata != "none" {
+		protection := entry.protection
+		if err := writeUaeMetadataForEntry(destinationDir, entry.name, mappedName, "file", opts.uaeMetadata, &protection, entry.comment, &entry.date); err != nil {
+			return "", err
+		}
+	}
+	return target, nil
+}
+
+func pfs3EntryTypeName(entryType int8) string {
+	switch entryType {
+	case 2:
+		return "dir"
+	case 4:
+		return "linkdir"
+	case -4:
+		return "linkfile"
+	case 3:
+		return "softlink"
+	default:
+		return "file"
+	}
+}
+
+func pfs3IsDirLike(entry pfs3DirEntry) bool {
+	return entry.entryType == 2 || entry.entryType == 4
+}
+
+func pfs3IsFileLike(entry pfs3DirEntry) bool {
+	return entry.entryType <= 0 || entry.entryType == 3
+}
+
+const (
+	affsTypeHeader  = 2
+	affsTypeList    = 16
+	affsTypeData    = 8
+	affsSecRoot     = 1
+	affsSecUserDir  = 2
+	affsSecFile     = -3
+	affsMaxFileName = 30
+)
+
+type affsReader struct {
+	r          io.ReaderAt
+	blockSize  int
+	rootBlock  uint32
+	hashSize   int
+	fastFile   bool
+	volumeName string
+}
+
+type affsDirEntry struct {
+	name       string
+	entryType  int32
+	blockNr    uint32
+	realBlock  uint32
+	size       int64
+	protection int
+	date       time.Time
+	comment    string
+	linkPath   string
+}
+
+var errNotAffs = errors.New("not an amiga dos filesystem")
+
+func listAffsPartitionDir(region partitionRegion, components []string, displayPath string) ([]fsDirItem, bool, error) {
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	items, err := listAffsReaderDir(reader, components, displayPath)
+	if err != nil {
+		return nil, true, err
+	}
+	return items, true, nil
+}
+
+func listAffsAdfDir(fullPath string) ([]fsDirItem, bool, error) {
+	adfPath, remainder, ok := parseAdfVirtualPath(fullPath)
+	if !ok {
+		return nil, false, nil
+	}
+	f, err := os.Open(adfPath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	reader, err := newAffsReader(f, info.Size())
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+	items, err := listAffsReaderDir(reader, splitVirtualPathComponents(remainder), fullPath)
+	if err != nil {
+		return nil, true, err
+	}
+	return items, true, nil
+}
+
+func listAffsReaderDir(reader *affsReader, components []string, displayPath string) ([]fsDirItem, error) {
+	entries, err := reader.listPath(components)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]fsDirItem, 0, len(entries))
+	for _, entry := range entries {
+		itemType := affsEntryTypeName(entry.entryType)
+		protection := entry.protection
+		items = append(items, fsDirItem{
+			Name:           entry.name,
+			Type:           itemType,
+			Size:           entry.size,
+			RawPath:        displayPath + `\` + entry.name,
+			LinkPath:       entry.linkPath,
+			Date:           formatAmigaDate(entry.date),
+			Attributes:     formatAmigaProtectionBits(protection),
+			ProtectionBits: &protection,
+			Comment:        entry.comment,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+	return items, nil
+}
+
+func openAffsVirtualFile(fullPath string) (io.ReadCloser, bool, error) {
+	data, _, handled, err := readAffsVirtualFile(fullPath)
+	if err != nil || !handled {
+		return nil, handled, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), true, nil
+}
+
+func openAffsAdfVirtualFile(fullPath string) (io.ReadCloser, bool, error) {
+	data, _, handled, err := readAffsAdfVirtualFile(fullPath)
+	if err != nil || !handled {
+		return nil, handled, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), true, nil
+}
+
+func readAffsVirtualFile(fullPath string) ([]byte, affsDirEntry, bool, error) {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(fullPath)
+	if !ok || remainder == "" {
+		return nil, affsDirEntry{}, false, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return nil, affsDirEntry{}, false, err
+	}
+	if !ok {
+		return nil, affsDirEntry{}, false, nil
+	}
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return nil, affsDirEntry{}, false, err
+	}
+	defer f.Close()
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return nil, affsDirEntry{}, false, nil
+		}
+		return nil, affsDirEntry{}, true, err
+	}
+	data, entry, err := readAffsReaderFile(reader, splitVirtualPathComponents(remainder))
+	return data, entry, true, err
+}
+
+func readAffsAdfVirtualFile(fullPath string) ([]byte, affsDirEntry, bool, error) {
+	adfPath, remainder, ok := parseAdfVirtualPath(fullPath)
+	if !ok || remainder == "" {
+		return nil, affsDirEntry{}, false, nil
+	}
+	f, err := os.Open(adfPath)
+	if err != nil {
+		return nil, affsDirEntry{}, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, affsDirEntry{}, false, err
+	}
+	reader, err := newAffsReader(f, info.Size())
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return nil, affsDirEntry{}, false, nil
+		}
+		return nil, affsDirEntry{}, true, err
+	}
+	data, entry, err := readAffsReaderFile(reader, splitVirtualPathComponents(remainder))
+	return data, entry, true, err
+}
+
+func readAffsReaderFile(reader *affsReader, components []string) ([]byte, affsDirEntry, error) {
+	entry, err := reader.findPathEntry(components)
+	if err != nil {
+		return nil, affsDirEntry{}, err
+	}
+	if affsIsDirLike(entry) {
+		return nil, entry, fmt.Errorf("source is a directory, use --recursive")
+	}
+	data, err := reader.readFile(entry)
+	if err != nil {
+		return nil, entry, err
+	}
+	return data, entry, nil
+}
+
+func extractAffsVirtualPath(source, destination string, opts fsPathOptions) (bool, int, error) {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(source)
+	if !ok || remainder == "" {
+		return false, 0, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return false, 0, err
+	}
+	if !ok {
+		return false, 0, nil
+	}
+	f, err := os.Open(region.BasePath)
+	if err != nil {
+		return false, 0, err
+	}
+	defer f.Close()
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return false, 0, nil
+		}
+		return true, 0, err
+	}
+	count, err := extractAffsReaderPath(reader, splitVirtualPathComponents(remainder), destination, opts)
+	return true, count, err
+}
+
+func extractAffsAdfVirtualPath(source, destination string, opts fsPathOptions) (bool, int, error) {
+	adfPath, remainder, ok := parseAdfVirtualPath(source)
+	if !ok || remainder == "" {
+		return false, 0, nil
+	}
+	f, err := os.Open(adfPath)
+	if err != nil {
+		return false, 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return false, 0, err
+	}
+	reader, err := newAffsReader(f, info.Size())
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return false, 0, nil
+		}
+		return true, 0, err
+	}
+	count, err := extractAffsReaderPath(reader, splitVirtualPathComponents(remainder), destination, opts)
+	return true, count, err
+}
+
+func extractAffsReaderPath(reader *affsReader, components []string, destination string, opts fsPathOptions) (int, error) {
+	entry, err := reader.findPathEntry(components)
+	if err != nil {
+		return 0, err
+	}
+	if affsIsFileLike(entry) {
+		data, err := reader.readFile(entry)
+		if err != nil {
+			return 0, err
+		}
+		if info, err := os.Stat(destination); err == nil && info.IsDir() {
+			if _, err := writeAffsExtractedFile(destination, entry, data, opts); err != nil {
+				return 0, err
+			}
+			return 1, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil && filepath.Dir(destination) != "." {
+			return 0, err
+		}
+		if err := os.WriteFile(destination, data, 0o644); err != nil {
+			return 0, err
+		}
+		if err := setPathTimesIfAvailable(destination, entry.date); err != nil {
+			return 0, err
+		}
+		if opts.uaeMetadata != "none" {
+			protection := entry.protection
+			if err := writeUaeMetadataForEntry(filepath.Dir(destination), entry.name, filepath.Base(destination), "file", opts.uaeMetadata, &protection, entry.comment, &entry.date); err != nil {
+				return 0, err
+			}
+		}
+		return 1, nil
+	}
+	if !opts.recursive {
+		return 0, errors.New("source is a directory, use --recursive")
+	}
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return 0, err
+	}
+	count, err := reader.extractDirectory(entry.blockNr, destination, opts)
+	return count, err
+}
+
+func newAffsReader(r io.ReaderAt, size int64) (*affsReader, error) {
+	for _, blockSize := range []int{512, 1024, 2048, 4096} {
+		if size < int64(blockSize*4) || size%int64(blockSize) != 0 {
+			continue
+		}
+		blocks := uint32(size / int64(blockSize))
+		rootBlock := (blocks + 1) / 2
+		if rootBlock >= blocks {
+			continue
+		}
+		block, err := readBlockAt(r, int64(rootBlock)*int64(blockSize), blockSize)
+		if err != nil && !errors.Is(err, io.EOF) {
+			continue
+		}
+		if !isAffsDirectoryBlock(block, blockSize, affsSecRoot) {
+			continue
+		}
+		hashSize := int(readBeU32(block, 12))
+		if hashSize <= 0 || hashSize > blockSize/4-56 {
+			hashSize = blockSize/4 - 56
+		}
+		boot, _ := readBlockAt(r, 0, minInt(blockSize, 512))
+		fastFile := true
+		if len(boot) >= 4 && string(boot[:3]) == "DOS" {
+			fastFile = boot[3]&1 != 0
+		}
+		return &affsReader{
+			r:          r,
+			blockSize:  blockSize,
+			rootBlock:  rootBlock,
+			hashSize:   hashSize,
+			fastFile:   fastFile,
+			volumeName: parseAffsName(block, blockSize),
+		}, nil
+	}
+	return nil, errNotAffs
+}
+
+func isAffsDirectoryBlock(block []byte, blockSize int, secType int32) bool {
+	return len(block) >= blockSize &&
+		readBeU32(block, 0) == affsTypeHeader &&
+		int32(readBeU32(block, blockSize-4)) == secType &&
+		int(readBeU32(block, 12)) <= blockSize/4-56
+}
+
+func (r *affsReader) listPath(components []string) ([]affsDirEntry, error) {
+	blockNr := r.rootBlock
+	for _, component := range components {
+		entries, err := r.listDirBlock(blockNr)
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, entry := range entries {
+			if affsIsDirLike(entry) && strings.EqualFold(entry.name, component) {
+				blockNr = entry.blockNr
+				if entry.entryType == 4 && entry.realBlock != 0 {
+					blockNr = entry.realBlock
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("path not found: %s", strings.Join(components, `\`))
+		}
+	}
+	return r.listDirBlock(blockNr)
+}
+
+func (r *affsReader) findPathEntry(components []string) (affsDirEntry, error) {
+	if len(components) == 0 {
+		return affsDirEntry{name: r.volumeName, entryType: affsSecRoot, blockNr: r.rootBlock}, nil
+	}
+	parent := components[:len(components)-1]
+	name := components[len(components)-1]
+	entries, err := r.listPath(parent)
+	if err != nil {
+		return affsDirEntry{}, err
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.name, name) {
+			return entry, nil
+		}
+	}
+	return affsDirEntry{}, fmt.Errorf("path not found: %s", strings.Join(components, `\`))
+}
+
+func (r *affsReader) findPathByBlock(dirBlock uint32, targetBlock uint32, prefix []string, visited map[uint32]bool) ([]string, bool) {
+	if visited[dirBlock] {
+		return nil, false
+	}
+	visited[dirBlock] = true
+	entries, err := r.listDirBlock(dirBlock)
+	if err != nil {
+		return nil, false
+	}
+	for _, entry := range entries {
+		if entry.blockNr == targetBlock {
+			return append(append([]string{}, prefix...), entry.name), true
+		}
+		if entry.entryType == affsSecUserDir || entry.entryType == affsSecRoot {
+			childPrefix := append(append([]string{}, prefix...), entry.name)
+			if path, ok := r.findPathByBlock(entry.blockNr, targetBlock, childPrefix, visited); ok {
+				return path, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func (r *affsReader) pathForBlock(blockNr uint32) (string, bool) {
+	components := make([]string, 0)
+	visited := map[uint32]bool{}
+	for current := blockNr; current != 0; {
+		if visited[current] {
+			return "", false
+		}
+		visited[current] = true
+		block, err := r.readBlock(current)
+		if err != nil {
+			return "", false
+		}
+		name := parseAffsName(block, r.blockSize)
+		if name != "" {
+			components = append([]string{name}, components...)
+		}
+		parent := readBeU32(block, r.blockSize-12)
+		if parent == 0 || parent == current || parent == r.rootBlock {
+			break
+		}
+		current = parent
+	}
+	if len(components) == 0 {
+		return "", false
+	}
+	return strings.Join(components, "/"), true
+}
+
+func (r *affsReader) listDirBlock(blockNr uint32) ([]affsDirEntry, error) {
+	block, err := r.readBlock(blockNr)
+	if err != nil {
+		return nil, err
+	}
+	secType := int32(readBeU32(block, r.blockSize-4))
+	if secType == 4 {
+		realBlock := readBeU32(block, r.blockSize-44)
+		if realBlock == 0 {
+			return nil, fmt.Errorf("AFFS link directory block %d has no real entry", blockNr)
+		}
+		return r.listDirBlock(realBlock)
+	}
+	if secType != affsSecRoot && secType != affsSecUserDir {
+		return nil, fmt.Errorf("AFFS block %d is not a directory", blockNr)
+	}
+	hashSize := int(readBeU32(block, 12))
+	if hashSize <= 0 || hashSize > r.hashSize {
+		hashSize = r.hashSize
+	}
+	entries := make([]affsDirEntry, 0)
+	visited := map[uint32]bool{}
+	for i := 0; i < hashSize; i++ {
+		ptr := readBeU32(block, 24+i*4)
+		for ptr != 0 {
+			if visited[ptr] {
+				return nil, errors.New("AFFS hash chain loop detected")
+			}
+			visited[ptr] = true
+			entryBlock, err := r.readBlock(ptr)
+			if err != nil {
+				return nil, err
+			}
+			entry := r.parseEntryBlock(ptr, entryBlock)
+			if entry.name != "" && (entry.entryType == affsSecFile || entry.entryType == affsSecUserDir || entry.entryType == -4 || entry.entryType == 4) {
+				if (entry.entryType == -4 || entry.entryType == 4) && entry.realBlock != 0 {
+					if path, ok := r.pathForBlock(entry.realBlock); ok {
+						entry.linkPath = path
+					}
+					if entry.entryType == -4 {
+						if realBlock, err := r.readBlock(entry.realBlock); err == nil {
+							entry.size = int64(readBeU32(realBlock, r.blockSize-188))
+						}
+					}
+				}
+				entries = append(entries, entry)
+			}
+			ptr = readBeU32(entryBlock, r.blockSize-16)
+		}
+	}
+	return entries, nil
+}
+
+func (r *affsReader) parseEntryBlock(blockNr uint32, block []byte) affsDirEntry {
+	secType := int32(readBeU32(block, r.blockSize-4))
+	size := int64(0)
+	if secType == affsSecFile {
+		size = int64(readBeU32(block, r.blockSize-188))
+	}
+	return affsDirEntry{
+		name:       parseAffsName(block, r.blockSize),
+		entryType:  secType,
+		blockNr:    blockNr,
+		realBlock:  readBeU32(block, r.blockSize-44),
+		size:       size,
+		protection: int(readBeU32(block, r.blockSize-192)),
+		date:       parseAmigaDateStamp(readBeU32(block, r.blockSize-92), readBeU32(block, r.blockSize-88), readBeU32(block, r.blockSize-84)),
+		comment:    parseAffsComment(block, r.blockSize),
+	}
+}
+
+func parseAffsName(block []byte, blockSize int) string {
+	offset := blockSize - 80
+	if offset < 0 || offset >= len(block) {
+		return ""
+	}
+	n := int(block[offset])
+	if n > affsMaxFileName {
+		n = affsMaxFileName
+	}
+	if offset+1+n > len(block) {
+		n = len(block) - offset - 1
+	}
+	return decodeLatin1String(block[offset+1 : offset+1+n])
+}
+
+func parseAffsComment(block []byte, blockSize int) string {
+	offset := blockSize - 184
+	if offset < 0 || offset >= len(block) {
+		return ""
+	}
+	n := int(block[offset])
+	if n > 79 {
+		n = 79
+	}
+	if offset+1+n > len(block) {
+		n = len(block) - offset - 1
+	}
+	return decodeLatin1String(block[offset+1 : offset+1+n])
+}
+
+func (r *affsReader) readFile(entry affsDirEntry) ([]byte, error) {
+	if entry.entryType == -4 && entry.realBlock != 0 {
+		entry.blockNr = entry.realBlock
+		if realBlock, err := r.readBlock(entry.realBlock); err == nil {
+			entry.size = int64(readBeU32(realBlock, r.blockSize-188))
+		}
+	}
+	if entry.size <= 0 {
+		return []byte{}, nil
+	}
+	header, err := r.readBlock(entry.blockNr)
+	if err != nil {
+		return nil, err
+	}
+	if !r.fastFile {
+		return r.readOFSFile(header, entry.size)
+	}
+	ptrs, err := r.readFileDataBlockPointers(header)
+	if err != nil {
+		return nil, err
+	}
+	return r.readFFSFile(ptrs, entry.size)
+}
+
+func (r *affsReader) readFileDataBlockPointers(header []byte) ([]uint32, error) {
+	ptrs := make([]uint32, 0)
+	for block := header; ; {
+		highSeq := int(readBeU32(block, 8))
+		if highSeq < 0 {
+			highSeq = 0
+		}
+		if highSeq > r.hashSize {
+			highSeq = r.hashSize
+		}
+		for i := 0; i < highSeq; i++ {
+			ptr := readBeU32(block, 24+(r.hashSize-1-i)*4)
+			if ptr != 0 {
+				ptrs = append(ptrs, ptr)
+			}
+		}
+		extension := readBeU32(block, r.blockSize-8)
+		if extension == 0 {
+			break
+		}
+		next, err := r.readBlock(extension)
+		if err != nil {
+			return nil, err
+		}
+		if readBeU32(next, 0) != affsTypeList || int32(readBeU32(next, r.blockSize-4)) != affsSecFile {
+			return nil, fmt.Errorf("invalid AFFS file extension block %d", extension)
+		}
+		block = next
+	}
+	return ptrs, nil
+}
+
+func (r *affsReader) readFFSFile(ptrs []uint32, size int64) ([]byte, error) {
+	data := make([]byte, 0, int(minInt64(size, 1024*1024)))
+	remaining := size
+	for _, ptr := range ptrs {
+		if remaining <= 0 {
+			break
+		}
+		block, err := r.readBlock(ptr)
+		if err != nil {
+			return nil, err
+		}
+		n := int64(len(block))
+		if n > remaining {
+			n = remaining
+		}
+		data = append(data, block[:n]...)
+		remaining -= n
+	}
+	if remaining > 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
+}
+
+func (r *affsReader) readOFSFile(header []byte, size int64) ([]byte, error) {
+	data := make([]byte, 0, int(minInt64(size, 1024*1024)))
+	remaining := size
+	next := readBeU32(header, 16)
+	visited := map[uint32]bool{}
+	for next != 0 && remaining > 0 {
+		if visited[next] {
+			return nil, errors.New("AFFS OFS data block loop detected")
+		}
+		visited[next] = true
+		block, err := r.readBlock(next)
+		if err != nil {
+			return nil, err
+		}
+		if readBeU32(block, 0) != affsTypeData {
+			return nil, fmt.Errorf("invalid AFFS OFS data block %d", next)
+		}
+		dataSize := int64(readBeU32(block, 12))
+		if dataSize > int64(r.blockSize-24) {
+			dataSize = int64(r.blockSize - 24)
+		}
+		if dataSize > remaining {
+			dataSize = remaining
+		}
+		data = append(data, block[24:24+dataSize]...)
+		remaining -= dataSize
+		next = readBeU32(block, 16)
+	}
+	if remaining > 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
+}
+
+func (r *affsReader) extractDirectory(blockNr uint32, destination string, opts fsPathOptions) (int, error) {
+	entries, err := r.listDirBlock(blockNr)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		if affsIsDirLike(entry) {
+			mappedName, changed, _ := mapLocalNameForUae(entry.name, opts.uaeMetadata, destination)
+			target := filepath.Join(destination, mappedName)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return count, err
+			}
+			if changed || opts.uaeMetadata != "none" {
+				protection := entry.protection
+				if err := writeUaeMetadataForEntry(destination, entry.name, mappedName, "dir", opts.uaeMetadata, &protection, entry.comment, &entry.date); err != nil {
+					return count, err
+				}
+			}
+			childBlock := entry.blockNr
+			if entry.entryType == 4 && entry.realBlock != 0 {
+				childBlock = entry.realBlock
+			}
+			childCount, err := r.extractDirectory(childBlock, target, opts)
+			count += childCount
+			if err != nil {
+				return count, err
+			}
+			count++
+			continue
+		}
+		data, err := r.readFile(entry)
+		if err != nil {
+			return count, err
+		}
+		if _, err := writeAffsExtractedFile(destination, entry, data, opts); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func writeAffsExtractedFile(destinationDir string, entry affsDirEntry, data []byte, opts fsPathOptions) (string, error) {
+	mappedName, changed, _ := mapLocalNameForUae(entry.name, opts.uaeMetadata, destinationDir)
+	target := filepath.Join(destinationDir, mappedName)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil && filepath.Dir(target) != "." {
+		return "", err
+	}
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		return "", err
+	}
+	if err := setPathTimesIfAvailable(target, entry.date); err != nil {
+		return "", err
+	}
+	if changed || opts.uaeMetadata != "none" {
+		protection := entry.protection
+		if err := writeUaeMetadataForEntry(destinationDir, entry.name, mappedName, "file", opts.uaeMetadata, &protection, entry.comment, &entry.date); err != nil {
+			return "", err
+		}
+	}
+	return target, nil
+}
+
+func affsEntryTypeName(entryType int32) string {
+	switch entryType {
+	case affsSecUserDir, affsSecRoot:
+		return "dir"
+	case 4:
+		return "linkdir"
+	case -4:
+		return "linkfile"
+	case 3:
+		return "softlink"
+	default:
+		return "file"
+	}
+}
+
+func affsIsDirLike(entry affsDirEntry) bool {
+	return entry.entryType == affsSecUserDir || entry.entryType == affsSecRoot || entry.entryType == 4
+}
+
+func affsIsFileLike(entry affsDirEntry) bool {
+	return entry.entryType == affsSecFile || entry.entryType == -4
+}
+
+func (r *affsReader) readBlock(blockNr uint32) ([]byte, error) {
+	return readBlockAt(r.r, int64(blockNr)*int64(r.blockSize), r.blockSize)
+}
+
+var errNotPfs3 = errors.New("not a pfs3 filesystem")
+
+func newPfs3Reader(r io.ReaderAt) (*pfs3Reader, error) {
+	root, err := readPfs3RootBlock(r)
+	if err != nil {
+		return nil, err
+	}
+	reservedBlockSize := int(root.reservedBlockSize)
+	if reservedBlockSize < pfs3BlockSize || reservedBlockSize%pfs3BlockSize != 0 {
+		return nil, fmt.Errorf("invalid PFS3 reserved block size %d", reservedBlockSize)
+	}
+	reader := &pfs3Reader{
+		r:                 r,
+		root:              root,
+		reservedBlockSize: reservedBlockSize,
+		resCluster:        uint32(reservedBlockSize / pfs3BlockSize),
+		anodesPerBlock:    uint32((reservedBlockSize - 16) / 12),
+		indexPerBlock:     uint32((reservedBlockSize - 12) / 4),
+		splitAnodes:       root.options&pfs3ModeSplitAnodes != 0,
+		dirExtension:      root.options&pfs3ModeDirExtension != 0,
+		superIndex:        root.options&pfs3ModeSuperIndex != 0,
+	}
+	if reader.resCluster == 0 || reader.anodesPerBlock == 0 || reader.indexPerBlock == 0 {
+		return nil, fmt.Errorf("invalid PFS3 geometry in root block")
+	}
+	if reader.superIndex {
+		super, err := reader.readRootExtensionSuperIndex()
+		if err != nil {
+			return nil, err
+		}
+		reader.superIndexBlocks = super
+	}
+	return reader, nil
+}
+
+func readPfs3RootBlock(r io.ReaderAt) (pfs3RootBlockInfo, error) {
+	block, err := readBlockAt(r, int64(pfs3RootBlock*pfs3BlockSize), pfs3BlockSize)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return pfs3RootBlockInfo{}, err
+	}
+	diskType := readBeU32(block, 0)
+	if diskType != pfs3DiskIDPFS1 && diskType != pfs3DiskIDPFS2 {
+		return pfs3RootBlockInfo{}, errNotPfs3
+	}
+	nameLen := int(block[20])
+	if nameLen > 31 {
+		nameLen = 31
+	}
+	indexBlocks := make([]uint32, pfs3MaxSmallIndexNumber+1)
+	indexStart := 96 + 5*4
+	for i := range indexBlocks {
+		indexBlocks[i] = readBeU32(block, indexStart+i*4)
+	}
+	return pfs3RootBlockInfo{
+		diskType:          diskType,
+		options:           readBeU32(block, 4),
+		name:              decodeLatin1String(block[21 : 21+nameLen]),
+		reservedBlockSize: readBeU16(block, 64),
+		rblkCluster:       readBeU16(block, 66),
+		extension:         readBeU32(block, 88),
+		indexBlocks:       indexBlocks,
+	}, nil
+}
+
+func (r *pfs3Reader) readRootExtensionSuperIndex() ([]uint32, error) {
+	if r.root.extension == 0 {
+		return nil, errors.New("PFS3 superindex mode set without root extension")
+	}
+	block, err := r.readReservedBlock(r.root.extension)
+	if err != nil {
+		return nil, err
+	}
+	if readBeU16(block, 0) != pfs3RootExtensionID {
+		return nil, fmt.Errorf("invalid PFS3 root extension block id 0x%04x", readBeU16(block, 0))
+	}
+	super := make([]uint32, 16)
+	for i := range super {
+		super[i] = readBeU32(block, 64+i*4)
+	}
+	return super, nil
+}
+
+func (r *pfs3Reader) listPath(components []string) ([]pfs3DirEntry, error) {
+	anode := uint32(pfs3AnodeRootDir)
+	for _, component := range components {
+		entries, err := r.listDirByAnode(anode)
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, entry := range entries {
+			if pfs3IsDirLike(entry) && strings.EqualFold(entry.name, component) {
+				anode = entry.anode
+				if entry.entryType == 4 && entry.linkAnode != 0 {
+					anode = entry.linkAnode
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("path not found: %s", strings.Join(components, `\`))
+		}
+	}
+	return r.listDirByAnode(anode)
+}
+
+func (r *pfs3Reader) findPathEntry(components []string) (pfs3DirEntry, error) {
+	if len(components) == 0 {
+		return pfs3DirEntry{name: r.root.name, entryType: 2, anode: pfs3AnodeRootDir}, nil
+	}
+	parentComponents := components[:len(components)-1]
+	name := components[len(components)-1]
+	entries, err := r.listPath(parentComponents)
+	if err != nil {
+		return pfs3DirEntry{}, err
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.name, name) {
+			return entry, nil
+		}
+	}
+	return pfs3DirEntry{}, fmt.Errorf("path not found: %s", strings.Join(components, `\`))
+}
+
+func (r *pfs3Reader) resolvePfs3EntryLinkPaths(entries []pfs3DirEntry) {
+	for i := range entries {
+		if (entries[i].entryType != -4 && entries[i].entryType != 4) || entries[i].linkAnode == 0 {
+			continue
+		}
+		if path, ok := r.findPathByAnode(pfs3AnodeRootDir, entries[i].linkAnode, nil, map[uint32]bool{}); ok {
+			entries[i].linkPath = strings.Join(path, "/")
+		}
+	}
+}
+
+func (r *pfs3Reader) findPathByAnode(dirAnode uint32, targetAnode uint32, prefix []string, visited map[uint32]bool) ([]string, bool) {
+	if visited[dirAnode] {
+		return nil, false
+	}
+	visited[dirAnode] = true
+	entries, err := r.listDirByAnode(dirAnode)
+	if err != nil {
+		return nil, false
+	}
+	for _, entry := range entries {
+		if entry.anode == targetAnode {
+			return append(append([]string{}, prefix...), entry.name), true
+		}
+		if entry.entryType == 2 {
+			childPrefix := append(append([]string{}, prefix...), entry.name)
+			if path, ok := r.findPathByAnode(entry.anode, targetAnode, childPrefix, visited); ok {
+				return path, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func (r *pfs3Reader) listDirByAnode(anodeNr uint32) ([]pfs3DirEntry, error) {
+	anode, err := r.getAnode(anodeNr)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]pfs3DirEntry, 0)
+	visited := map[uint32]bool{}
+	for current := anode; ; {
+		if current.blockNr == 0 {
+			break
+		}
+		for offset := uint32(0); offset < current.clusterSize; offset++ {
+			blockNr := current.blockNr + offset
+			if visited[blockNr] {
+				return nil, errors.New("PFS3 directory block loop detected")
+			}
+			visited[blockNr] = true
+			blockEntries, err := r.readDirBlock(blockNr)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, blockEntries...)
+		}
+		if current.next == 0 {
+			break
+		}
+		current, err = r.getAnode(current.next)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+func (r *pfs3Reader) readFileByAnode(anodeNr uint32, size int64) ([]byte, error) {
+	if size < 0 {
+		return nil, errors.New("invalid PFS3 file size")
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	anode, err := r.getAnode(anodeNr)
+	if err != nil {
+		return nil, err
+	}
+	capacity := int64(1024 * 1024)
+	if size < capacity {
+		capacity = size
+	}
+	data := make([]byte, 0, int(capacity))
+	remaining := size
+	visited := map[uint32]bool{}
+	for current := anode; remaining > 0; {
+		if current.clusterSize == 0 || current.blockNr == 0 {
+			return nil, errors.New("invalid PFS3 file anode")
+		}
+		for offset := uint32(0); offset < current.clusterSize && remaining > 0; offset++ {
+			blockNr := current.blockNr + offset
+			if visited[blockNr] {
+				return nil, errors.New("PFS3 file block loop detected")
+			}
+			visited[blockNr] = true
+			block, err := readBlockAt(r.r, int64(blockNr)*pfs3BlockSize, pfs3BlockSize)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			n := int64(len(block))
+			if n > remaining {
+				n = remaining
+			}
+			data = append(data, block[:n]...)
+			remaining -= n
+		}
+		if remaining <= 0 {
+			break
+		}
+		if current.next == 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		current, err = r.getAnode(current.next)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
+func (r *pfs3Reader) readFile(entry pfs3DirEntry) ([]byte, error) {
+	anode := entry.anode
+	if entry.entryType == -4 && entry.linkAnode != 0 {
+		anode = entry.linkAnode
+	}
+	if entry.entryType == 3 {
+		return nil, errors.New("PFS3 soft links are not readable as regular files")
+	}
+	return r.readFileByAnode(anode, entry.size)
+}
+
+func (r *pfs3Reader) extractDirectory(anodeNr uint32, destination string, opts fsPathOptions) (int, error) {
+	entries, err := r.listDirByAnode(anodeNr)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		if pfs3IsDirLike(entry) {
+			mappedName, changed, _ := mapLocalNameForUae(entry.name, opts.uaeMetadata, destination)
+			target := filepath.Join(destination, mappedName)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return count, err
+			}
+			if changed || opts.uaeMetadata != "none" {
+				protection := entry.protection
+				if err := writeUaeMetadataForEntry(destination, entry.name, mappedName, "dir", opts.uaeMetadata, &protection, entry.comment, &entry.date); err != nil {
+					return count, err
+				}
+			}
+			childAnode := entry.anode
+			if entry.entryType == 4 && entry.linkAnode != 0 {
+				childAnode = entry.linkAnode
+			}
+			childCount, err := r.extractDirectory(childAnode, target, opts)
+			count += childCount
+			if err != nil {
+				return count, err
+			}
+			count++
+			continue
+		}
+		data, err := r.readFile(entry)
+		if err != nil {
+			return count, err
+		}
+		if _, err := writePfs3ExtractedFile(destination, entry, data, opts); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (r *pfs3Reader) getAnode(anodeNr uint32) (pfs3Anode, error) {
+	var seqNr uint16
+	var offset uint16
+	if r.splitAnodes {
+		seqNr = uint16(anodeNr >> 16)
+		offset = uint16(anodeNr & 0xffff)
+	} else {
+		divided := pfs3Divide(anodeNr, r.anodesPerBlock)
+		seqNr = uint16(divided)
+		offset = uint16(divided >> 16)
+	}
+	nodes, err := r.getAnodeBlock(seqNr)
+	if err != nil {
+		return pfs3Anode{}, err
+	}
+	if int(offset) >= len(nodes) {
+		return pfs3Anode{}, fmt.Errorf("PFS3 anode offset %d exceeds block entries %d", offset, len(nodes))
+	}
+	return nodes[offset], nil
+}
+
+func (r *pfs3Reader) getAnodeBlock(seqNr uint16) ([]pfs3Anode, error) {
+	divided := pfs3Divide(uint32(seqNr), r.indexPerBlock)
+	indexSeqNr := uint16(divided)
+	indexOffset := int(divided >> 16)
+	index, err := r.getIndexBlock(indexSeqNr)
+	if err != nil {
+		return nil, err
+	}
+	if indexOffset >= len(index) {
+		return nil, fmt.Errorf("PFS3 index offset %d exceeds block entries %d", indexOffset, len(index))
+	}
+	blockNr := index[indexOffset]
+	if blockNr == 0 {
+		return nil, fmt.Errorf("PFS3 anode block %d is not allocated", seqNr)
+	}
+	block, err := r.readReservedBlock(blockNr)
+	if err != nil {
+		return nil, err
+	}
+	if readBeU16(block, 0) != pfs3AnodeBlockID {
+		return nil, fmt.Errorf("invalid PFS3 anode block id 0x%04x", readBeU16(block, 0))
+	}
+	nodes := make([]pfs3Anode, 0, r.anodesPerBlock)
+	for off := 16; off+12 <= len(block) && len(nodes) < int(r.anodesPerBlock); off += 12 {
+		nodes = append(nodes, pfs3Anode{
+			clusterSize: readBeU32(block, off),
+			blockNr:     readBeU32(block, off+4),
+			next:        readBeU32(block, off+8),
+		})
+	}
+	return nodes, nil
+}
+
+func (r *pfs3Reader) getIndexBlock(seqNr uint16) ([]uint32, error) {
+	var blockNr uint32
+	if r.superIndex {
+		divided := pfs3Divide(uint32(seqNr), r.indexPerBlock)
+		superSeqNr := uint16(divided)
+		superOffset := int(divided >> 16)
+		super, err := r.getSuperBlock(superSeqNr)
+		if err != nil {
+			return nil, err
+		}
+		if superOffset >= len(super) {
+			return nil, fmt.Errorf("PFS3 superindex offset %d exceeds block entries %d", superOffset, len(super))
+		}
+		blockNr = super[superOffset]
+	} else {
+		if int(seqNr) >= len(r.root.indexBlocks) {
+			return nil, fmt.Errorf("PFS3 index block %d exceeds small index table", seqNr)
+		}
+		blockNr = r.root.indexBlocks[seqNr]
+	}
+	if blockNr == 0 {
+		return nil, fmt.Errorf("PFS3 index block %d is not allocated", seqNr)
+	}
+	block, err := r.readReservedBlock(blockNr)
+	if err != nil {
+		return nil, err
+	}
+	if readBeU16(block, 0) != pfs3IndexBlockID {
+		return nil, fmt.Errorf("invalid PFS3 index block id 0x%04x", readBeU16(block, 0))
+	}
+	return parsePfs3IndexEntries(block, int(r.indexPerBlock)), nil
+}
+
+func (r *pfs3Reader) getSuperBlock(seqNr uint16) ([]uint32, error) {
+	if int(seqNr) >= len(r.superIndexBlocks) {
+		return nil, fmt.Errorf("PFS3 superindex block %d exceeds root extension table", seqNr)
+	}
+	blockNr := r.superIndexBlocks[seqNr]
+	if blockNr == 0 {
+		return nil, fmt.Errorf("PFS3 superindex block %d is not allocated", seqNr)
+	}
+	block, err := r.readReservedBlock(blockNr)
+	if err != nil {
+		return nil, err
+	}
+	if readBeU16(block, 0) != pfs3SuperBlockID {
+		return nil, fmt.Errorf("invalid PFS3 superindex block id 0x%04x", readBeU16(block, 0))
+	}
+	return parsePfs3IndexEntries(block, int(r.indexPerBlock)), nil
+}
+
+func parsePfs3IndexEntries(block []byte, limit int) []uint32 {
+	entries := make([]uint32, 0, limit)
+	for off := 12; off+4 <= len(block) && len(entries) < limit; off += 4 {
+		entries = append(entries, readBeU32(block, off))
+	}
+	return entries
+}
+
+func (r *pfs3Reader) readDirBlock(blockNr uint32) ([]pfs3DirEntry, error) {
+	block, err := r.readReservedBlock(blockNr)
+	if err != nil {
+		return nil, err
+	}
+	if readBeU16(block, 0) != pfs3DirBlockID {
+		return nil, fmt.Errorf("invalid PFS3 directory block id 0x%04x", readBeU16(block, 0))
+	}
+	entries := make([]pfs3DirEntry, 0)
+	for off := 20; off < len(block); {
+		next := int(block[off])
+		if next == 0 {
+			break
+		}
+		if next < 20 || off+next > len(block) {
+			return nil, fmt.Errorf("invalid PFS3 directory entry length %d", next)
+		}
+		nameLen := int(block[off+17])
+		nameStart := off + 18
+		nameEnd := nameStart + nameLen
+		if nameEnd > off+next {
+			return nil, fmt.Errorf("invalid PFS3 directory entry name length %d", nameLen)
+		}
+		comment := ""
+		commentLenOffset := nameEnd
+		if commentLenOffset < off+next {
+			commentLen := int(block[commentLenOffset])
+			commentStart := commentLenOffset + 1
+			commentEnd := commentStart + commentLen
+			if commentEnd <= off+next {
+				comment = decodeLatin1String(block[commentStart:commentEnd])
+			}
+		}
+		linkAnode := uint32(0)
+		if r.dirExtension {
+			linkAnode = parsePfs3ExtraFieldsLink(block[off : off+next])
+		}
+		entries = append(entries, pfs3DirEntry{
+			name:       decodeLatin1String(block[nameStart:nameEnd]),
+			entryType:  int8(block[off+1]),
+			anode:      readBeU32(block, off+2),
+			linkAnode:  linkAnode,
+			size:       int64(readBeU32(block, off+6)),
+			protection: int(block[off+16]),
+			date:       parseAmigaDateStamp(uint32(readBeU16(block, off+10)), uint32(readBeU16(block, off+12)), uint32(readBeU16(block, off+14))),
+			comment:    comment,
+		})
+		off += next
+	}
+	return entries, nil
+}
+
+func parsePfs3ExtraFieldsLink(entry []byte) uint32 {
+	if len(entry) < 2 {
+		return 0
+	}
+	pos := len(entry) - 2
+	mask := readBeU16(entry, pos)
+	extras := make([]uint16, 11)
+	for i := 0; i < len(extras); i++ {
+		if mask&1 != 0 {
+			pos -= 2
+			if pos < 0 {
+				return 0
+			}
+			extras[i] = readBeU16(entry, pos)
+		}
+		mask >>= 1
+	}
+	return (uint32(extras[0]) << 16) | uint32(extras[1])
+}
+
+func (r *pfs3Reader) readReservedBlock(blockNr uint32) ([]byte, error) {
+	return readBlockAt(r.r, int64(blockNr)*pfs3BlockSize, r.reservedBlockSize)
+}
+
+func pfs3Divide(d0, d1 uint32) uint32 {
+	if d1 == 0 {
+		return 0
+	}
+	q := d0 / d1
+	if q > 0xffff {
+		return d0
+	}
+	return ((d0 % d1) << 16) | q
+}
+
+func decodeLatin1String(b []byte) string {
+	runes := make([]rune, 0, len(b))
+	for _, c := range b {
+		if c == 0 {
+			break
+		}
+		runes = append(runes, rune(c))
+	}
+	return string(runes)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func handleGptInfo(args []string, stdout io.Writer, opts GlobalOptions) error {
@@ -5773,6 +7957,25 @@ func readRdbState(path string) (rdbState, error) {
 		return rdbState{}, err
 	}
 	defer f.Close()
+	return readRdbStateFromReadSeeker(f)
+}
+
+func readRdbStateFromPathOrPartition(path string) (rdbState, error) {
+	if region, ok, err := resolvePartitionSelection(path); err != nil {
+		return rdbState{}, err
+	} else if ok {
+		f, err := os.Open(region.BasePath)
+		if err != nil {
+			return rdbState{}, err
+		}
+		defer f.Close()
+		section := io.NewSectionReader(f, region.Offset, region.Size)
+		return readRdbStateFromReadSeeker(section)
+	}
+	return readRdbState(path)
+}
+
+func readRdbStateFromReadSeeker(f readSeekReaderAt) (rdbState, error) {
 	header := make([]byte, rdbHeaderSize)
 	if _, err := io.ReadFull(f, header); err != nil {
 		return rdbState{}, err
@@ -5781,7 +7984,7 @@ func readRdbState(path string) (rdbState, error) {
 		if err := trySeekStart(f); err != nil {
 			return rdbState{}, err
 		}
-		native, err := readNativeRdbState(f)
+		native, err := readNativeRdbStateFromReadSeeker(f)
 		if err == nil {
 			native.Native = true
 			normalizeRdbStateIndexes(&native)
@@ -5844,12 +8047,22 @@ func writeRdbState(path string, state rdbState) error {
 	return f.Sync()
 }
 
-func trySeekStart(f *os.File) error {
+type readSeekReaderAt interface {
+	io.Reader
+	io.ReaderAt
+	io.Seeker
+}
+
+func trySeekStart(f io.Seeker) error {
 	_, err := f.Seek(0, io.SeekStart)
 	return err
 }
 
 func readNativeRdbState(f *os.File) (rdbState, error) {
+	return readNativeRdbStateFromReadSeeker(f)
+}
+
+func readNativeRdbStateFromReadSeeker(f readSeekReaderAt) (rdbState, error) {
 	ctx, err := readNativeRdbContextFromFile(f)
 	if err != nil {
 		return rdbState{}, err
@@ -6087,7 +8300,7 @@ func readNativeRdbContext(path string) (nativeRdbContext, error) {
 	return readNativeRdbContextFromFile(f)
 }
 
-func readNativeRdbContextFromFile(f *os.File) (nativeRdbContext, error) {
+func readNativeRdbContextFromFile(f readSeekReaderAt) (nativeRdbContext, error) {
 	if err := trySeekStart(f); err != nil {
 		return nativeRdbContext{}, err
 	}
@@ -6134,7 +8347,7 @@ func readNativeRdbContextFromFile(f *os.File) (nativeRdbContext, error) {
 	return ctx, nil
 }
 
-func readNativeChainBlocks(f *os.File, blockSize int64, start int32, kind string) ([]nativeRdbChainBlock, error) {
+func readNativeChainBlocks(f io.ReaderAt, blockSize int64, start int32, kind string) ([]nativeRdbChainBlock, error) {
 	blocks := make([]nativeRdbChainBlock, 0)
 	visited := map[int32]bool{}
 	for ptr := start; ptr >= 0; {
@@ -6681,7 +8894,7 @@ func buildLegacyRdbInitLabel(path string) string {
 	return "HstImage" + name
 }
 
-func readBlockAt(f *os.File, offset int64, size int) ([]byte, error) {
+func readBlockAt(f io.ReaderAt, offset int64, size int) ([]byte, error) {
 	b := make([]byte, size)
 	_, err := f.ReadAt(b, offset)
 	return b, err
@@ -6891,6 +9104,15 @@ func findRdbPart(items []rdbPart, index int) (rdbPart, error) {
 		}
 	}
 	return rdbPart{}, fmt.Errorf("partition %d not found", index)
+}
+
+func findRdbPartByName(items []rdbPart, name string) (rdbPart, error) {
+	for _, p := range items {
+		if strings.EqualFold(strings.TrimSpace(p.Name), strings.TrimSpace(name)) {
+			return p, nil
+		}
+	}
+	return rdbPart{}, fmt.Errorf("partition '%s' not found", name)
 }
 
 func findRdbPartByNumber(items []rdbPart, number int) (rdbPart, error) {
@@ -7163,6 +9385,20 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func printSimpleStatus(stdout io.Writer, opts GlobalOptions, message string, details any) error {
 	if opts.Format == "json" {
 		return writeJSON(stdout, map[string]any{"status": message, "details": details})
@@ -7181,8 +9417,16 @@ func copyPath(source, destination string, recursive bool) (int, error) {
 		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
 			target = filepath.Join(destination, filepath.Base(source))
 		}
-		_, err = copyFile(source, target, 0)
-		return 1, err
+		if _, err := copyFile(source, target, 0); err != nil {
+			return 0, err
+		}
+		if err := setPathModeIfAvailable(target, info.Mode()); err != nil {
+			return 0, err
+		}
+		if err := setPathTimesIfAvailable(target, info.ModTime()); err != nil {
+			return 0, err
+		}
+		return 1, nil
 	}
 	if !recursive {
 		return 0, errors.New("source is a directory, use --recursive")
@@ -7221,6 +9465,7 @@ type fsPathOptions struct {
 type sourceUaeEntryInfo struct {
 	AmigaName      string
 	ProtectionBits *int
+	Date           time.Time
 	Comment        string
 	HasMetadata    bool
 }
@@ -7309,9 +9554,19 @@ func parseFsOptions(args []string) (fsPathOptions, error) {
 }
 
 func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, error) {
-	info, err := os.Stat(source)
+	info, err := os.Lstat(source)
 	if err != nil {
 		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target := destination
+		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
+			target = filepath.Join(destination, filepath.Base(source))
+		}
+		if err := copySymlink(source, target); err != nil {
+			return 0, err
+		}
+		return 1, nil
 	}
 	if !info.IsDir() {
 		sourceName := filepath.Base(source)
@@ -7328,13 +9583,23 @@ func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, e
 			mappedName, changed, _ := mapLocalNameForUae(amigaName, opts.uaeMetadata, destination)
 			target = filepath.Join(destination, mappedName)
 			if changed || entryInfo.HasMetadata {
-				if err := writeUaeMetadataForEntry(destination, amigaName, mappedName, "file", opts.uaeMetadata, entryInfo.ProtectionBits, entryInfo.Comment); err != nil {
+				if err := writeUaeMetadataForEntry(destination, amigaName, mappedName, "file", opts.uaeMetadata, entryInfo.ProtectionBits, entryInfo.Comment, &entryInfo.Date); err != nil {
 					return 0, err
 				}
 			}
 		}
-		_, err = copyFile(source, target, 0)
-		return 1, err
+		if _, err := copyFile(source, target, 0); err != nil {
+			return 0, err
+		}
+		if !opts.skipAttributes {
+			if err := setPathModeIfAvailable(target, info.Mode()); err != nil {
+				return 0, err
+			}
+		}
+		if err := setPathTimesIfAvailable(target, info.ModTime()); err != nil {
+			return 0, err
+		}
+		return 1, nil
 	}
 	if !opts.recursive {
 		return 0, errors.New("source is a directory, use --recursive")
@@ -7342,7 +9607,19 @@ func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, e
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return 0, err
 	}
-	return copyDirectoryRecursiveWithUae(source, destination, opts)
+	count, err := copyDirectoryRecursiveWithUae(source, destination, opts)
+	if err != nil {
+		return count, err
+	}
+	if !opts.skipAttributes {
+		if err := setPathModeIfAvailable(destination, info.Mode()); err != nil {
+			return count, err
+		}
+	}
+	if err := setPathTimesIfAvailable(destination, info.ModTime()); err != nil {
+		return count, err
+	}
+	return count, nil
 }
 
 func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOptions) (int, error) {
@@ -7360,6 +9637,10 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 			continue
 		}
 		srcPath := filepath.Join(source, entry.Name())
+		entryStat, err := os.Lstat(srcPath)
+		if err != nil {
+			return count, err
+		}
 		entryInfo := sourceUaeEntryInfo{
 			AmigaName:   entry.Name(),
 			HasMetadata: false,
@@ -7368,6 +9649,7 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 			entryInfo = sourceUaeEntryInfo{
 				AmigaName:      node.AmigaName,
 				ProtectionBits: node.ProtectionBits,
+				Date:           node.Date,
 				Comment:        node.Comment,
 				HasMetadata:    true,
 			}
@@ -7380,7 +9662,7 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 			if entry.IsDir() {
 				entryType = "dir"
 			}
-			if err := writeUaeMetadataForEntry(destination, entryInfo.AmigaName, mappedName, entryType, opts.uaeMetadata, entryInfo.ProtectionBits, entryInfo.Comment); err != nil {
+			if err := writeUaeMetadataForEntry(destination, entryInfo.AmigaName, mappedName, entryType, opts.uaeMetadata, entryInfo.ProtectionBits, entryInfo.Comment, &entryInfo.Date); err != nil {
 				return count, err
 			}
 		}
@@ -7393,15 +9675,56 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 			if err != nil {
 				return count, err
 			}
+			if !opts.skipAttributes {
+				if err := setPathModeIfAvailable(dstPath, entryStat.Mode()); err != nil {
+					return count, err
+				}
+			}
+			if err := setPathTimesIfAvailable(dstPath, entryStat.ModTime()); err != nil {
+				return count, err
+			}
+			count++
+			continue
+		}
+		if entryStat.Mode()&os.ModeSymlink != 0 {
+			if err := copySymlink(srcPath, dstPath); err != nil {
+				return count, err
+			}
 			count++
 			continue
 		}
 		if _, err := copyFile(srcPath, dstPath, 0); err != nil {
 			return count, err
 		}
+		if !opts.skipAttributes {
+			if err := setPathModeIfAvailable(dstPath, entryStat.Mode()); err != nil {
+				return count, err
+			}
+		}
+		if err := setPathTimesIfAvailable(dstPath, entryStat.ModTime()); err != nil {
+			return count, err
+		}
 		count++
 	}
 	return count, nil
+}
+
+func copySymlink(source, destination string) error {
+	linkTarget, err := os.Readlink(source)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil && filepath.Dir(destination) != "." {
+		return err
+	}
+	if _, err := os.Lstat(destination); err == nil {
+		if err := os.Remove(destination); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Symlink(linkTarget, destination)
 }
 
 func resolveSourceUaeEntryInfo(sourceDir, sourceName, uaeMode string) (sourceUaeEntryInfo, error) {
@@ -7416,6 +9739,7 @@ func resolveSourceUaeEntryInfo(sourceDir, sourceName, uaeMode string) (sourceUae
 	if node, ok := nodes[strings.ToLower(sourceName)]; ok {
 		info.AmigaName = node.AmigaName
 		info.ProtectionBits = node.ProtectionBits
+		info.Date = node.Date
 		info.Comment = node.Comment
 		info.HasMetadata = true
 	}
@@ -7610,19 +9934,25 @@ func decodeFilenameForUaeMetafile(name string) string {
 	return latin1Decode(out)
 }
 
-func readUaeMetafile(path string) (*int, string, error) {
+func readUaeMetafile(path string) (*int, time.Time, string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, "", err
+		return nil, time.Time{}, "", err
 	}
 	if len(b) == 0 {
-		return nil, "", nil
+		return nil, time.Time{}, "", nil
 	}
 	text := strings.TrimRight(latin1Decode(b), "\r\n")
 	if len(text) < 8 {
-		return nil, "", nil
+		return nil, time.Time{}, "", nil
 	}
 	protectionText := text[:8]
+	date := time.Time{}
+	if len(text) >= 31 {
+		if parsed, parseErr := time.ParseInLocation("2006-01-02 15:04:05.00", text[9:31], time.Local); parseErr == nil {
+			date = parsed
+		}
+	}
 	comment := ""
 	if len(text) >= 32 {
 		comment = text[32:]
@@ -7630,7 +9960,7 @@ func readUaeMetafile(path string) (*int, string, error) {
 
 	protectionParsed := parseAmigaProtectionBitsText(protectionText)
 	value := protectionParsed ^ 0xf
-	return &value, comment, nil
+	return &value, date, comment, nil
 }
 
 func parseAmigaProtectionBitsText(text string) int {
@@ -7661,13 +9991,18 @@ func parseAmigaProtectionBitsText(text string) int {
 	return bits
 }
 
-func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string, protectionBits *int, comment string) error {
+func writeUaeMetadataForEntry(dirPath, amigaName, mappedName, entryType, mode string, protectionBits *int, comment string, date *time.Time) error {
 	switch mode {
 	case "uaefsdb":
 		return writeUaeFsDb(dirPath, amigaName, mappedName, protectionBits, comment)
 	case "uaemetafile":
 		_ = entryType
-		return writeUaeMetafile(dirPath, mappedName, protectionBits, time.Now(), comment)
+		metadataDate := time.Now()
+		if date != nil && !date.IsZero() {
+			metadataDate = *date
+		}
+		metadataDate = metadataDate.Local()
+		return writeUaeMetafile(dirPath, mappedName, protectionBits, metadataDate, comment)
 	default:
 		return nil
 	}
@@ -7871,6 +10206,54 @@ func formatAmigaProtectionBits(bits int) string {
 		b.WriteByte('-')
 	}
 	return b.String()
+}
+
+func parseAmigaDateStamp(days uint32, minutes uint32, ticks uint32) time.Time {
+	if days == 0 && minutes == 0 && ticks == 0 {
+		return time.Time{}
+	}
+	epoch := time.Date(1978, 1, 1, 0, 0, 0, 0, time.Local)
+	return epoch.Add(time.Duration(days)*24*time.Hour +
+		time.Duration(minutes)*time.Minute +
+		time.Duration(ticks)*20*time.Millisecond)
+}
+
+func parseDosDateTime(v uint32) time.Time {
+	if v == 0 {
+		return time.Time{}
+	}
+	year := int(1980 + (v>>25)&0x7f)
+	month := time.Month((v >> 21) & 0x0f)
+	day := int((v >> 16) & 0x1f)
+	hour := int((v >> 11) & 0x1f)
+	minute := int((v >> 5) & 0x3f)
+	second := int(v&0x1f) * 2
+	if month < time.January || month > time.December || day < 1 || day > 31 {
+		return time.Time{}
+	}
+	return time.Date(year, month, day, hour, minute, second, 0, time.Local)
+}
+
+func formatAmigaDate(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02T15:04:05")
+}
+
+func setPathTimesIfAvailable(path string, date time.Time) error {
+	if date.IsZero() {
+		return nil
+	}
+	return os.Chtimes(path, date, date)
+}
+
+func setPathModeIfAvailable(path string, mode os.FileMode) error {
+	perm := mode.Perm()
+	if perm == 0 {
+		return nil
+	}
+	return os.Chmod(path, perm)
 }
 
 func fileOrDirExists(path string) bool {
@@ -8115,6 +10498,50 @@ type writeCloser struct {
 func (w *writeCloser) Write(p []byte) (int, error) { return w.writer.Write(p) }
 func (w *writeCloser) Close() error                { return w.close() }
 
+type deferredPathTime struct {
+	path string
+	date time.Time
+	mode os.FileMode
+}
+
+type deferredSymlink struct {
+	path   string
+	target string
+}
+
+func applyDeferredPathTimes(items []deferredPathTime) error {
+	sort.Slice(items, func(i, j int) bool { return len(items[i].path) > len(items[j].path) })
+	for _, item := range items {
+		if err := setPathModeIfAvailable(item.path, item.mode); err != nil {
+			return err
+		}
+		if err := setPathTimesIfAvailable(item.path, item.date); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyDeferredSymlinks(items []deferredSymlink) error {
+	sort.Slice(items, func(i, j int) bool { return len(items[i].path) > len(items[j].path) })
+	for _, item := range items {
+		if err := os.MkdirAll(filepath.Dir(item.path), 0o755); err != nil && filepath.Dir(item.path) != "." {
+			return err
+		}
+		if _, err := os.Lstat(item.path); err == nil {
+			if err := os.Remove(item.path); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Symlink(item.target, item.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type partitionRegion struct {
 	BasePath string
 	Table    string
@@ -8124,11 +10551,14 @@ type partitionRegion struct {
 }
 
 type archiveEntry struct {
-	Name           string `json:"name"`
-	Size           int64  `json:"size"`
-	IsDir          bool   `json:"isDir,omitempty"`
-	ProtectionBits *int   `json:"protectionBits,omitempty"`
-	Comment        string `json:"comment,omitempty"`
+	Name           string    `json:"name"`
+	Size           int64     `json:"size"`
+	IsDir          bool      `json:"isDir,omitempty"`
+	IsSymlink      bool      `json:"isSymlink,omitempty"`
+	LinkPath       string    `json:"link,omitempty"`
+	ProtectionBits *int      `json:"protectionBits,omitempty"`
+	Comment        string    `json:"comment,omitempty"`
+	Date           time.Time `json:"-"`
 }
 
 type archiveFormat string
@@ -8154,6 +10584,21 @@ var errUnsupportedLzxFeature = errors.New("unsupported lzx feature")
 var errUnsupportedRarFeature = errors.New("unsupported rar feature")
 
 func openSourceReader(path string) (io.ReadCloser, error) {
+	if rc, handled, err := openPfs3VirtualFile(path); err != nil {
+		return nil, err
+	} else if handled {
+		return rc, nil
+	}
+	if rc, handled, err := openAffsVirtualFile(path); err != nil {
+		return nil, err
+	} else if handled {
+		return rc, nil
+	}
+	if rc, handled, err := openAffsAdfVirtualFile(path); err != nil {
+		return nil, err
+	} else if handled {
+		return rc, nil
+	}
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
 		return nil, err
 	} else if ok {
@@ -8281,6 +10726,9 @@ func openDestinationWriter(path string) (io.WriteCloser, error) {
 }
 
 func openDestinationWriterWithOptions(path string, requireExisting, preserveSize bool) (io.WriteCloser, error) {
+	if isVirtualFilesystemPath(path) {
+		return nil, errors.New("writing files inside Amiga filesystem images is not implemented in pure Go yet")
+	}
 	if region, ok, err := resolvePartitionSelection(path); err != nil {
 		return nil, err
 	} else if ok {
@@ -8438,12 +10886,16 @@ func (w *partitionWriteCloser) Write(p []byte) (int, error) {
 func (w *partitionWriteCloser) Close() error { return w.f.Close() }
 
 func resolvePartitionSelection(path string) (partitionRegion, bool, error) {
-	basePath, table, index, ok := parsePartitionPath(path)
+	basePath, table, selector, ok := parsePartitionPathSelector(path)
 	if !ok {
 		return partitionRegion{}, false, nil
 	}
+	index, numeric := parsePartitionSelectorNumber(selector)
 	switch table {
 	case "mbr":
+		if !numeric {
+			return partitionRegion{}, false, fmt.Errorf("mbr partition selector '%s' is not numeric", selector)
+		}
 		parts, err := readMbrPartitions(basePath)
 		if err != nil {
 			return partitionRegion{}, false, err
@@ -8464,7 +10916,12 @@ func resolvePartitionSelection(path string) (partitionRegion, bool, error) {
 		if err != nil {
 			return partitionRegion{}, false, err
 		}
-		p, err := findGptPart(parts, index)
+		var p gptPartitionEntry
+		if numeric {
+			p, err = findGptPart(parts, index)
+		} else {
+			p, err = findGptPartByName(parts, selector)
+		}
 		if err != nil {
 			return partitionRegion{}, false, err
 		}
@@ -8476,19 +10933,33 @@ func resolvePartitionSelection(path string) (partitionRegion, bool, error) {
 			Size:     int64(p.LastLBA-p.FirstLBA+1) * mbrSectorSize,
 		}, true, nil
 	case "rdb":
-		state, err := readRdbState(basePath)
+		baseRegion := partitionRegion{
+			BasePath: basePath,
+			Offset:   0,
+		}
+		if parentRegion, parentOK, err := resolvePartitionSelection(basePath); err != nil {
+			return partitionRegion{}, false, err
+		} else if parentOK {
+			baseRegion = parentRegion
+		}
+		state, err := readRdbStateFromPathOrPartition(basePath)
 		if err != nil {
 			return partitionRegion{}, false, err
 		}
-		p, err := findRdbPart(state.Parts, index)
+		var p rdbPart
+		if numeric {
+			p, err = findRdbPart(state.Parts, index)
+		} else {
+			p, err = findRdbPartByName(state.Parts, selector)
+		}
 		if err != nil {
 			return partitionRegion{}, false, err
 		}
 		return partitionRegion{
-			BasePath: basePath,
+			BasePath: baseRegion.BasePath,
 			Table:    table,
 			Index:    index,
-			Offset:   p.Start,
+			Offset:   baseRegion.Offset + p.Start,
 			Size:     p.Size,
 		}, true, nil
 	default:
@@ -8497,21 +10968,100 @@ func resolvePartitionSelection(path string) (partitionRegion, bool, error) {
 }
 
 func parsePartitionPath(path string) (basePath string, table string, index int, ok bool) {
+	basePath, table, index, remainder, ok := parsePartitionPathWithRemainder(path)
+	if !ok || remainder != "" {
+		return "", "", 0, false
+	}
+	return basePath, table, index, true
+}
+
+func parsePartitionPathWithRemainder(path string) (basePath string, table string, index int, remainder string, ok bool) {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(path)
+	if !ok {
+		return "", "", 0, "", false
+	}
+	index, numeric := parsePartitionSelectorNumber(selector)
+	if !numeric {
+		return "", "", 0, "", false
+	}
+	return basePath, table, index, remainder, true
+}
+
+func parsePartitionPathSelector(path string) (basePath string, table string, selector string, ok bool) {
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(path)
+	if !ok || remainder != "" {
+		return "", "", "", false
+	}
+	return basePath, table, selector, true
+}
+
+func parsePartitionPathSelectorWithRemainder(path string) (basePath string, table string, selector string, remainder string, ok bool) {
 	lower := strings.ToLower(path)
+	bestPos := -1
+	bestEnd := -1
+	bestTable := ""
+	bestSelector := ""
 	for _, t := range []string{"mbr", "gpt", "rdb"} {
 		suffix := `\` + t + `\`
-		pos := strings.LastIndex(lower, suffix)
-		if pos <= 0 {
-			continue
+		searchFrom := 0
+		for {
+			rel := strings.Index(lower[searchFrom:], suffix)
+			if rel < 0 {
+				break
+			}
+			pos := searchFrom + rel
+			if pos <= 0 {
+				searchFrom = pos + len(suffix)
+				continue
+			}
+			selectorStart := pos + len(suffix)
+			selectorEnd := selectorStart
+			for selectorEnd < len(path) && path[selectorEnd] != '\\' && path[selectorEnd] != '/' {
+				selectorEnd++
+			}
+			if selectorEnd == selectorStart {
+				searchFrom = selectorStart
+				continue
+			}
+			candidate := strings.TrimSpace(path[selectorStart:selectorEnd])
+			if candidate != "" && pos > bestPos {
+				bestPos = pos
+				bestEnd = selectorEnd
+				bestTable = t
+				bestSelector = candidate
+			}
+			searchFrom = selectorStart
 		}
-		idxStr := path[pos+len(suffix):]
-		n, err := strconv.Atoi(idxStr)
-		if err != nil || n < 1 {
-			continue
-		}
-		return path[:pos], t, n, true
 	}
-	return "", "", 0, false
+	if bestPos < 0 {
+		return "", "", "", "", false
+	}
+	return path[:bestPos], bestTable, bestSelector, strings.Trim(path[bestEnd:], `\/`), true
+}
+
+func parsePartitionSelectorNumber(selector string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(selector))
+	return n, err == nil && n >= 1
+}
+
+func parseAdfVirtualPath(path string) (adfPath string, remainder string, ok bool) {
+	lower := strings.ToLower(path)
+	searchFrom := 0
+	for {
+		rel := strings.Index(lower[searchFrom:], ".adf")
+		if rel < 0 {
+			return "", "", false
+		}
+		pos := searchFrom + rel
+		end := pos + len(".adf")
+		if end == len(path) {
+			return path, "", true
+		}
+		if path[end] == '\\' || path[end] == '/' {
+			return path[:end], strings.Trim(path[end+1:], `\/`), true
+		}
+		searchFrom = end
+	}
 }
 
 func parsePartitionContainerPath(path string) (basePath string, table string, ok bool) {
@@ -8539,6 +11089,15 @@ func findGptPart(parts []gptPartitionEntry, index int) (gptPartitionEntry, error
 	return gptPartitionEntry{}, fmt.Errorf("partition %d not found", index)
 }
 
+func findGptPartByName(parts []gptPartitionEntry, name string) (gptPartitionEntry, error) {
+	for _, p := range parts {
+		if strings.EqualFold(strings.TrimSpace(p.Name), strings.TrimSpace(name)) {
+			return p, nil
+		}
+	}
+	return gptPartitionEntry{}, fmt.Errorf("partition '%s' not found", name)
+}
+
 func listArchiveEntries(path string) ([]archiveEntry, error) {
 	format := detectArchiveFormat(path)
 	switch format {
@@ -8552,12 +11111,21 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		for _, f := range zr.File {
 			entryName := strings.ReplaceAll(f.Name, "\\", "/")
 			protectionBits := zipAmigaProtectionBits(f)
+			mode := zipFileModeIfAvailable(f)
+			isSymlink := mode&os.ModeSymlink != 0
+			linkPath := ""
+			if isSymlink {
+				linkPath, _ = zipSymlinkTarget(f)
+			}
 			items = append(items, archiveEntry{
 				Name:           entryName,
 				Size:           int64(f.UncompressedSize64),
 				IsDir:          f.FileInfo().IsDir() || strings.HasSuffix(entryName, "/"),
+				IsSymlink:      isSymlink,
+				LinkPath:       linkPath,
 				ProtectionBits: protectionBits,
 				Comment:        f.Comment,
+				Date:           f.Modified,
 			})
 		}
 		return items, nil
@@ -8630,6 +11198,26 @@ func zipAmigaProtectionBits(file *zip.File) *int {
 	}
 	protectionBits := int((file.ExternalAttrs>>16)&0xff) ^ 0x0f
 	return &protectionBits
+}
+
+func zipFileModeIfAvailable(file *zip.File) os.FileMode {
+	if file.ExternalAttrs>>16 == 0 {
+		return 0
+	}
+	return file.Mode()
+}
+
+func zipSymlinkTarget(file *zip.File) (string, error) {
+	rc, err := file.Open()
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	linkBytes, err := io.ReadAll(io.LimitReader(rc, 4096))
+	if err != nil {
+		return "", err
+	}
+	return string(linkBytes), nil
 }
 
 func splitArchivePath(path string) (archivePath string, innerPath string, ok bool) {
@@ -8801,7 +11389,7 @@ func applyArchiveExtractedUaeMetadata(destination, archivePath, innerPath, uaeMo
 		if amigaName == "" || normalName == "" {
 			continue
 		}
-		if err := writeUaeMetadataForEntry(filepath.Dir(targetPath), amigaName, normalName, entryType, uaeMode, entry.ProtectionBits, entry.Comment); err != nil {
+		if err := writeUaeMetadataForEntry(filepath.Dir(targetPath), amigaName, normalName, entryType, uaeMode, entry.ProtectionBits, entry.Comment, &entry.Date); err != nil {
 			return err
 		}
 	}
@@ -8901,9 +11489,12 @@ func listTarEntriesFromReader(reader io.Reader) ([]archiveEntry, error) {
 			continue
 		}
 		items = append(items, archiveEntry{
-			Name:  hdr.Name,
-			Size:  hdr.Size,
-			IsDir: hdr.FileInfo().IsDir() || hdr.Typeflag == tar.TypeDir,
+			Name:      hdr.Name,
+			Size:      hdr.Size,
+			IsDir:     hdr.FileInfo().IsDir() || hdr.Typeflag == tar.TypeDir,
+			IsSymlink: hdr.Typeflag == tar.TypeSymlink,
+			LinkPath:  hdr.Linkname,
+			Date:      hdr.ModTime,
 		})
 	}
 	return items, nil
@@ -8957,17 +11548,20 @@ func listGzipArchiveEntries(path string) ([]archiveEntry, error) {
 		Name:  entryName,
 		Size:  size,
 		IsDir: false,
+		Date:  gr.ModTime,
 	}}, nil
 }
 
 func listXzArchiveEntries(path string) ([]archiveEntry, error) {
-	if _, err := os.Stat(path); err != nil {
+	info, err := os.Stat(path)
+	if err != nil {
 		return nil, err
 	}
 	return []archiveEntry{{
 		Name:  defaultSingleStreamArchiveEntryName(path, ".xz"),
 		Size:  0,
 		IsDir: false,
+		Date:  info.ModTime(),
 	}}, nil
 }
 
@@ -8977,6 +11571,10 @@ func listBzip2ArchiveEntries(path string) ([]archiveEntry, error) {
 		return nil, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
 
 	size, err := io.Copy(io.Discard, bzip2.NewReader(f))
 	if err != nil {
@@ -8986,6 +11584,7 @@ func listBzip2ArchiveEntries(path string) ([]archiveEntry, error) {
 		Name:  defaultSingleStreamArchiveEntryName(path, ".bz2"),
 		Size:  size,
 		IsDir: false,
+		Date:  info.ModTime(),
 	}}, nil
 }
 
@@ -8998,6 +11597,7 @@ func listLzwArchiveEntries(path string) ([]archiveEntry, error) {
 		Name:  defaultSingleStreamArchiveEntryName(path, ".z"),
 		Size:  info.Size(),
 		IsDir: false,
+		Date:  info.ModTime(),
 	}}, nil
 }
 
@@ -9137,6 +11737,10 @@ func decodeLzwData(data []byte) ([]byte, error) {
 }
 
 func extractSingleStreamArchive(reader io.Reader, entryName, innerPath, destination string) error {
+	return extractSingleStreamArchiveWithDate(reader, entryName, innerPath, destination, time.Time{})
+}
+
+func extractSingleStreamArchiveWithDate(reader io.Reader, entryName, innerPath, destination string, date time.Time) error {
 	relPath, ok := resolveArchiveEntryRelativePath(entryName, innerPath)
 	if !ok || relPath == "" {
 		return nil
@@ -9162,6 +11766,9 @@ func extractSingleStreamArchive(reader io.Reader, entryName, innerPath, destinat
 	if closeErr != nil {
 		return closeErr
 	}
+	if err := setPathTimesIfAvailable(target, date); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -9179,7 +11786,7 @@ func extractGzipArchive(archivePath, innerPath, destination string) error {
 	defer gr.Close()
 
 	entryName := gzipArchiveEntryName(archivePath, gr.Name)
-	return extractSingleStreamArchive(gr, entryName, innerPath, destination)
+	return extractSingleStreamArchiveWithDate(gr, entryName, innerPath, destination, gr.ModTime)
 }
 
 func extractXzArchive(archivePath, innerPath, destination string) error {
@@ -9188,6 +11795,10 @@ func extractXzArchive(archivePath, innerPath, destination string) error {
 		return err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
 
 	xzr, err := xz.NewReader(f)
 	if err != nil {
@@ -9195,7 +11806,7 @@ func extractXzArchive(archivePath, innerPath, destination string) error {
 	}
 
 	entryName := defaultSingleStreamArchiveEntryName(archivePath, ".xz")
-	return extractSingleStreamArchive(xzr, entryName, innerPath, destination)
+	return extractSingleStreamArchiveWithDate(xzr, entryName, innerPath, destination, info.ModTime())
 }
 
 func extractBzip2Archive(archivePath, innerPath, destination string) error {
@@ -9204,12 +11815,17 @@ func extractBzip2Archive(archivePath, innerPath, destination string) error {
 		return err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
 
-	return extractSingleStreamArchive(
+	return extractSingleStreamArchiveWithDate(
 		bzip2.NewReader(f),
 		defaultSingleStreamArchiveEntryName(archivePath, ".bz2"),
 		innerPath,
 		destination,
+		info.ModTime(),
 	)
 }
 
@@ -9218,11 +11834,16 @@ func extractLzwArchive(archivePath, innerPath, destination string) error {
 	if err != nil {
 		return err
 	}
-	return extractSingleStreamArchive(
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return err
+	}
+	return extractSingleStreamArchiveWithDate(
 		bytes.NewReader(data),
 		defaultSingleStreamArchiveEntryName(archivePath, ".z"),
 		innerPath,
 		destination,
+		info.ModTime(),
 	)
 }
 
@@ -9274,6 +11895,8 @@ func extractTarBzip2Archive(archivePath, innerPath, destination string) error {
 
 func extractTarFromReader(reader io.Reader, innerPath, destination string) error {
 	tr := tar.NewReader(reader)
+	deferredDirTimes := make([]deferredPathTime, 0)
+	deferredSymlinks := make([]deferredSymlink, 0)
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
@@ -9301,6 +11924,7 @@ func extractTarFromReader(reader io.Reader, innerPath, destination string) error
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			deferredDirTimes = append(deferredDirTimes, deferredPathTime{path: target, date: hdr.ModTime, mode: hdr.FileInfo().Mode()})
 		case tar.TypeReg, tar.TypeRegA:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -9317,14 +11941,25 @@ func extractTarFromReader(reader io.Reader, innerPath, destination string) error
 			if closeErr != nil {
 				return closeErr
 			}
-		case tar.TypeSymlink, tar.TypeLink:
-			// Keep extraction deterministic and safe without recreating links.
+			if err := setPathModeIfAvailable(target, hdr.FileInfo().Mode()); err != nil {
+				return err
+			}
+			if err := setPathTimesIfAvailable(target, hdr.ModTime); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			deferredSymlinks = append(deferredSymlinks, deferredSymlink{path: target, target: hdr.Linkname})
+		case tar.TypeLink:
+			// Keep hardlink extraction deterministic without recreating additional filesystem references.
 			continue
 		default:
 			continue
 		}
 	}
-	return nil
+	if err := applyDeferredSymlinks(deferredSymlinks); err != nil {
+		return err
+	}
+	return applyDeferredPathTimes(deferredDirTimes)
 }
 
 const (
@@ -9640,6 +12275,7 @@ func listRarArchiveEntries(path string) ([]archiveEntry, error) {
 			Name:  entryName,
 			Size:  h.UnPackedSize,
 			IsDir: h.IsDir,
+			Date:  h.ModificationTime,
 		})
 	}
 	return items, nil
@@ -9655,11 +12291,12 @@ func extractRarArchive(archivePath, innerPath, destination string) error {
 	}
 	defer rr.Close()
 
+	deferredDirTimes := make([]deferredPathTime, 0)
 	for {
 		h, err := rr.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return applyDeferredPathTimes(deferredDirTimes)
 			}
 			if isRarUnsupportedFeatureError(err) {
 				return errUnsupportedRarFeature
@@ -9687,7 +12324,10 @@ func extractRarArchive(archivePath, innerPath, destination string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
-			applyExtractedArchiveMetadata(target, h.Mode(), h.ModificationTime)
+			if perm := h.Mode().Perm(); perm != 0 {
+				_ = os.Chmod(target, perm)
+			}
+			deferredDirTimes = append(deferredDirTimes, deferredPathTime{path: target, date: h.ModificationTime})
 			continue
 		}
 
@@ -10338,6 +12978,7 @@ type lhaEntry struct {
 	Comment        string
 	Method         string
 	Attribute      byte
+	Date           time.Time
 	CompressedSize uint32
 	OriginalSize   uint32
 	DataOffset     int
@@ -10377,6 +13018,7 @@ func listLhaArchiveEntries(path string) ([]archiveEntry, error) {
 			IsDir:          e.IsDir || strings.EqualFold(e.Method, "-lhd-"),
 			ProtectionBits: &protectionBits,
 			Comment:        e.Comment,
+			Date:           e.Date,
 		})
 	}
 	return items, nil
@@ -10400,6 +13042,7 @@ func listLhaArchiveEntriesJerom(path string) ([]archiveEntry, error) {
 			IsDir:          isDir,
 			ProtectionBits: &protectionBits,
 			Comment:        comment,
+			Date:           time.Unix(header.UnixLastModifiedStamp, 0).Local(),
 		})
 	}
 	return items, nil
@@ -10435,6 +13078,7 @@ func listLhaArchiveEntriesNative(path string) ([]archiveEntry, error) {
 			IsDir:          isDir,
 			ProtectionBits: &protectionBits,
 			Comment:        comment,
+			Date:           h.Time,
 		})
 	}
 	return items, nil
@@ -10466,6 +13110,7 @@ func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
 	defer f.Close()
 
 	r := lhago.NewReader(f)
+	deferredDirTimes := make([]deferredPathTime, 0)
 	for {
 		h, err := lhaNextHeaderSafe(r)
 		if err != nil {
@@ -10493,6 +13138,7 @@ func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			deferredDirTimes = append(deferredDirTimes, deferredPathTime{path: target, date: h.Time})
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -10509,6 +13155,9 @@ func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
 			if closeErr != nil {
 				return closeErr
 			}
+			if err := setPathTimesIfAvailable(target, h.Time); err != nil {
+				return err
+			}
 			continue
 		}
 		_ = os.Remove(target)
@@ -10517,7 +13166,7 @@ func extractLhaArchiveNative(archivePath, innerPath, destination string) error {
 		}
 		return decodeErr
 	}
-	return nil
+	return applyDeferredPathTimes(deferredDirTimes)
 }
 
 func extractLhaArchiveJerom(archivePath, innerPath, destination string) error {
@@ -10527,6 +13176,7 @@ func extractLhaArchiveJerom(archivePath, innerPath, destination string) error {
 	}
 
 	lha := jlhago.NewLha(archivePath)
+	deferredDirTimes := make([]deferredPathTime, 0)
 	for _, header := range headers {
 		entryName, _, isDir := lhaJeromHeaderEntry(header)
 		if entryName == "" {
@@ -10545,6 +13195,7 @@ func extractLhaArchiveJerom(archivePath, innerPath, destination string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			deferredDirTimes = append(deferredDirTimes, deferredPathTime{path: target, date: time.Unix(header.UnixLastModifiedStamp, 0).Local()})
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -10563,8 +13214,11 @@ func extractLhaArchiveJerom(archivePath, innerPath, destination string) error {
 		if err := os.WriteFile(target, content, 0o644); err != nil {
 			return err
 		}
+		if err := setPathTimesIfAvailable(target, time.Unix(header.UnixLastModifiedStamp, 0).Local()); err != nil {
+			return err
+		}
 	}
-	return nil
+	return applyDeferredPathTimes(deferredDirTimes)
 }
 
 func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) error {
@@ -10576,6 +13230,7 @@ func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) err
 	if err != nil {
 		return err
 	}
+	deferredDirTimes := make([]deferredPathTime, 0)
 	for _, e := range entries {
 		relPath, ok := resolveArchiveEntryRelativePath(e.Name, innerPath)
 		if !ok || relPath == "" {
@@ -10591,6 +13246,7 @@ func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) err
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			deferredDirTimes = append(deferredDirTimes, deferredPathTime{path: target, date: e.Date})
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -10607,8 +13263,11 @@ func extractLhaArchiveStoredOnly(archivePath, innerPath, destination string) err
 		if err := os.WriteFile(target, decoded, 0o644); err != nil {
 			return err
 		}
+		if err := setPathTimesIfAvailable(target, e.Date); err != nil {
+			return err
+		}
 	}
-	return nil
+	return applyDeferredPathTimes(deferredDirTimes)
 }
 
 func lhaNextHeaderSafe(r *lhago.Reader) (h *lhago.Header, err error) {
@@ -10915,6 +13574,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 		dirPrefix := ""
 		dataOffset := 0
 		compressedSize := uint32(0)
+		modified := time.Time{}
 
 		switch level {
 		case 0, 1:
@@ -10929,6 +13589,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 			method = string(data[offset+2 : offset+7])
 			compressedSize = binary.LittleEndian.Uint32(data[offset+7 : offset+11])
 			originalSize = binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+			modified = parseDosDateTime(binary.LittleEndian.Uint32(data[offset+15 : offset+19]))
 			attribute = data[offset+19]
 			nameLen := int(data[offset+21])
 			nameStart := offset + 22
@@ -10973,6 +13634,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 			method = string(data[offset+2 : offset+7])
 			compressedSize = binary.LittleEndian.Uint32(data[offset+7 : offset+11])
 			originalSize = binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+			modified = parseDosDateTime(binary.LittleEndian.Uint32(data[offset+15 : offset+19]))
 			attribute = data[offset+19]
 			nextExtSize := int(binary.LittleEndian.Uint16(data[offset+24 : offset+26]))
 			extCursor, _, extName, extComment, extDir, err := parseLhaExtendedHeaders(data, offset+26, nextExtSize, 2)
@@ -10997,6 +13659,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 			method = string(data[offset+2 : offset+7])
 			compressedSize = binary.LittleEndian.Uint32(data[offset+7 : offset+11])
 			originalSize = binary.LittleEndian.Uint32(data[offset+11 : offset+15])
+			modified = parseDosDateTime(binary.LittleEndian.Uint32(data[offset+15 : offset+19]))
 			attribute = data[offset+19]
 			nextExtSize := int(binary.LittleEndian.Uint32(data[offset+28 : offset+32]))
 			extCursor, _, extName, extComment, extDir, err := parseLhaExtendedHeaders(data, offset+32, nextExtSize, 4)
@@ -11038,6 +13701,7 @@ func parseLhaEntries(data []byte) ([]lhaEntry, error) {
 			Comment:        comment,
 			Method:         method,
 			Attribute:      attribute,
+			Date:           modified,
 			CompressedSize: compressedSize,
 			OriginalSize:   originalSize,
 			DataOffset:     dataOffset,
@@ -11104,6 +13768,8 @@ func extractZip(archivePath, innerPath, destination string) error {
 		return err
 	}
 	defer zr.Close()
+	deferredDirTimes := make([]deferredPathTime, 0)
+	deferredSymlinks := make([]deferredSymlink, 0)
 	for _, f := range zr.File {
 		relPath, ok := resolveArchiveEntryRelativePath(f.Name, innerPath)
 		if !ok || relPath == "" {
@@ -11117,6 +13783,15 @@ func extractZip(archivePath, innerPath, destination string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			deferredDirTimes = append(deferredDirTimes, deferredPathTime{path: target, date: f.Modified, mode: zipFileModeIfAvailable(f)})
+			continue
+		}
+		if zipFileModeIfAvailable(f)&os.ModeSymlink != 0 {
+			linkTarget, err := zipSymlinkTarget(f)
+			if err != nil {
+				return err
+			}
+			deferredSymlinks = append(deferredSymlinks, deferredSymlink{path: target, target: linkTarget})
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -11143,6 +13818,15 @@ func extractZip(archivePath, innerPath, destination string) error {
 		if closeErr2 != nil {
 			return closeErr2
 		}
+		if err := setPathModeIfAvailable(target, zipFileModeIfAvailable(f)); err != nil {
+			return err
+		}
+		if err := setPathTimesIfAvailable(target, f.Modified); err != nil {
+			return err
+		}
 	}
-	return nil
+	if err := applyDeferredSymlinks(deferredSymlinks); err != nil {
+		return err
+	}
+	return applyDeferredPathTimes(deferredDirTimes)
 }
