@@ -512,6 +512,93 @@ func TestFsExtractTarGzNative(t *testing.T) {
 	}
 }
 
+func TestArchiveListTarAndZipSymlinkMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	tarPath := filepath.Join(tmp, "links.tar.gz")
+	if err := writeTarGzArchiveWithSymlink(tarPath, "target.txt", "link.txt"); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(tmp, "links.zip")
+	if err := writeZipArchiveWithSymlink(zipPath, "target.txt", "link.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, archivePath := range []string{tarPath, zipPath} {
+		var out bytes.Buffer
+		if err := run([]string{"--format", "json", "archive", "list", archivePath}, &out); err != nil {
+			t.Fatalf("archive list failed for %s: %v", archivePath, err)
+		}
+		var payload struct {
+			Entries []struct {
+				Name      string `json:"name"`
+				IsSymlink bool   `json:"isSymlink"`
+				Link      string `json:"link"`
+			} `json:"entries"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+			t.Fatalf("invalid archive list json: %v\n%s", err, out.String())
+		}
+		found := false
+		for _, entry := range payload.Entries {
+			if entry.Name == "link.txt" {
+				found = true
+				if !entry.IsSymlink || entry.Link != "target.txt" {
+					t.Fatalf("unexpected symlink metadata for %s: %+v", archivePath, entry)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("link entry not found in %s: %+v", archivePath, payload.Entries)
+		}
+	}
+}
+
+func TestFsExtractTarGzSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on many Windows runners")
+	}
+	tmp := t.TempDir()
+	tarPath := filepath.Join(tmp, "links.tar.gz")
+	if err := writeTarGzArchiveWithSymlink(tarPath, "target.txt", "link.txt"); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", tarPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract tar symlink failed: %v", err)
+	}
+	target, err := os.Readlink(filepath.Join(dest, "link.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted symlink: %v", err)
+	}
+	if target != "target.txt" {
+		t.Fatalf("unexpected symlink target: %q", target)
+	}
+}
+
+func TestFsExtractZipSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on many Windows runners")
+	}
+	tmp := t.TempDir()
+	zipPath := filepath.Join(tmp, "links.zip")
+	if err := writeZipArchiveWithSymlink(zipPath, "target.txt", "link.txt"); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(tmp, "out")
+	var out bytes.Buffer
+	if err := run([]string{"fs", "extract", zipPath, dest, "--recursive"}, &out); err != nil {
+		t.Fatalf("fs extract zip symlink failed: %v", err)
+	}
+	target, err := os.Readlink(filepath.Join(dest, "link.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted symlink: %v", err)
+	}
+	if target != "target.txt" {
+		t.Fatalf("unexpected symlink target: %q", target)
+	}
+}
+
 func TestArchiveListTarXzNative(t *testing.T) {
 	tmp := t.TempDir()
 	tarXzPath := filepath.Join(tmp, "sample.tar.xz")
@@ -1860,6 +1947,59 @@ func writeTarGzArchive(path string, files map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func writeTarGzArchiveWithSymlink(path, targetName, linkName string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+	if err := tw.WriteHeader(&tar.Header{
+		Name: targetName,
+		Mode: 0o644,
+		Size: int64(len("target")),
+	}); err != nil {
+		return err
+	}
+	if _, err := io.Copy(tw, strings.NewReader("target")); err != nil {
+		return err
+	}
+	return tw.WriteHeader(&tar.Header{
+		Name:     linkName,
+		Typeflag: tar.TypeSymlink,
+		Mode:     0o777,
+		Linkname: targetName,
+	})
+}
+
+func writeZipArchiveWithSymlink(path, targetName, linkName string) error {
+	zf, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer zf.Close()
+	zw := zip.NewWriter(zf)
+	defer zw.Close()
+	w, err := zw.Create(targetName)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("target")); err != nil {
+		return err
+	}
+	hdr := &zip.FileHeader{Name: linkName}
+	hdr.SetMode(os.ModeSymlink | 0o777)
+	w, err = zw.CreateHeader(hdr)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte(targetName))
+	return err
 }
 
 func writeTarXzArchive(path string, files map[string]string) error {

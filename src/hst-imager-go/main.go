@@ -774,6 +774,8 @@ type fsDirLegacyStyleItem struct {
 	Type       int    `json:"type"`
 	Size       int64  `json:"size"`
 	Attributes string `json:"attributes,omitempty"`
+	IsSymlink  bool   `json:"isSymlink,omitempty"`
+	Link       string `json:"link,omitempty"`
 }
 
 type uaeMetadataNodeInfo struct {
@@ -1082,12 +1084,14 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 		Attributes string
 	}
 	type aggregateItem struct {
-		name           string
-		hasDirect      bool
-		hasChildren    bool
-		directIsDir    bool
-		directSize     int64
-		protectionBits *int
+		name            string
+		hasDirect       bool
+		hasChildren     bool
+		directIsDir     bool
+		directIsSymlink bool
+		directSize      int64
+		link            string
+		protectionBits  *int
 	}
 	aggregates := make(map[string]*aggregateItem)
 	prefix := normalizeArchivePath(innerPath)
@@ -1116,7 +1120,9 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 		if len(parts) == 1 {
 			aggregate.hasDirect = true
 			aggregate.directIsDir = e.IsDir
+			aggregate.directIsSymlink = e.IsSymlink
 			aggregate.directSize = e.Size
+			aggregate.link = e.Link
 			if e.ProtectionBits != nil {
 				bits := *e.ProtectionBits
 				aggregate.protectionBits = &bits
@@ -1156,6 +1162,8 @@ func handleFsDirArchive(archivePath, innerPath string, stdout io.Writer, opts Gl
 				Type:       typeValue,
 				Size:       i.Size,
 				Attributes: i.Attributes,
+				IsSymlink:  aggregates[i.Name] != nil && aggregates[i.Name].directIsSymlink,
+				Link:       aggregates[i.Name].link,
 			})
 		}
 		return writeJSON(stdout, map[string]any{"path": archivePath, "innerPath": innerPath, "entries": jsonItems})
@@ -7309,9 +7317,19 @@ func parseFsOptions(args []string) (fsPathOptions, error) {
 }
 
 func copyPathWithOptions(source, destination string, opts fsPathOptions) (int, error) {
-	info, err := os.Stat(source)
+	info, err := os.Lstat(source)
 	if err != nil {
 		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target := destination
+		if dstInfo, err := os.Stat(destination); err == nil && dstInfo.IsDir() {
+			target = filepath.Join(destination, filepath.Base(source))
+		}
+		if err := copySymlink(source, target); err != nil {
+			return 0, err
+		}
+		return 1, nil
 	}
 	if !info.IsDir() {
 		sourceName := filepath.Base(source)
@@ -7360,6 +7378,14 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 			continue
 		}
 		srcPath := filepath.Join(source, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			dstPath := filepath.Join(destination, entry.Name())
+			if err := copySymlink(srcPath, dstPath); err != nil {
+				return count, err
+			}
+			count++
+			continue
+		}
 		entryInfo := sourceUaeEntryInfo{
 			AmigaName:   entry.Name(),
 			HasMetadata: false,
@@ -7402,6 +7428,20 @@ func copyDirectoryRecursiveWithUae(source, destination string, opts fsPathOption
 		count++
 	}
 	return count, nil
+}
+
+func copySymlink(source, destination string) error {
+	target, err := os.Readlink(source)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	if err := removeExistingArchiveLinkTarget(destination); err != nil {
+		return err
+	}
+	return os.Symlink(target, destination)
 }
 
 func resolveSourceUaeEntryInfo(sourceDir, sourceName, uaeMode string) (sourceUaeEntryInfo, error) {
@@ -8127,6 +8167,8 @@ type archiveEntry struct {
 	Name           string `json:"name"`
 	Size           int64  `json:"size"`
 	IsDir          bool   `json:"isDir,omitempty"`
+	IsSymlink      bool   `json:"isSymlink,omitempty"`
+	Link           string `json:"link,omitempty"`
 	ProtectionBits *int   `json:"protectionBits,omitempty"`
 	Comment        string `json:"comment,omitempty"`
 }
@@ -8552,10 +8594,22 @@ func listArchiveEntries(path string) ([]archiveEntry, error) {
 		for _, f := range zr.File {
 			entryName := strings.ReplaceAll(f.Name, "\\", "/")
 			protectionBits := zipAmigaProtectionBits(f)
+			mode := f.FileInfo().Mode()
+			isSymlink := mode&os.ModeSymlink != 0
+			link := ""
+			size := int64(f.UncompressedSize64)
+			if isSymlink {
+				if target, err := readZipSymlinkTarget(f); err == nil {
+					link = target
+					size = 0
+				}
+			}
 			items = append(items, archiveEntry{
 				Name:           entryName,
-				Size:           int64(f.UncompressedSize64),
+				Size:           size,
 				IsDir:          f.FileInfo().IsDir() || strings.HasSuffix(entryName, "/"),
+				IsSymlink:      isSymlink,
+				Link:           link,
 				ProtectionBits: protectionBits,
 				Comment:        f.Comment,
 			})
@@ -8692,6 +8746,98 @@ func safeArchiveTargetPath(destination, relPath, sourceName string) (string, err
 		return target, nil
 	}
 	return "", fmt.Errorf("archive entry escapes destination: %s", sourceName)
+}
+
+type archiveLink struct {
+	TargetPath string
+	LinkName   string
+	SourceName string
+	Symlink    bool
+}
+
+func createArchiveLinks(destination string, links []archiveLink) error {
+	for _, link := range links {
+		if link.Symlink {
+			if err := createArchiveSymlink(link); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := createArchiveHardlink(destination, link); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createArchiveSymlink(link archiveLink) error {
+	if err := validateArchiveLinkName(link.LinkName, link.SourceName); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(link.TargetPath), 0o755); err != nil {
+		return err
+	}
+	if err := removeExistingArchiveLinkTarget(link.TargetPath); err != nil {
+		return err
+	}
+	return os.Symlink(filepath.FromSlash(link.LinkName), link.TargetPath)
+}
+
+func createArchiveHardlink(destination string, link archiveLink) error {
+	target, err := safeArchiveTargetPath(destination, link.LinkName, link.SourceName)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(link.TargetPath), 0o755); err != nil {
+		return err
+	}
+	if err := removeExistingArchiveLinkTarget(link.TargetPath); err != nil {
+		return err
+	}
+	return os.Link(target, link.TargetPath)
+}
+
+func validateArchiveLinkName(linkName, sourceName string) error {
+	if strings.TrimSpace(linkName) == "" {
+		return fmt.Errorf("archive link has empty target: %s", sourceName)
+	}
+	linkName = strings.ReplaceAll(linkName, "\\", "/")
+	if path.IsAbs(linkName) || filepath.IsAbs(linkName) || filepath.VolumeName(linkName) != "" {
+		return fmt.Errorf("archive link target escapes destination: %s", sourceName)
+	}
+	for _, part := range strings.Split(path.Clean(linkName), "/") {
+		if part == ".." {
+			return fmt.Errorf("archive link target escapes destination: %s", sourceName)
+		}
+	}
+	return nil
+}
+
+func removeExistingArchiveLinkTarget(target string) error {
+	info, err := os.Lstat(target)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("archive link target already exists as directory: %s", target)
+	}
+	return os.Remove(target)
+}
+
+func readZipSymlinkTarget(f *zip.File) (string, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(io.LimitReader(rc, 4096))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(b), "\x00\r\n"), nil
 }
 
 func singleExtractedFilePath(dir string) (string, bool) {
@@ -8901,12 +9047,21 @@ func listTarEntriesFromReader(reader io.Reader) ([]archiveEntry, error) {
 			continue
 		}
 		items = append(items, archiveEntry{
-			Name:  hdr.Name,
-			Size:  hdr.Size,
-			IsDir: hdr.FileInfo().IsDir() || hdr.Typeflag == tar.TypeDir,
+			Name:      hdr.Name,
+			Size:      tarEntryDisplaySize(hdr),
+			IsDir:     hdr.FileInfo().IsDir() || hdr.Typeflag == tar.TypeDir,
+			IsSymlink: hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink,
+			Link:      hdr.Linkname,
 		})
 	}
 	return items, nil
+}
+
+func tarEntryDisplaySize(hdr *tar.Header) int64 {
+	if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
+		return 0
+	}
+	return hdr.Size
 }
 
 func defaultSingleStreamArchiveEntryName(path, ext string) string {
@@ -9274,6 +9429,7 @@ func extractTarBzip2Archive(archivePath, innerPath, destination string) error {
 
 func extractTarFromReader(reader io.Reader, innerPath, destination string) error {
 	tr := tar.NewReader(reader)
+	pendingLinks := make([]archiveLink, 0)
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
@@ -9317,14 +9473,24 @@ func extractTarFromReader(reader io.Reader, innerPath, destination string) error
 			if closeErr != nil {
 				return closeErr
 			}
-		case tar.TypeSymlink, tar.TypeLink:
-			// Keep extraction deterministic and safe without recreating links.
-			continue
+		case tar.TypeSymlink:
+			pendingLinks = append(pendingLinks, archiveLink{
+				TargetPath: target,
+				LinkName:   hdr.Linkname,
+				SourceName: hdr.Name,
+				Symlink:    true,
+			})
+		case tar.TypeLink:
+			pendingLinks = append(pendingLinks, archiveLink{
+				TargetPath: target,
+				LinkName:   hdr.Linkname,
+				SourceName: hdr.Name,
+			})
 		default:
 			continue
 		}
 	}
-	return nil
+	return createArchiveLinks(destination, pendingLinks)
 }
 
 const (
@@ -11104,6 +11270,7 @@ func extractZip(archivePath, innerPath, destination string) error {
 		return err
 	}
 	defer zr.Close()
+	pendingLinks := make([]archiveLink, 0)
 	for _, f := range zr.File {
 		relPath, ok := resolveArchiveEntryRelativePath(f.Name, innerPath)
 		if !ok || relPath == "" {
@@ -11117,6 +11284,19 @@ func extractZip(archivePath, innerPath, destination string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			continue
+		}
+		if f.FileInfo().Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := readZipSymlinkTarget(f)
+			if err != nil {
+				return err
+			}
+			pendingLinks = append(pendingLinks, archiveLink{
+				TargetPath: target,
+				LinkName:   linkTarget,
+				SourceName: f.Name,
+				Symlink:    true,
+			})
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -11144,5 +11324,5 @@ func extractZip(archivePath, innerPath, destination string) error {
 			return closeErr2
 		}
 	}
-	return nil
+	return createArchiveLinks(destination, pendingLinks)
 }

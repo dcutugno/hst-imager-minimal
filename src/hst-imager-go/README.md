@@ -105,6 +105,7 @@ Pure-Go parity progress:
 - single-stream compressed archives now have native pure-Go handling for `archive list` and `fs extract` (`.gz`, `.xz`, `.bz2`, `.z`) with inner-path matching semantics.
 - `fs extract` archive-root behavior now matches legacy semantics: when inner path is empty, extraction is recursive even without `--recursive`.
 - archive path extraction now handles exact single-file inner paths and case-insensitive matching (`archive\Dir\File`).
+- TAR/ZIP archive symlinks are exposed in JSON metadata and preserved by `fs extract`/host copy in pure-Go mode.
 - LHA now has native `archive list` and native `fs extract` for mixed archives, including compressed `-lh4-/-lh5-/-lh6-/-lh7-` and stored `-lh0-` through vendored `koron-go/lha`.
 - LZX now has native `archive list` and native `fs extract`, including compressed mode (`pack_mode=2`) and merged-file groups.
 - RAR now has native `archive list` and native `fs extract` for standard single-archive inputs.

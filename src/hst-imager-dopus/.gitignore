@@ -1,0 +1,10 @@
+node_modules/
+.npm-cache/
+dist/
+.engine-test/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+!src-tauri/icons/
+!src-tauri/icons/icon.png
