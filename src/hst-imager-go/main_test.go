@@ -5105,6 +5105,44 @@ func TestFsCopyResolvesUaeMetafileSourcePath(t *testing.T) {
 	}
 }
 
+func TestFsMkLinkLocalSymlinkJson(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows symlink creation depends on privileges")
+	}
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "target.txt")
+	linkPath := filepath.Join(tmp, "nested", "link.txt")
+	if err := os.WriteFile(target, []byte("linked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"--format", "json", "fs", "mklink", linkPath, target}, &out); err != nil {
+		t.Fatalf("fs mklink failed: %v", err)
+	}
+	linkInfo, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("expected created link: %v", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected symlink mode, got %s", linkInfo.Mode())
+	}
+	gotTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTarget != target {
+		t.Fatalf("expected link target %q, got %q", target, gotTarget)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, out.String())
+	}
+	if payload["status"] != "created" || payload["path"] != linkPath || payload["target"] != target {
+		t.Fatalf("unexpected mklink payload: %+v", payload)
+	}
+}
+
 func TestFsDeleteLocalFileJson(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "delete-me.txt")
@@ -5578,6 +5616,127 @@ func TestAffsAdfVirtualPathListsReadsAndCopies(t *testing.T) {
 	}
 	if len(subListing.Entries) != 1 || subListing.Entries[0].Name != "nested" || subListing.Entries[0].RawPath != imagePath+`\Dir\nested` {
 		t.Fatalf("unexpected ADF subdir listing: %#v", subListing.Entries)
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "mklink", imagePath + `\link2.txt`, "file.txt"}, &out); err != nil {
+		t.Fatalf("fs mklink ADF file failed: %v", err)
+	}
+	var mklinkPayload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &mklinkPayload); err != nil {
+		t.Fatalf("unmarshal ADF mklink payload failed: %v\n%s", err, out.String())
+	}
+	if mklinkPayload["status"] != "created" || mklinkPayload["path"] != imagePath+`\link2.txt` || mklinkPayload["target"] != "file.txt" {
+		t.Fatalf("unexpected ADF mklink payload: %+v", mklinkPayload)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "dir", imagePath}, &out); err != nil {
+		t.Fatalf("fs dir ADF root after mklink failed: %v", err)
+	}
+	rootListing = struct {
+		Path    string      `json:"path"`
+		Entries []fsDirItem `json:"entries"`
+	}{}
+	if err := json.Unmarshal(out.Bytes(), &rootListing); err != nil {
+		t.Fatalf("unmarshal ADF root post-mklink listing failed: %v", err)
+	}
+	byName = map[string]fsDirItem{}
+	for _, entry := range rootListing.Entries {
+		byName[entry.Name] = entry
+	}
+	if byName["link2.txt"].Type != "linkfile" || byName["link2.txt"].LinkPath != "file.txt" {
+		t.Fatalf("unexpected ADF created link entry: %#v", byName["link2.txt"])
+	}
+
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "mkdir", imagePath + `\Dir\NewDir`}, &out); err != nil {
+		t.Fatalf("fs mkdir ADF directory failed: %v", err)
+	}
+	var mkdirPayload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &mkdirPayload); err != nil {
+		t.Fatalf("unmarshal ADF mkdir payload failed: %v\n%s", err, out.String())
+	}
+	if mkdirPayload["status"] != "created" || mkdirPayload["path"] != imagePath+`\Dir\NewDir` {
+		t.Fatalf("unexpected ADF mkdir payload: %+v", mkdirPayload)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "dir", imagePath + `\Dir`}, &out); err != nil {
+		t.Fatalf("fs dir ADF subdir after mkdir failed: %v", err)
+	}
+	subListing = struct {
+		Entries []fsDirItem `json:"entries"`
+	}{}
+	if err := json.Unmarshal(out.Bytes(), &subListing); err != nil {
+		t.Fatalf("unmarshal ADF post-mkdir listing failed: %v", err)
+	}
+	created := false
+	for _, entry := range subListing.Entries {
+		if entry.Name == "NewDir" && entry.Type == "dir" {
+			created = true
+			break
+		}
+	}
+	if !created {
+		t.Fatalf("expected NewDir in ADF listing after mkdir, got %#v", subListing.Entries)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "rename", imagePath + `\Dir\NewDir`, imagePath + `\Dir\RenamedDir`}, &out); err != nil {
+		t.Fatalf("fs rename ADF directory failed: %v", err)
+	}
+	var renamePayload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &renamePayload); err != nil {
+		t.Fatalf("unmarshal ADF rename payload failed: %v\n%s", err, out.String())
+	}
+	if renamePayload["status"] != "renamed" || renamePayload["source"] != imagePath+`\Dir\NewDir` || renamePayload["destination"] != imagePath+`\Dir\RenamedDir` {
+		t.Fatalf("unexpected ADF rename payload: %+v", renamePayload)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "dir", imagePath + `\Dir`}, &out); err != nil {
+		t.Fatalf("fs dir ADF subdir after rename failed: %v", err)
+	}
+	subListing = struct {
+		Entries []fsDirItem `json:"entries"`
+	}{}
+	if err := json.Unmarshal(out.Bytes(), &subListing); err != nil {
+		t.Fatalf("unmarshal ADF post-rename listing failed: %v", err)
+	}
+	renamed := false
+	for _, entry := range subListing.Entries {
+		if entry.Name == "NewDir" {
+			t.Fatalf("did not expect NewDir after rename, got %#v", subListing.Entries)
+		}
+		if entry.Name == "RenamedDir" && entry.Type == "dir" {
+			renamed = true
+		}
+	}
+	if !renamed {
+		t.Fatalf("expected RenamedDir in ADF listing after rename, got %#v", subListing.Entries)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "delete", imagePath + `\Dir\RenamedDir`}, &out); err != nil {
+		t.Fatalf("fs delete ADF directory failed: %v", err)
+	}
+	var deletePayload map[string]any
+	if err := json.Unmarshal(out.Bytes(), &deletePayload); err != nil {
+		t.Fatalf("unmarshal ADF delete payload failed: %v\n%s", err, out.String())
+	}
+	if deletePayload["status"] != "deleted" || deletePayload["path"] != imagePath+`\Dir\RenamedDir` {
+		t.Fatalf("unexpected ADF delete payload: %+v", deletePayload)
+	}
+	out.Reset()
+	if err := run([]string{"--format", "json", "fs", "dir", imagePath + `\Dir`}, &out); err != nil {
+		t.Fatalf("fs dir ADF subdir after delete failed: %v", err)
+	}
+	subListing = struct {
+		Entries []fsDirItem `json:"entries"`
+	}{}
+	if err := json.Unmarshal(out.Bytes(), &subListing); err != nil {
+		t.Fatalf("unmarshal ADF post-delete listing failed: %v", err)
+	}
+	for _, entry := range subListing.Entries {
+		if entry.Name == "NewDir" || entry.Name == "RenamedDir" {
+			t.Fatalf("did not expect created dir after delete, got %#v", subListing.Entries)
+		}
 	}
 
 	readPath := filepath.Join(tmp, "link-copy.txt")

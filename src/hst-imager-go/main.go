@@ -3810,6 +3810,15 @@ func handleFsMkdir(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return errors.New("usage: fs mkdir <path>")
 	}
 	if isVirtualFilesystemPath(args[0]) {
+		if handled, err := createAffsVirtualDirectory(args[0]); err != nil {
+			return err
+		} else if handled {
+			if opts.Format == "json" {
+				return writeJSON(stdout, map[string]any{"path": args[0], "status": "created"})
+			}
+			fmt.Fprintf(stdout, "Created directory '%s'.\n", args[0])
+			return nil
+		}
 		return runUnsupportedVirtualMutationOrLegacy("fs mkdir", args, stdout, opts, "creating directories inside Amiga filesystem images")
 	}
 	if err := os.MkdirAll(args[0], 0o755); err != nil {
@@ -3826,7 +3835,37 @@ func handleFsMkLink(args []string, stdout io.Writer, opts GlobalOptions) error {
 	if len(args) < 2 {
 		return errors.New("usage: fs mklink <from-path> <to-path>")
 	}
-	return runUnsupportedVirtualMutationOrLegacy("fs mklink", args, stdout, opts, "creating links inside Amiga filesystem images")
+	fromPath := args[0]
+	toPath := args[1]
+	if isVirtualFilesystemPath(fromPath) {
+		if handled, err := createAffsVirtualLink(fromPath, toPath); err != nil {
+			return err
+		} else if handled {
+			if opts.Format == "json" {
+				return writeJSON(stdout, map[string]any{"path": fromPath, "target": toPath, "status": "created"})
+			}
+			fmt.Fprintf(stdout, "Created link '%s' -> '%s'.\n", fromPath, toPath)
+			return nil
+		}
+		return runUnsupportedVirtualMutationOrLegacy("fs mklink", args, stdout, opts, "creating links inside Amiga filesystem images")
+	}
+	if isVirtualFilesystemPath(toPath) {
+		return runUnsupportedVirtualMutationOrLegacy("fs mklink", args, stdout, opts, "creating host links targeting Amiga filesystem paths")
+	}
+	if len(args) > 2 {
+		return fmt.Errorf("unsupported argument: %s", args[2])
+	}
+	if err := os.MkdirAll(filepath.Dir(fromPath), 0o755); err != nil && filepath.Dir(fromPath) != "." {
+		return err
+	}
+	if err := os.Symlink(toPath, fromPath); err != nil {
+		return err
+	}
+	if opts.Format == "json" {
+		return writeJSON(stdout, map[string]any{"path": fromPath, "target": toPath, "status": "created"})
+	}
+	fmt.Fprintf(stdout, "Created link '%s' -> '%s'.\n", fromPath, toPath)
+	return nil
 }
 
 type fsDeleteOptions struct {
@@ -3844,6 +3883,11 @@ func handleFsDelete(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return err
 	}
 	if isVirtualFilesystemPath(args[0]) {
+		if handled, err := deleteAffsVirtualPath(args[0], deleteOpts.recursive, deleteOpts.force); err != nil {
+			return err
+		} else if handled {
+			return printFsMutationStatus(stdout, opts, deleteOpts.quiet, map[string]any{"path": args[0], "status": "deleted"}, "Deleted '%s'.\n", args[0])
+		}
 		return runUnsupportedVirtualMutationOrLegacy("fs delete", args, stdout, opts, "deleting entries inside Amiga filesystem images")
 	}
 
@@ -3879,6 +3923,11 @@ func handleFsRename(args []string, stdout io.Writer, opts GlobalOptions) error {
 		return err
 	}
 	if isVirtualFilesystemPath(args[0]) || isVirtualFilesystemPath(args[1]) {
+		if handled, err := renameAffsVirtualPath(args[0], args[1], renameOpts.force); err != nil {
+			return err
+		} else if handled {
+			return printFsMutationStatus(stdout, opts, renameOpts.quiet, map[string]any{"source": args[0], "destination": args[1], "status": "renamed"}, "Renamed '%s' to '%s'.\n", args[0], args[1])
+		}
 		return runUnsupportedVirtualMutationOrLegacy("fs rename", args, stdout, opts, "renaming entries inside Amiga filesystem images")
 	}
 	if !renameOpts.force {
@@ -5640,6 +5689,707 @@ func affsIsFileLike(entry affsDirEntry) bool {
 
 func (r *affsReader) readBlock(blockNr uint32) ([]byte, error) {
 	return readBlockAt(r.r, int64(blockNr)*int64(r.blockSize), r.blockSize)
+}
+
+func createAffsVirtualDirectory(fullPath string) (bool, error) {
+	if adfPath, remainder, ok := parseAdfVirtualPath(fullPath); ok && remainder != "" {
+		f, err := os.OpenFile(adfPath, os.O_RDWR, 0o644)
+		if err != nil {
+			return false, err
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return false, err
+		}
+		handled, err := createAffsDirectoryInRegion(f, partitionRegion{BasePath: adfPath, Offset: 0, Size: info.Size()}, splitVirtualPathComponents(remainder))
+		return handled, err
+	}
+
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(fullPath)
+	if !ok || remainder == "" {
+		return false, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	f, err := os.OpenFile(region.BasePath, os.O_RDWR, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	return createAffsDirectoryInRegion(f, region, splitVirtualPathComponents(remainder))
+}
+
+func deleteAffsVirtualPath(fullPath string, recursive bool, force bool) (bool, error) {
+	if adfPath, remainder, ok := parseAdfVirtualPath(fullPath); ok && remainder != "" {
+		f, err := os.OpenFile(adfPath, os.O_RDWR, 0o644)
+		if err != nil {
+			return false, err
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return false, err
+		}
+		handled, err := deleteAffsPathInRegion(f, partitionRegion{BasePath: adfPath, Offset: 0, Size: info.Size()}, splitVirtualPathComponents(remainder), recursive, force)
+		return handled, err
+	}
+
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(fullPath)
+	if !ok || remainder == "" {
+		return false, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	f, err := os.OpenFile(region.BasePath, os.O_RDWR, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	return deleteAffsPathInRegion(f, region, splitVirtualPathComponents(remainder), recursive, force)
+}
+
+func createAffsVirtualLink(fromPath string, toPath string) (bool, error) {
+	if adfPath, remainder, ok := parseAdfVirtualPath(fromPath); ok && remainder != "" {
+		f, err := os.OpenFile(adfPath, os.O_RDWR, 0o644)
+		if err != nil {
+			return false, err
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return false, err
+		}
+		handled, err := createAffsLinkInRegion(f, partitionRegion{BasePath: adfPath, Offset: 0, Size: info.Size()}, splitVirtualPathComponents(remainder), toPath)
+		return handled, err
+	}
+
+	basePath, table, selector, remainder, ok := parsePartitionPathSelectorWithRemainder(fromPath)
+	if !ok || remainder == "" {
+		return false, nil
+	}
+	partitionPath := basePath + `\` + table + `\` + selector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	f, err := os.OpenFile(region.BasePath, os.O_RDWR, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	return createAffsLinkInRegion(f, region, splitVirtualPathComponents(remainder), toPath)
+}
+
+func renameAffsVirtualPath(sourcePath string, destinationPath string, force bool) (bool, error) {
+	if srcAdfPath, srcRemainder, srcOK := parseAdfVirtualPath(sourcePath); srcOK && srcRemainder != "" {
+		dstAdfPath, dstRemainder, dstOK := parseAdfVirtualPath(destinationPath)
+		if !dstOK || dstRemainder == "" || dstAdfPath != srcAdfPath {
+			return true, errors.New("AFFS rename source and destination must be in the same ADF image")
+		}
+		f, err := os.OpenFile(srcAdfPath, os.O_RDWR, 0o644)
+		if err != nil {
+			return false, err
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return false, err
+		}
+		handled, err := renameAffsPathInRegion(f, partitionRegion{BasePath: srcAdfPath, Offset: 0, Size: info.Size()}, splitVirtualPathComponents(srcRemainder), splitVirtualPathComponents(dstRemainder), force)
+		return handled, err
+	}
+
+	srcBasePath, srcTable, srcSelector, srcRemainder, srcOK := parsePartitionPathSelectorWithRemainder(sourcePath)
+	if !srcOK || srcRemainder == "" {
+		return false, nil
+	}
+	dstBasePath, dstTable, dstSelector, dstRemainder, dstOK := parsePartitionPathSelectorWithRemainder(destinationPath)
+	if !dstOK || dstRemainder == "" || dstBasePath != srcBasePath || dstTable != srcTable || dstSelector != srcSelector {
+		return true, errors.New("AFFS rename source and destination must be in the same partition")
+	}
+	partitionPath := srcBasePath + `\` + srcTable + `\` + srcSelector
+	region, ok, err := resolvePartitionSelection(partitionPath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	f, err := os.OpenFile(region.BasePath, os.O_RDWR, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	return renameAffsPathInRegion(f, region, splitVirtualPathComponents(srcRemainder), splitVirtualPathComponents(dstRemainder), force)
+}
+
+func createAffsDirectoryInRegion(f *os.File, region partitionRegion, components []string) (bool, error) {
+	if len(components) == 0 {
+		return false, nil
+	}
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return false, nil
+		}
+		return true, err
+	}
+
+	name := components[len(components)-1]
+	if name == "" || name == "." || name == ".." {
+		return true, fmt.Errorf("invalid AFFS directory name: %s", name)
+	}
+	nameBytes := latin1Bytes(name)
+	if len(nameBytes) > affsMaxFileName {
+		return true, fmt.Errorf("AFFS directory name exceeds %d characters: %s", affsMaxFileName, name)
+	}
+	parentComponents := components[:len(components)-1]
+	parentEntry, err := reader.findPathEntry(parentComponents)
+	if err != nil {
+		return true, err
+	}
+	if !affsIsDirLike(parentEntry) {
+		return true, fmt.Errorf("parent path is not a directory: %s", strings.Join(parentComponents, `\`))
+	}
+	parentBlockNr := parentEntry.blockNr
+	if parentEntry.entryType == 4 && parentEntry.realBlock != 0 {
+		parentBlockNr = parentEntry.realBlock
+	}
+	parentEntries, err := reader.listPath(parentComponents)
+	if err != nil {
+		return true, err
+	}
+	for _, entry := range parentEntries {
+		if strings.EqualFold(entry.name, name) {
+			return true, fmt.Errorf("path already exists: %s", strings.Join(components, `\`))
+		}
+	}
+
+	freeBlock, err := findFreeAffsBlock(f, region, reader.blockSize, reader.rootBlock)
+	if err != nil {
+		return true, err
+	}
+	newBlock := make([]byte, reader.blockSize)
+	writeAffsDirectoryBlock(newBlock, reader.blockSize, freeBlock, parentBlockNr, name)
+	if err := linkAffsDirectoryEntry(f, region, reader, parentBlockNr, freeBlock, name); err != nil {
+		return true, err
+	}
+	if _, err := f.WriteAt(newBlock, region.Offset+int64(freeBlock)*int64(reader.blockSize)); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func createAffsLinkInRegion(f *os.File, region partitionRegion, fromComponents []string, toPath string) (bool, error) {
+	if len(fromComponents) == 0 {
+		return false, nil
+	}
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return false, nil
+		}
+		return true, err
+	}
+	linkName := fromComponents[len(fromComponents)-1]
+	if linkName == "" || linkName == "." || linkName == ".." {
+		return true, fmt.Errorf("invalid AFFS link name: %s", linkName)
+	}
+	if len(latin1Bytes(linkName)) > affsMaxFileName {
+		return true, fmt.Errorf("AFFS link name exceeds %d characters: %s", affsMaxFileName, linkName)
+	}
+	parentComponents := fromComponents[:len(fromComponents)-1]
+	parentEntry, err := reader.findPathEntry(parentComponents)
+	if err != nil {
+		return true, err
+	}
+	parentBlockNr := parentEntry.blockNr
+	if parentEntry.entryType == 4 && parentEntry.realBlock != 0 {
+		parentBlockNr = parentEntry.realBlock
+	}
+	parentEntries, err := reader.listPath(parentComponents)
+	if err != nil {
+		return true, err
+	}
+	for _, entry := range parentEntries {
+		if strings.EqualFold(entry.name, linkName) {
+			return true, fmt.Errorf("path already exists: %s", strings.Join(fromComponents, `\`))
+		}
+	}
+
+	target, err := findAffsLinkTarget(reader, parentComponents, toPath)
+	if err != nil {
+		return true, err
+	}
+	linkType := int32(-4)
+	if affsIsDirLike(target) {
+		linkType = 4
+	}
+	freeBlock, err := findFreeAffsBlock(f, region, reader.blockSize, reader.rootBlock)
+	if err != nil {
+		return true, err
+	}
+	linkBlock := make([]byte, reader.blockSize)
+	writeAffsLinkBlock(linkBlock, reader.blockSize, freeBlock, parentBlockNr, linkName, target.blockNr, linkType)
+	if err := linkAffsDirectoryEntry(f, region, reader, parentBlockNr, freeBlock, linkName); err != nil {
+		return true, err
+	}
+	if _, err := f.WriteAt(linkBlock, region.Offset+int64(freeBlock)*int64(reader.blockSize)); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func findAffsLinkTarget(reader *affsReader, parentComponents []string, toPath string) (affsDirEntry, error) {
+	targetComponents := splitVirtualPathComponents(toPath)
+	if len(targetComponents) == 0 {
+		return affsDirEntry{}, fmt.Errorf("invalid AFFS link target: %s", toPath)
+	}
+	if entry, err := reader.findPathEntry(targetComponents); err == nil {
+		return entry, nil
+	}
+	if len(parentComponents) > 0 {
+		relativeComponents := append(append([]string{}, parentComponents...), targetComponents...)
+		if entry, err := reader.findPathEntry(relativeComponents); err == nil {
+			return entry, nil
+		}
+	}
+	return affsDirEntry{}, fmt.Errorf("AFFS link target not found: %s", toPath)
+}
+
+func renameAffsPathInRegion(f *os.File, region partitionRegion, sourceComponents []string, destinationComponents []string, force bool) (bool, error) {
+	if len(sourceComponents) == 0 || len(destinationComponents) == 0 {
+		return false, nil
+	}
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return false, nil
+		}
+		return true, err
+	}
+	sourceParentComponents := sourceComponents[:len(sourceComponents)-1]
+	destinationParentComponents := destinationComponents[:len(destinationComponents)-1]
+	if hasPathPrefix(destinationParentComponents, sourceComponents) {
+		return true, errors.New("cannot move a directory into itself")
+	}
+	newName := destinationComponents[len(destinationComponents)-1]
+	if newName == "" || newName == "." || newName == ".." {
+		return true, fmt.Errorf("invalid AFFS destination name: %s", newName)
+	}
+	if len(latin1Bytes(newName)) > affsMaxFileName {
+		return true, fmt.Errorf("AFFS destination name exceeds %d characters: %s", affsMaxFileName, newName)
+	}
+
+	sourceParentEntry, err := reader.findPathEntry(sourceParentComponents)
+	if err != nil {
+		return true, err
+	}
+	sourceParentBlockNr := sourceParentEntry.blockNr
+	if sourceParentEntry.entryType == 4 && sourceParentEntry.realBlock != 0 {
+		sourceParentBlockNr = sourceParentEntry.realBlock
+	}
+	sourceEntries, err := reader.listPath(sourceParentComponents)
+	if err != nil {
+		return true, err
+	}
+	sourceName := sourceComponents[len(sourceComponents)-1]
+	var target affsDirEntry
+	found := false
+	for _, entry := range sourceEntries {
+		if strings.EqualFold(entry.name, sourceName) {
+			target = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		return true, fmt.Errorf("path not found: %s", strings.Join(sourceComponents, `\`))
+	}
+
+	destinationParentEntry, err := reader.findPathEntry(destinationParentComponents)
+	if err != nil {
+		return true, err
+	}
+	if !affsIsDirLike(destinationParentEntry) {
+		return true, fmt.Errorf("destination parent is not a directory: %s", strings.Join(destinationParentComponents, `\`))
+	}
+	destinationParentBlockNr := destinationParentEntry.blockNr
+	if destinationParentEntry.entryType == 4 && destinationParentEntry.realBlock != 0 {
+		destinationParentBlockNr = destinationParentEntry.realBlock
+	}
+	destinationEntries, err := reader.listPath(destinationParentComponents)
+	if err != nil {
+		return true, err
+	}
+	for _, entry := range destinationEntries {
+		if !strings.EqualFold(entry.name, newName) {
+			continue
+		}
+		if entry.blockNr == target.blockNr {
+			break
+		}
+		if !force {
+			return true, fmt.Errorf("destination already exists: %s", strings.Join(destinationComponents, `\`))
+		}
+		if err := deleteAffsEntry(f, region, reader, destinationParentBlockNr, entry, true); err != nil {
+			return true, err
+		}
+		reader, err = newAffsReader(io.NewSectionReader(f, region.Offset, region.Size), region.Size)
+		if err != nil {
+			return true, err
+		}
+		break
+	}
+
+	if err := unlinkAffsEntryFromParent(f, region, reader, sourceParentBlockNr, target.blockNr); err != nil {
+		return true, err
+	}
+	block, err := reader.readBlock(target.blockNr)
+	if err != nil {
+		return true, err
+	}
+	writeAffsName(block, reader.blockSize, newName)
+	writeBeU32(block, reader.blockSize-12, destinationParentBlockNr)
+	writeBeU32(block, reader.blockSize-16, 0)
+	affsUpdateBlockChecksum(block)
+	if _, err := f.WriteAt(block, region.Offset+int64(target.blockNr)*int64(reader.blockSize)); err != nil {
+		return true, err
+	}
+	if err := linkAffsDirectoryEntry(f, region, reader, destinationParentBlockNr, target.blockNr, newName); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func deleteAffsPathInRegion(f *os.File, region partitionRegion, components []string, recursive bool, force bool) (bool, error) {
+	if len(components) == 0 {
+		return false, nil
+	}
+	section := io.NewSectionReader(f, region.Offset, region.Size)
+	reader, err := newAffsReader(section, region.Size)
+	if err != nil {
+		if errors.Is(err, errNotAffs) {
+			return false, nil
+		}
+		return true, err
+	}
+	parentComponents := components[:len(components)-1]
+	parentEntry, err := reader.findPathEntry(parentComponents)
+	if err != nil {
+		if force && strings.Contains(strings.ToLower(err.Error()), "path not found") {
+			return true, nil
+		}
+		return true, err
+	}
+	parentBlockNr := parentEntry.blockNr
+	if parentEntry.entryType == 4 && parentEntry.realBlock != 0 {
+		parentBlockNr = parentEntry.realBlock
+	}
+	entries, err := reader.listPath(parentComponents)
+	if err != nil {
+		return true, err
+	}
+	targetName := components[len(components)-1]
+	var target affsDirEntry
+	found := false
+	for _, entry := range entries {
+		if strings.EqualFold(entry.name, targetName) {
+			target = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		if force {
+			return true, nil
+		}
+		return true, fmt.Errorf("path not found: %s", strings.Join(components, `\`))
+	}
+	if err := deleteAffsEntry(f, region, reader, parentBlockNr, target, recursive); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func findFreeAffsBlock(f *os.File, region partitionRegion, blockSize int, rootBlock uint32) (uint32, error) {
+	blocks := uint32(region.Size / int64(blockSize))
+	buf := make([]byte, blockSize)
+	for blockNr := uint32(2); blockNr < blocks; blockNr++ {
+		if blockNr == rootBlock {
+			continue
+		}
+		if _, err := f.ReadAt(buf, region.Offset+int64(blockNr)*int64(blockSize)); err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		empty := true
+		for _, b := range buf {
+			if b != 0 {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			return blockNr, nil
+		}
+	}
+	return 0, errors.New("AFFS image has no free zeroed blocks")
+}
+
+func deleteAffsEntry(f *os.File, region partitionRegion, reader *affsReader, parentBlockNr uint32, entry affsDirEntry, recursive bool) error {
+	if entry.entryType == affsSecUserDir {
+		children, err := reader.listDirBlock(entry.blockNr)
+		if err != nil {
+			return err
+		}
+		if len(children) > 0 && !recursive {
+			return errors.New("source is a directory, use --recursive")
+		}
+		for _, child := range children {
+			if err := deleteAffsEntry(f, region, reader, entry.blockNr, child, true); err != nil {
+				return err
+			}
+		}
+	} else if entry.entryType == affsSecFile {
+		if err := zeroAffsFileDataBlocks(f, region, reader, entry); err != nil {
+			return err
+		}
+	}
+	if err := unlinkAffsEntryFromParent(f, region, reader, parentBlockNr, entry.blockNr); err != nil {
+		return err
+	}
+	return zeroAffsBlock(f, region, reader.blockSize, entry.blockNr)
+}
+
+func zeroAffsFileDataBlocks(f *os.File, region partitionRegion, reader *affsReader, entry affsDirEntry) error {
+	header, err := reader.readBlock(entry.blockNr)
+	if err != nil {
+		return err
+	}
+	if reader.fastFile {
+		ptrs, err := reader.readFileDataBlockPointers(header)
+		if err != nil {
+			return err
+		}
+		for _, ptr := range ptrs {
+			if err := zeroAffsBlock(f, region, reader.blockSize, ptr); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	visited := map[uint32]bool{}
+	for next := readBeU32(header, 16); next != 0; {
+		if visited[next] {
+			return errors.New("AFFS OFS data block loop detected")
+		}
+		visited[next] = true
+		block, err := reader.readBlock(next)
+		if err != nil {
+			return err
+		}
+		nextBlock := readBeU32(block, 16)
+		if err := zeroAffsBlock(f, region, reader.blockSize, next); err != nil {
+			return err
+		}
+		next = nextBlock
+	}
+	return nil
+}
+
+func unlinkAffsEntryFromParent(f *os.File, region partitionRegion, reader *affsReader, parentBlockNr uint32, targetBlockNr uint32) error {
+	parent, err := reader.readBlock(parentBlockNr)
+	if err != nil {
+		return err
+	}
+	hashSize := int(readBeU32(parent, 12))
+	if hashSize <= 0 || hashSize > reader.hashSize {
+		hashSize = reader.hashSize
+	}
+	visited := map[uint32]bool{}
+	for i := 0; i < hashSize; i++ {
+		slot := 24 + i*4
+		if slot+4 > len(parent) {
+			break
+		}
+		current := readBeU32(parent, slot)
+		if current == 0 {
+			continue
+		}
+		if current == targetBlockNr {
+			target, err := reader.readBlock(targetBlockNr)
+			if err != nil {
+				return err
+			}
+			writeBeU32(parent, slot, readBeU32(target, reader.blockSize-16))
+			affsUpdateBlockChecksum(parent)
+			_, err = f.WriteAt(parent, region.Offset+int64(parentBlockNr)*int64(reader.blockSize))
+			return err
+		}
+		for current != 0 {
+			if visited[current] {
+				return errors.New("AFFS hash chain loop detected")
+			}
+			visited[current] = true
+			block, err := reader.readBlock(current)
+			if err != nil {
+				return err
+			}
+			next := readBeU32(block, reader.blockSize-16)
+			if next == targetBlockNr {
+				target, err := reader.readBlock(targetBlockNr)
+				if err != nil {
+					return err
+				}
+				writeBeU32(block, reader.blockSize-16, readBeU32(target, reader.blockSize-16))
+				affsUpdateBlockChecksum(block)
+				_, err = f.WriteAt(block, region.Offset+int64(current)*int64(reader.blockSize))
+				return err
+			}
+			current = next
+		}
+	}
+	return fmt.Errorf("AFFS entry block %d not linked from parent %d", targetBlockNr, parentBlockNr)
+}
+
+func zeroAffsBlock(f *os.File, region partitionRegion, blockSize int, blockNr uint32) error {
+	_, err := f.WriteAt(make([]byte, blockSize), region.Offset+int64(blockNr)*int64(blockSize))
+	return err
+}
+
+func linkAffsDirectoryEntry(f *os.File, region partitionRegion, reader *affsReader, parentBlockNr uint32, newBlockNr uint32, name string) error {
+	parent, err := reader.readBlock(parentBlockNr)
+	if err != nil {
+		return err
+	}
+	hashSize := int(readBeU32(parent, 12))
+	if hashSize <= 0 || hashSize > reader.hashSize {
+		hashSize = reader.hashSize
+	}
+	bucket := affsNameHash(name, hashSize)
+	slot := 24 + bucket*4
+	if slot+4 > len(parent) {
+		return fmt.Errorf("AFFS hash slot %d exceeds block size", bucket)
+	}
+	head := readBeU32(parent, slot)
+	if head == 0 {
+		writeBeU32(parent, slot, newBlockNr)
+		affsUpdateBlockChecksum(parent)
+		_, err = f.WriteAt(parent, region.Offset+int64(parentBlockNr)*int64(reader.blockSize))
+		return err
+	}
+
+	visited := map[uint32]bool{}
+	current := head
+	for {
+		if visited[current] {
+			return errors.New("AFFS hash chain loop detected")
+		}
+		visited[current] = true
+		block, err := reader.readBlock(current)
+		if err != nil {
+			return err
+		}
+		next := readBeU32(block, reader.blockSize-16)
+		if next != 0 {
+			current = next
+			continue
+		}
+		writeBeU32(block, reader.blockSize-16, newBlockNr)
+		affsUpdateBlockChecksum(block)
+		_, err = f.WriteAt(block, region.Offset+int64(current)*int64(reader.blockSize))
+		return err
+	}
+}
+
+func writeAffsDirectoryBlock(block []byte, blockSize int, own uint32, parent uint32, name string) {
+	writeBeU32(block, 0, affsTypeHeader)
+	writeBeU32(block, 4, own)
+	writeBeU32(block, 12, uint32(blockSize/4-56))
+	writeBeU32(block, blockSize-12, parent)
+	writeAffsName(block, blockSize, name)
+	writeBeU32(block, blockSize-4, uint32(affsSecUserDir))
+	affsUpdateBlockChecksum(block)
+}
+
+func writeAffsLinkBlock(block []byte, blockSize int, own uint32, parent uint32, name string, realEntry uint32, linkType int32) {
+	writeBeU32(block, 0, affsTypeHeader)
+	writeBeU32(block, 4, own)
+	writeBeU32(block, blockSize-44, realEntry)
+	writeBeU32(block, blockSize-12, parent)
+	writeAffsName(block, blockSize, name)
+	writeBeU32(block, blockSize-4, uint32(linkType))
+	affsUpdateBlockChecksum(block)
+}
+
+func writeAffsName(block []byte, blockSize int, name string) {
+	offset := blockSize - 80
+	if offset < 0 || offset >= len(block) {
+		return
+	}
+	for i := 0; i <= affsMaxFileName && offset+i < len(block); i++ {
+		block[offset+i] = 0
+	}
+	nameBytes := latin1Bytes(name)
+	if len(nameBytes) > affsMaxFileName {
+		nameBytes = nameBytes[:affsMaxFileName]
+	}
+	block[offset] = byte(len(nameBytes))
+	copy(block[offset+1:], nameBytes)
+}
+
+func hasPathPrefix(pathComponents []string, prefix []string) bool {
+	if len(prefix) > len(pathComponents) {
+		return false
+	}
+	for i := range prefix {
+		if !strings.EqualFold(pathComponents[i], prefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func affsNameHash(name string, hashSize int) int {
+	if hashSize <= 0 {
+		return 0
+	}
+	hash := len(name)
+	for _, b := range latin1Bytes(strings.ToUpper(name)) {
+		hash = (hash*13 + int(b)) & 0x7ff
+	}
+	return hash % hashSize
+}
+
+func affsUpdateBlockChecksum(block []byte) {
+	if len(block) < 24 {
+		return
+	}
+	writeBeU32(block, 20, 0)
+	sum := uint32(0)
+	for off := 0; off+4 <= len(block); off += 4 {
+		sum += readBeU32(block, off)
+	}
+	writeBeU32(block, 20, 0-sum)
 }
 
 var errNotPfs3 = errors.New("not a pfs3 filesystem")
